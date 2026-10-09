@@ -95,6 +95,7 @@ src/        lexer, parser + ast, codegen, asm, obj (object model), elf_writer, m
 examples/   hello.luma
 tests/      unit/, pos/, neg/, asm/, run_e2e.sh
 docs/       DESIGN.md: encodings, relocations, section layout, symbol resolution
+            IR.md: LIR spec (draft) for milestone 2
 ```
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the details of the language subset, the
