@@ -66,6 +66,114 @@ static void test_encodings(void) {
     EXPECT("lea rdi, [rip + 16]", 0x48, 0x8d, 0x3d, 0x10, 0x00, 0x00, 0x00);
     EXPECT("lea r9, [rip - 4]", 0x4c, 0x8d, 0x0d, 0xfc, 0xff, 0xff, 0xff);
     EXPECT("RET", 0xc3); /* mnemonics are case-insensitive */
+
+    /* milestone 2: rbp-relative memory */
+    EXPECT("mov rax, [rbp - 8]", 0x48, 0x8b, 0x45, 0xf8);
+    EXPECT("mov rax, [rbp-1024]", 0x48, 0x8b, 0x85, 0x00, 0xfc, 0xff, 0xff);
+    EXPECT("mov rax, [rbp]", 0x48, 0x8b, 0x45, 0x00); /* mod=00 rm=101 would mean RIP */
+    EXPECT("mov r9, [rbp + 16]", 0x4c, 0x8b, 0x4d, 0x10);
+    EXPECT("mov [rbp - 16], rdi", 0x48, 0x89, 0x7d, 0xf0);
+    EXPECT("mov [rbp - 16], r9", 0x4c, 0x89, 0x4d, 0xf0);
+    EXPECT("lea rax, [rbp - 8]", 0x48, 0x8d, 0x45, 0xf8);
+    /* ALU group incl. accumulator short forms (as chosen by GNU as) */
+    EXPECT("cmp rax, 2", 0x48, 0x83, 0xf8, 0x02);
+    EXPECT("cmp rax, 1000", 0x48, 0x3d, 0xe8, 0x03, 0x00, 0x00);
+    EXPECT("cmp rcx, 1000", 0x48, 0x81, 0xf9, 0xe8, 0x03, 0x00, 0x00);
+    EXPECT("cmp rax, rcx", 0x48, 0x39, 0xc8);
+    EXPECT("and rax, -5", 0x48, 0x83, 0xe0, 0xfb);
+    EXPECT("and rdx, rcx", 0x48, 0x21, 0xca);
+    EXPECT("or rax, 1", 0x48, 0x83, 0xc8, 0x01);
+    EXPECT("add rax, 0x1000", 0x48, 0x05, 0x00, 0x10, 0x00, 0x00);
+    EXPECT("sub rax, 0x1000", 0x48, 0x2d, 0x00, 0x10, 0x00, 0x00);
+    EXPECT("xor rax, 0x1000", 0x48, 0x35, 0x00, 0x10, 0x00, 0x00);
+    EXPECT("test edx, 1", 0xf7, 0xc2, 0x01, 0x00, 0x00, 0x00);
+    EXPECT("test eax, 1", 0xa9, 0x01, 0x00, 0x00, 0x00);
+    EXPECT("test rax, rcx", 0x48, 0x85, 0xc8);
+}
+
+/* Returns the .text bytes of src, or NULL (caller frees via obj_free). */
+static const Buf *text_of(const char *src, ObjFile *o) {
+    if (!assemble_str(src, o)) return NULL;
+    int t = obj_find_section(o, ".text");
+    return t >= 0 ? &o->sections[t].data : NULL;
+}
+
+static char *nops(const char *head, int count, const char *tail) {
+    size_t n = strlen(head) + strlen(tail) + (size_t)count * 4 + 1;
+    char *s = malloc(n);
+    strcpy(s, head);
+    for (int i = 0; i < count; i++) strcat(s, "nop\n");
+    strcat(s, tail);
+    return s;
+}
+
+static void test_relaxation(void) {
+    ObjFile o;
+    const Buf *t;
+    char *src;
+
+    /* forward: displacement 127 fits rel8 */
+    src = nops(".text\njmp L\n", 127, "L: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->len == 2 + 127 + 1 && t->data[0] == 0xeb && t->data[1] == 127);
+    obj_free(&o); free(src);
+    /* forward: displacement 128 needs rel32: E9 80 00 00 00 */
+    src = nops(".text\njmp L\n", 128, "L: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->len == 5 + 128 + 1 && t->data[0] == 0xe9 && t->data[1] == 128 && t->data[2] == 0);
+    obj_free(&o); free(src);
+    /* backward: -128 fits (126 nops + 2-byte jump) */
+    src = nops(".text\nL:\n", 126, "jmp L\n");
+    t = text_of(src, &o);
+    CHECK(t && t->len == 126 + 2 && t->data[126] == 0xeb && t->data[127] == 0x80);
+    obj_free(&o); free(src);
+    /* backward: -129 does not: long form, disp = -(127 + 5) */
+    src = nops(".text\nL:\n", 127, "jmp L\n");
+    t = text_of(src, &o);
+    CHECK(t && t->len == 127 + 5 && t->data[127] == 0xe9);
+    if (t) {
+        int32_t d = (int32_t)(t->data[128] | t->data[129] << 8 | t->data[130] << 16 | (uint32_t)t->data[131] << 24);
+        CHECK_EQ_INT(d, -132);
+    }
+    obj_free(&o); free(src);
+    /* jcc short and long */
+    src = nops(".text\nje L\n", 10, "L: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->data[0] == 0x74 && t->data[1] == 10);
+    obj_free(&o); free(src);
+    src = nops(".text\njne L\n", 200, "L: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->data[0] == 0x0f && t->data[1] == 0x85 && t->data[2] == 200 && t->data[3] == 0);
+    obj_free(&o); free(src);
+    /* mixed: OUTER disp = 2 + 126 + 1 = 129 -> long; INNER disp = 126 -> short */
+    src = nops(".text\njmp OUTER\njmp INNER\n", 126, "INNER: nop\nOUTER: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->data[0] == 0xe9 && t->data[5] == 0xeb && t->data[6] == 126);
+    obj_free(&o); free(src);
+    /* cascade: pass 1 makes jmp B long (disp 134); that pushes A from disp
+     * 126 to 129, so pass 2 makes jmp A long too; pass 3 is stable. */
+    src = nops(".text\njmp A\njmp B\n", 124, "A: nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nB: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->data[0] == 0xe9 && t->data[5] == 0xe9 && t->len == 5 + 5 + 124 + 10 + 1);
+    obj_free(&o); free(src);
+    /* jump to an external symbol is always long with a PLT32 relocation */
+    CHECK(assemble_str(".text\njmp ext\nje ext\n", &o));
+    CHECK_EQ_INT(o.sections[0].data.len, 5 + 6);
+    CHECK_EQ_INT(o.nrelocs, 2);
+    CHECK_EQ_INT(o.relocs[0].type, OBJ_R_X86_64_PLT32);
+    CHECK_EQ_INT(o.relocs[1].offset, 7);
+    obj_free(&o);
+}
+
+static void test_data_directives(void) {
+    ObjFile o;
+    CHECK(assemble_str(".section .rodata\n.byte 1\n.p2align 3\nq: .quad 1, -1\n", &o));
+    const Buf *b = &o.sections[0].data;
+    CHECK_EQ_INT(b->len, 8 + 16);
+    CHECK_EQ_INT(o.sections[0].align, 8);
+    CHECK(b->data[8] == 1 && b->data[16] == 0xff && b->data[23] == 0xff);
+    CHECK_EQ_INT(o.symbols[obj_find_symbol(&o, "q")].value, 8);
+    obj_free(&o);
 }
 
 static void test_relocations(void) {
@@ -155,6 +263,14 @@ static void test_errors(void) {
         ".intel_syntax prefix\n",      /* unsupported syntax */
         "lea rdi, [rip + a + b]\n",    /* two symbols */
         "mov rax, rbx, rcx, rdx\n",    /* too many operands */
+        "mov rax, [rsp + 8]\n",        /* rsp base needs SIB: unsupported */
+        "mov rax, [rbp + sym]\n",      /* symbols only with rip */
+        "mov eax, [rbp - 8]\n",        /* 32-bit loads unsupported */
+        "jmp rax\n",                   /* indirect jumps unsupported */
+        "jmp .Lnowhere\n",             /* undefined local label */
+        ".text\n.p2align 4\n",         /* .p2align in code */
+        ".section .rodata\n.p2align 99\n",
+        ".quad 1x\n",
     };
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         bool ok = assemble_str(bad[i], &o);
@@ -176,6 +292,8 @@ static void test_errors(void) {
 int main(void) {
     test_encodings();
     test_relocations();
+    test_relaxation();
+    test_data_directives();
     test_errors();
     return check_report("test_asm");
 }
