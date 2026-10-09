@@ -1,0 +1,4 @@
+print "She said \"hi\"";
+print "back\\slash";
+print "two\nlines";
+print "tab\there";
