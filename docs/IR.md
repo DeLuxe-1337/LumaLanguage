@@ -1,6 +1,7 @@
-# LIR: the Luma intermediate representation (spec v0.1, draft)
+# LIR: the Luma intermediate representation (spec v0.1)
 
-**Status:** proposed for milestone 2. Not implemented yet.
+**Status:** implemented in milestone 2. The decisions in section 13 are resolved,
+and the places where the implementation refined the original draft are listed in section 14.
 **Scope:** this spec covers:
 
 - what LIR is
@@ -118,6 +119,15 @@ STRING      := C-style "…" with escapes \" \\ \n \t \xNN
 comment     := ';' to end of line
 ```
 
+Printing is canonical: externs and data first (in declaration order), then
+functions. `ir_parse(ir_print(m))` prints identically, and the test suite
+checks this for every program.
+
+Vregs are numbered in text order: parameters first, then in order of first
+appearance, with the destination before the operands. The lowering pass
+renumbers to the same order (`ir_func_canonicalize`), so a lowered module and
+its re-parsed `.lir` get identical stack slots and identical assembly.
+
 The first block of a function is its entry block. Vregs are local to their
 function. Globals (`@…`) are module-wide: functions, data and externs share
 one namespace.
@@ -132,13 +142,13 @@ All operands and results are `val`.
 | `%d = const nil` / `true` / `false` | immediate | no |
 | `%d = const @s` | pointer to static data object `@s` | no |
 | `%d = mov %a` | copy | no |
-| `%d = add %a, %b` | Luma `+`: fixnum + fixnum; string + string (concatenation, milestone 3) | type error, overflow |
+| `%d = add %a, %b` | Luma `+`: fixnum + fixnum, or string + string (concatenation; allocates) | type error, overflow |
 | `sub`, `mul` | fixnum only | type error, overflow |
-| `div`, `mod` | fixnum only; floor semantics (rounding toward −∞; the sign of `mod` follows the divisor) | type error, division by zero |
+| `div`, `mod` | fixnum only; floor semantics (rounding toward −∞; the sign of `mod` follows the divisor). `mod` has no surface syntax, because Lox has no `%`; it is reachable from hand-written LIR. | type error, division by zero |
 | `%d = neg %a` | fixnum negation | type error, overflow (−2⁶²) |
 | `%d = not %a` | `true` if `%a` is falsy, else `false` | no |
 | `%d = eq %a, %b` / `ne` | structural equality: fixnums and immediates by word; strings by content; values of different types are never equal | no |
-| `lt le gt ge` | fixnum compare; string compare (bytewise, milestone 3) | type error |
+| `lt le gt ge` | fixnum compare only. Strings are a type error, as in Lox. | type error |
 | `%d = call @f(%a, …)` | call a LIR function or extern; at most 6 arguments in v0.1 | whatever `@f` does |
 | `call @f(…)` | the same, result discarded | |
 | `jmp L` | unconditional branch | |
@@ -170,12 +180,12 @@ These are C functions following the System V ABI. Every argument and return valu
 
 | Symbol | Purpose |
 |---|---|
-| `main` | Owned by the runtime. Calls `luma_main()` and returns 0. Future runtime initialization (GC, argv) lives here. |
-| `luma_print(v)` | Writes `v`'s display form followed by `'\n'`. Strings are written raw; fixnums in decimal; `nil`, `true` and `false` as words. |
+| `main` | Owned by the runtime. Calls `luma_main()`, flushes stdout, and returns 0 (or 1 if the flush fails). Future runtime initialization (GC, argv) lives here. |
+| `luma_print(v)` | Writes `v`'s display form followed by `'\n'`. Strings are written raw; fixnums in decimal; `nil`, `true` and `false` as words. Returns `nil`. |
 | `luma_add/sub/mul/div/mod(a,b)` | Generic arithmetic slow paths, including all error checks. |
 | `luma_neg(a)`, `luma_not(a)` | |
 | `luma_eq/ne/lt/le/gt/ge(a,b)` | |
-| `luma_panic(msg)` | Prints `luma: runtime error: msg` and exits with status 1. |
+| *(internal)* `luma_panic` | Flushes stdout, prints `luma: runtime error: msg` (Lox wording, e.g. `Operands must be numbers.`), and exits with status 1. Not exported. |
 
 The program body compiles to `fn @luma_main()`, which returns `nil`.
 
@@ -353,16 +363,29 @@ These are deferred, and each is listed with the milestone where it belongs:
 - debug info (DWARF), and source locations in runtime errors
 - a second target
 
-## 13. Open questions
+## 13. Decisions (resolved)
 
-1. **Runtime language.** I recommend `luma_rt.c`, built by `make` with the system
-   C compiler and treated as part of the toolchain, the same way libc is. The
-   alternative is hand-written assembly built by lasm, which avoids GNU `as`
-   completely but needs much more assembler surface now. In either case, the
-   long-term plan is a runtime written in Luma.
-2. **Integer overflow.** I recommend a runtime error for v0.1. The alternatives
-   are wraparound, or promoting to bignums later.
-3. **Milestone-2 surface syntax**, which needs your sign-off: `let`, assignment,
-   `if`/`else`, `while`, braces, integer/`nil`/`true`/`false` literals,
-   arithmetic and comparison operators, `and`/`or`/`not`, and whether
-   `print` takes any expression.
+1. **Runtime language:** C (`runtime/luma_rt.c`), built by `make` into
+   `build/libluma_rt.a` and treated as part of the toolchain. A runtime written
+   in Luma is deferred until bootstrapping.
+2. **Integer overflow:** a runtime error (`Integer overflow.`). There is no
+   wraparound, and bignums are deferred.
+3. **Surface syntax:** Lox-style. It is not final before bootstrap. See
+   `docs/DESIGN.md` for the accepted subset and the differences from reference Lox.
+
+## 14. Implementation notes (changes from the draft)
+
+- **String concatenation** with `+` landed in v0.1 rather than milestone 3,
+  because it is part of Lox's `+`. String ordering comparisons are a type error,
+  as in Lox.
+- **Function symbols:** every LIR function is emitted as a global `FUNC`
+  symbol. Calls to module functions use direct `call f`. Externs and runtime
+  operations use `call f@PLT`.
+- **Constants:** immediates are materialized with `mov rax, imm`. The
+  assembler picks the sign-extended imm32 form or `movabs`, as GNU `as` does.
+- **lasm:** every extension in section 9 is implemented, and the
+  accumulator-form gap is fixed. Branch relaxation is implemented as described.
+  Each new form, including relaxation boundaries and cascades, is checked byte
+  for byte against GNU `as`.
+- **Verifier diagnostics** use the input's line numbers: `.lir` lines for
+  parsed IR, and `.luma` lines for lowered IR.

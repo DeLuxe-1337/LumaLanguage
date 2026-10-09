@@ -1,0 +1,7 @@
+// FizzBuzz without a modulo operator (Lox has none): i - i / n * n is i mod n.
+for (var i = 1; i <= 15; i = i + 1) {
+  if (i - i / 15 * 15 == 0) print "FizzBuzz";
+  else if (i - i / 3 * 3 == 0) print "Fizz";
+  else if (i - i / 5 * 5 == 0) print "Buzz";
+  else print i;
+}
