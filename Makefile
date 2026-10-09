@@ -3,7 +3,8 @@
 #   make            build build/luma and build/lasm
 #   make hello      compile and run examples/hello.luma
 #   make inspect    show readelf/objdump of build/hello.o
-#   make test       run unit + end-to-end + negative tests
+#   make test       run unit + end-to-end + differential tests
+#   make difftest   random programs vs. a reference interpreter (DIFFTEST_COUNT=N)
 #   make clean      remove build/
 
 CC      ?= cc
@@ -20,7 +21,7 @@ CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_par
 CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
 HEADERS   := $(wildcard src/*.h)
 
-.PHONY: all clean test unit e2e hello inspect
+.PHONY: all clean test unit e2e difftest hello inspect
 
 all: $(BUILD)/luma $(BUILD)/lasm $(BUILD)/libluma_rt.a
 
@@ -77,7 +78,12 @@ unit: $(BUILD)/test_asm $(BUILD)/test_elf $(BUILD)/test_frontend $(BUILD)/test_i
 e2e: all
 	./tests/run_e2e.sh
 
-test: unit e2e
+# Random programs vs. a reference interpreter (tests/difftest.py).
+DIFFTEST_COUNT ?= 300
+difftest: all
+	python3 -I tests/difftest.py $(DIFFTEST_COUNT)
+
+test: unit e2e difftest
 
 clean:
 	rm -rf $(BUILD)

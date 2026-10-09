@@ -1,0 +1,22 @@
+; The loop example from docs/IR.md section 11, written by hand.
+module "loop.lir"
+
+extern fn @luma_print(1)
+
+fn @luma_main() {
+entry:
+  %i = const 0
+  jmp cond
+cond:
+  %t0 = const 3
+  %t1 = lt %i, %t0
+  br %t1, body, exit
+body:
+  call @luma_print(%i)
+  %t2 = const 1
+  %i = add %i, %t2
+  jmp cond
+exit:
+  %r = const nil
+  ret %r
+}

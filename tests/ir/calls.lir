@@ -1,0 +1,59 @@
+; LIR functions with parameters (all six SysV argument registers),
+; return values, data, and calls in both directions.
+module "calls.lir"
+
+extern fn @luma_print(1)
+data @hello = str "hello from @greet"
+
+fn @luma_main() {
+entry:
+  call @greet()
+  %a = const 1
+  %b = const 2
+  %c = const 3
+  %d = const 4
+  %e = const 5
+  %f = const 6
+  %s = call @sum6(%a, %b, %c, %d, %e, %f)
+  call @luma_print(%s)
+  %n = const 10
+  %r = call @countdown(%n)
+  call @luma_print(%r)
+  ret %r
+}
+
+fn @greet() {
+entry:
+  %h = const @hello
+  call @luma_print(%h)
+  %z = const nil
+  ret %z
+}
+
+fn @sum6(%a, %b, %c, %d, %e, %f) {
+entry:
+  %t = add %a, %b
+  %t = add %t, %c
+  %t = add %t, %d
+  %t = add %t, %e
+  %t = add %t, %f
+  ret %t
+}
+
+; recursion: countdown(n) = n == 0 ? "liftoff" : countdown(n - 1)
+data @liftoff = str "liftoff"
+
+fn @countdown(%n) {
+entry:
+  %zero = const 0
+  %done = eq %n, %zero
+  br %done, base, step
+base:
+  %l = const @liftoff
+  ret %l
+step:
+  %one = const 1
+  %m = sub %n, %one
+  %r = call @countdown(%m)
+  ret %r
+}

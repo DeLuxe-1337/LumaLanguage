@@ -1,1 +1,1 @@
-expected string literal after 'print'
+expected expression, found ';'
