@@ -98,6 +98,30 @@ make test        # unit + end-to-end + differential
 make unit        # test_frontend, test_ir, test_asm, test_elf
 make e2e         # tests/run_e2e.sh
 make difftest    # random programs vs. a reference interpreter (DIFFTEST_COUNT=300)
+make selftest    # compile and run examples/selftest.luma
+```
+
+`examples/selftest.luma` is a Luma program that checks the compiler from the
+inside. It runs 77 checks covering:
+
+- arithmetic and floor division
+- fixnum limits
+- precedence
+- equality across types
+- truthiness
+- `and`/`or` values and short-circuiting
+- strings and escapes
+- scoping and shadowing
+- loops (gcd, primes and fib(90))
+- evaluation order
+- `else` binding
+
+Each failing check prints `FAIL: <description>`. The program ends with
+`SELFTEST PASSED` (exit 0) or `SELFTEST FAILED` (exit 1). Until Luma has
+functions, each check is written out inline:
+
+```js
+t = t + 1; if (!(-7 / 2 == -4)) { f = f + 1; print "FAIL: -7 / 2 floors toward -infinity"; }
 ```
 
 | Location | Contents |
@@ -116,7 +140,7 @@ make difftest    # random programs vs. a reference interpreter (DIFFTEST_COUNT=3
 src/        lexer, parser + ast, lower (AST→LIR), ir/ir_parse/ir_verify, x86_isel (LIR→asm),
             asm, obj (object model), elf_writer, value.h (shared value tags), main (luma), lasm
 runtime/    luma_rt.c: the C runtime linked into every program
-examples/   hello.luma, fizzbuzz.luma
+examples/   hello.luma, fizzbuzz.luma, selftest.luma
 tests/      unit/, pos/, neg/, rt/, ir/, asm/, run_e2e.sh, difftest.py
 docs/       DESIGN.md: pipeline, language, runtime, assembler, ELF, linking
             IR.md:     LIR specification

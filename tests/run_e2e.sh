@@ -129,6 +129,29 @@ for src in tests/pos/*.luma; do
         "$LUMA $OUT/rt_$name.lir -S -o $OUT/rt2_$name --dump-ir > $OUT/rt_$name.reprint && cmp $exe.lir $OUT/rt_$name.reprint"
 done
 
+# ---------------------------------------------------------- self-checking program
+printf '== self-test (examples/selftest.luma) ==\n'
+st="$OUT/selftest"
+if "$LUMA" examples/selftest.luma -o "$st" >"$OUT/last.log" 2>&1; then
+    "$st" >"$st.actual" 2>"$st.stderr"
+    stst=$?
+    # exact match pins the number of checks run, so silently skipped checks also fail
+    if [ $stst -eq 0 ] && cmp -s "$st.actual" tests/selftest.out && [ ! -s "$st.stderr" ]; then
+        ok "selftest: $(sed -n 2p "$st.actual") checks passed, exit 0"
+    else
+        bad "selftest (exit $stst)"; cat "$st.actual" "$st.stderr" | sed 's/^/      /'
+    fi
+    check "selftest: object identical to GNU as" same_as_gas selftest "$st.s" "$st.o"
+    cp "$st.lir" "$OUT/st_copy.lir"
+    check "selftest: .lir recompiles to identical .s" sh -c \
+        "$LUMA $OUT/st_copy.lir -S -o $OUT/st_copy && sed 1d $st.s > $OUT/x1 && sed 1d $OUT/st_copy.s > $OUT/x2 && cmp $OUT/x1 $OUT/x2"
+else
+    bad "selftest compiles"; sed 's/^/      /' "$OUT/last.log"
+fi
+sed 's/sum == 5050/sum == 5051/' examples/selftest.luma > "$OUT/selftest_broken.luma"
+check "selftest detects a failing check (exit 1, FAIL line)" sh -c \
+    "$LUMA $OUT/selftest_broken.luma -o $OUT/stb && ! $OUT/stb > $OUT/stb.out 2>&1 && grep -q '^FAIL: while sums 1..100$' $OUT/stb.out && grep -q '^SELFTEST FAILED$' $OUT/stb.out"
+
 # ---------------------------------------------------------- negative programs
 printf '== compile errors ==\n'
 for src in tests/neg/*.luma; do

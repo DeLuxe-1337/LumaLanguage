@@ -4,6 +4,7 @@
 #   make hello      compile and run examples/hello.luma
 #   make inspect    show readelf/objdump of build/hello.o
 #   make test       run unit + end-to-end + differential tests
+#   make selftest   compile and run the self-checking program examples/selftest.luma
 #   make difftest   random programs vs. a reference interpreter (DIFFTEST_COUNT=N)
 #   make clean      remove build/
 
@@ -21,7 +22,7 @@ CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_par
 CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
 HEADERS   := $(wildcard src/*.h)
 
-.PHONY: all clean test unit e2e difftest hello inspect
+.PHONY: all clean test unit e2e difftest selftest hello inspect
 
 all: $(BUILD)/luma $(BUILD)/lasm $(BUILD)/libluma_rt.a
 
@@ -83,7 +84,12 @@ DIFFTEST_COUNT ?= 300
 difftest: all
 	python3 -I tests/difftest.py $(DIFFTEST_COUNT)
 
-test: unit e2e difftest
+# A Luma program that checks the compiler from the inside (examples/selftest.luma).
+selftest: all
+	./$(BUILD)/luma examples/selftest.luma -o $(BUILD)/selftest
+	./$(BUILD)/selftest
+
+test: unit e2e difftest selftest
 
 clean:
 	rm -rf $(BUILD)
