@@ -8,34 +8,51 @@
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter
-CFLAGS  += -D_POSIX_C_SOURCE=200809L
+# Required defines live outside CFLAGS so `make CFLAGS=...` (e.g. sanitizers) keeps them.
+DEFS    := -D_POSIX_C_SOURCE=200809L
+# The runtime is linked into user programs, so compiler-only flags such as
+# sanitizers (passed via CFLAGS) must not leak into it.
+RT_CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 BUILD   ?= build
 
-CORE_SRC  := src/util.c src/lexer.c src/parser.c src/codegen.c src/obj.c src/asm.c src/elf_writer.c
+CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_parse.c src/ir_verify.c \
+             src/x86_isel.c src/obj.c src/asm.c src/elf_writer.c
 CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
 HEADERS   := $(wildcard src/*.h)
 
 .PHONY: all clean test unit e2e hello inspect
 
-all: $(BUILD)/luma $(BUILD)/lasm
+all: $(BUILD)/luma $(BUILD)/lasm $(BUILD)/libluma_rt.a
+
+# The runtime is part of the toolchain (like libc): built once here with the
+# system C compiler, then linked into every Luma program by `luma`.
+$(BUILD)/obj/luma_rt.o: runtime/luma_rt.c src/value.h | $(BUILD)/obj
+	$(CC) $(RT_CFLAGS) -c $< -o $@
+
+$(BUILD)/libluma_rt.a: $(BUILD)/obj/luma_rt.o
+	rm -f $@
+	ar rcs $@ $^
 
 $(BUILD)/obj/%.o: src/%.c $(HEADERS) | $(BUILD)/obj
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEFS) -c $< -o $@
 
 $(BUILD)/luma: $(BUILD)/obj/main.o $(CORE_OBJ)
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $(DEFS) $^ -o $@
 
 $(BUILD)/lasm: $(BUILD)/obj/lasm.o $(CORE_OBJ)
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $(DEFS) $^ -o $@
 
 $(BUILD)/test_asm: tests/unit/test_asm.c $(CORE_OBJ) tests/unit/check.h
-	$(CC) $(CFLAGS) -Isrc tests/unit/test_asm.c $(CORE_OBJ) -o $@
+	$(CC) $(CFLAGS) $(DEFS) -Isrc tests/unit/test_asm.c $(CORE_OBJ) -o $@
 
 $(BUILD)/test_elf: tests/unit/test_elf.c $(CORE_OBJ) tests/unit/check.h
-	$(CC) $(CFLAGS) -Isrc tests/unit/test_elf.c $(CORE_OBJ) -o $@
+	$(CC) $(CFLAGS) $(DEFS) -Isrc tests/unit/test_elf.c $(CORE_OBJ) -o $@
 
 $(BUILD)/test_frontend: tests/unit/test_frontend.c $(CORE_OBJ) tests/unit/check.h
-	$(CC) $(CFLAGS) -Isrc tests/unit/test_frontend.c $(CORE_OBJ) -o $@
+	$(CC) $(CFLAGS) $(DEFS) -Isrc tests/unit/test_frontend.c $(CORE_OBJ) -o $@
+
+$(BUILD)/test_ir: tests/unit/test_ir.c $(CORE_OBJ) tests/unit/check.h
+	$(CC) $(CFLAGS) $(DEFS) -Isrc tests/unit/test_ir.c $(CORE_OBJ) -o $@
 
 $(BUILD)/obj:
 	mkdir -p $@
@@ -46,12 +63,14 @@ hello: all
 	./$(BUILD)/hello
 
 inspect: hello
+	@echo "== $(BUILD)/hello.lir =="; cat $(BUILD)/hello.lir
 	@echo "== $(BUILD)/hello.s =="; cat $(BUILD)/hello.s
 	readelf -h -S -s -r $(BUILD)/hello.o
 	objdump -d -r -M intel $(BUILD)/hello.o
 
-unit: $(BUILD)/test_asm $(BUILD)/test_elf $(BUILD)/test_frontend
+unit: $(BUILD)/test_asm $(BUILD)/test_elf $(BUILD)/test_frontend $(BUILD)/test_ir
 	./$(BUILD)/test_frontend
+	./$(BUILD)/test_ir
 	./$(BUILD)/test_asm
 	./$(BUILD)/test_elf
 

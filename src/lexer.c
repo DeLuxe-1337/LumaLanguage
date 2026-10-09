@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "util.h"
+#include "value.h"
 
 typedef struct {
     const char *path;
@@ -21,7 +22,10 @@ static void lex_error(const Lexer *lx, int line, int col, const char *fmt, const
     fputc('\n', stderr);
 }
 
-static int peek(const Lexer *lx) { return lx->pos < lx->len ? (unsigned char)lx->src[lx->pos] : -1; }
+static int peek_at(const Lexer *lx, size_t k) {
+    return lx->pos + k < lx->len ? (unsigned char)lx->src[lx->pos + k] : -1;
+}
+static int peek(const Lexer *lx) { return peek_at(lx, 0); }
 
 static void advance(Lexer *lx) {
     if (lx->pos >= lx->len) return;
@@ -42,8 +46,19 @@ static void push(TokenList *t, Token tok) {
     t->items[t->len++] = tok;
 }
 
+static bool is_digit(int c) { return c >= '0' && c <= '9'; }
 static bool is_ident_start(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
-static bool is_ident_char(int c) { return is_ident_start(c) || (c >= '0' && c <= '9'); }
+static bool is_ident_char(int c) { return is_ident_start(c) || is_digit(c); }
+
+static const struct {
+    const char *word;
+    TokenKind kind;
+} KEYWORDS[] = {
+    {"and", TOK_AND},       {"class", TOK_CLASS}, {"else", TOK_ELSE},     {"false", TOK_FALSE},
+    {"for", TOK_FOR},       {"fun", TOK_FUN},     {"if", TOK_IF},         {"nil", TOK_NIL},
+    {"or", TOK_OR},         {"print", TOK_PRINT}, {"return", TOK_RETURN}, {"super", TOK_SUPER},
+    {"this", TOK_THIS},     {"true", TOK_TRUE},   {"var", TOK_VAR},       {"while", TOK_WHILE},
+};
 
 static bool lex_string(Lexer *lx, Token *tok) {
     int sline = lx->line, scol = lx->col;
@@ -108,6 +123,34 @@ static bool lex_string(Lexer *lx, Token *tok) {
     return true;
 }
 
+static bool lex_number(Lexer *lx, Token *tok) {
+    size_t start = lx->pos;
+    int64_t v = 0;
+    bool too_big = false;
+    while (is_digit(peek(lx))) {
+        int d = peek(lx) - '0';
+        if (v > (LUMA_FIXNUM_MAX - d) / 10) too_big = true;
+        else v = v * 10 + d;
+        advance(lx);
+    }
+    if (peek(lx) == '.' && is_digit(peek_at(lx, 1))) {
+        lex_error(lx, tok->line, tok->col, "floating-point numbers are not supported yet%s", NULL);
+        return false;
+    }
+    if (is_ident_start(peek(lx))) {
+        lex_error(lx, tok->line, tok->col, "invalid number literal%s", NULL);
+        return false;
+    }
+    if (too_big) {
+        lex_error(lx, tok->line, tok->col, "integer literal too large (maximum is 4611686018427387903)%s", NULL);
+        return false;
+    }
+    tok->kind = TOK_NUMBER;
+    tok->ival = v;
+    tok->lexeme_len = lx->pos - start;
+    return true;
+}
+
 bool lex(const char *path, const char *src, size_t len, TokenList *out) {
     Lexer lx = {path, src, len, 0, 1, 1};
     memset(out, 0, sizeof *out);
@@ -117,50 +160,74 @@ bool lex(const char *path, const char *src, size_t len, TokenList *out) {
             advance(&lx);
             continue;
         }
+        if (c == '/' && peek_at(&lx, 1) == '/') {
+            while (peek(&lx) != -1 && peek(&lx) != '\n') advance(&lx);
+            continue;
+        }
         Token tok = {0};
         tok.line = lx.line;
         tok.col = lx.col;
         tok.lexeme = src + lx.pos;
+        tok.lexeme_len = 1;
         if (c == -1) {
             tok.kind = TOK_EOF;
             tok.lexeme_len = 0;
             push(out, tok);
             return true;
         }
-        if (c == ';') {
-            tok.kind = TOK_SEMICOLON;
-            tok.lexeme_len = 1;
-            advance(&lx);
+        if (c == '"') {
+            if (!lex_string(&lx, &tok)) goto fail;
             push(out, tok);
             continue;
         }
-        if (c == '"') {
-            if (!lex_string(&lx, &tok)) goto fail;
+        if (is_digit(c)) {
+            if (!lex_number(&lx, &tok)) goto fail;
             push(out, tok);
             continue;
         }
         if (is_ident_start(c)) {
             size_t start = lx.pos;
             while (is_ident_char(peek(&lx))) advance(&lx);
-            size_t n = lx.pos - start;
-            if (n == 5 && memcmp(src + start, "print", 5) == 0) {
-                tok.kind = TOK_PRINT;
-                tok.lexeme_len = n;
-                push(out, tok);
-                continue;
-            }
-            char *word = xstrndup(src + start, n > 64 ? 64 : n);
-            lex_error(&lx, tok.line, tok.col, "unknown identifier '%s' (only 'print' is supported)", word);
-            free(word);
-            goto fail;
+            tok.lexeme_len = lx.pos - start;
+            tok.kind = TOK_IDENTIFIER;
+            for (size_t k = 0; k < sizeof KEYWORDS / sizeof *KEYWORDS; k++)
+                if (strlen(KEYWORDS[k].word) == tok.lexeme_len && memcmp(KEYWORDS[k].word, tok.lexeme, tok.lexeme_len) == 0)
+                    tok.kind = KEYWORDS[k].kind;
+            push(out, tok);
+            continue;
         }
-        {
+        int n = peek_at(&lx, 1);
+        bool two = false;
+        switch (c) {
+        case '(': tok.kind = TOK_LEFT_PAREN; break;
+        case ')': tok.kind = TOK_RIGHT_PAREN; break;
+        case '{': tok.kind = TOK_LEFT_BRACE; break;
+        case '}': tok.kind = TOK_RIGHT_BRACE; break;
+        case ',': tok.kind = TOK_COMMA; break;
+        case '.': tok.kind = TOK_DOT; break;
+        case '-': tok.kind = TOK_MINUS; break;
+        case '+': tok.kind = TOK_PLUS; break;
+        case ';': tok.kind = TOK_SEMICOLON; break;
+        case '/': tok.kind = TOK_SLASH; break;
+        case '*': tok.kind = TOK_STAR; break;
+        case '!': two = n == '='; tok.kind = two ? TOK_BANG_EQUAL : TOK_BANG; break;
+        case '=': two = n == '='; tok.kind = two ? TOK_EQUAL_EQUAL : TOK_EQUAL; break;
+        case '<': two = n == '='; tok.kind = two ? TOK_LESS_EQUAL : TOK_LESS; break;
+        case '>': two = n == '='; tok.kind = two ? TOK_GREATER_EQUAL : TOK_GREATER; break;
+        default: {
             char shown[8];
             if (c >= 0x21 && c < 0x7f) snprintf(shown, sizeof shown, "%c", c);
             else snprintf(shown, sizeof shown, "\\x%02x", c);
             lex_error(&lx, tok.line, tok.col, "unexpected character '%s'", shown);
+            goto fail;
         }
-        goto fail;
+        }
+        advance(&lx);
+        if (two) {
+            advance(&lx);
+            tok.lexeme_len = 2;
+        }
+        push(out, tok);
     }
 fail:
     token_list_free(out);
@@ -174,19 +241,19 @@ void token_list_free(TokenList *t) {
 }
 
 const char *token_kind_name(TokenKind k) {
-    switch (k) {
-    case TOK_PRINT: return "PRINT";
-    case TOK_STRING: return "STRING";
-    case TOK_SEMICOLON: return "SEMICOLON";
-    case TOK_EOF: return "EOF";
-    }
-    return "?";
+    static const char *const names[] = {
+        "LEFT_PAREN", "RIGHT_PAREN", "LEFT_BRACE", "RIGHT_BRACE", "COMMA", "DOT", "MINUS", "PLUS",
+        "SEMICOLON", "SLASH", "STAR", "BANG", "BANG_EQUAL", "EQUAL", "EQUAL_EQUAL", "GREATER",
+        "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "AND", "CLASS",
+        "ELSE", "FALSE", "FOR", "FUN", "IF", "NIL", "OR", "PRINT", "RETURN", "SUPER", "THIS", "TRUE",
+        "VAR", "WHILE", "EOF",
+    };
+    return (unsigned)k < sizeof names / sizeof *names ? names[k] : "?";
 }
 
 void tokens_dump(const TokenList *t) {
     for (size_t i = 0; i < t->len; i++) {
         const Token *k = &t->items[i];
-        printf("%d:%d\t%-10s\t%.*s\n", k->line, k->col, token_kind_name(k->kind), (int)k->lexeme_len,
-               k->lexeme);
+        printf("%d:%d\t%-14s\t%.*s\n", k->line, k->col, token_kind_name(k->kind), (int)k->lexeme_len, k->lexeme);
     }
 }
