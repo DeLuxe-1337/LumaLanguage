@@ -1,0 +1,25 @@
+// if/else chains, while, for (each clause form), truthiness
+var i = 0;
+while (i < 3) {
+  if (i == 1) print "one"; else print i;
+  i = i + 1;
+}
+for (var j = 3; j > 0; j = j - 1) print j;
+var k = 0;
+for (; k < 2;) k = k + 1;
+print k;
+for (k = 10; k < 12; k = k + 1) print k;
+if (nil) print "no"; else if (false) print "no"; else print "else-if";
+if (0) print "0 is truthy";
+if ("") print "empty string is truthy";
+if (true) if (false) print "no"; else print "dangling else binds inner";
+while (false) print "never";
+var outer = 0;
+while (outer < 2) {
+  var inner = 0;
+  while (inner < 2) {
+    print outer * 10 + inner;
+    inner = inner + 1;
+  }
+  outer = outer + 1;
+}

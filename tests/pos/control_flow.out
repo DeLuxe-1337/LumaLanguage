@@ -1,0 +1,17 @@
+0
+one
+2
+3
+2
+1
+2
+10
+11
+else-if
+0 is truthy
+empty string is truthy
+dangling else binds inner
+0
+1
+10
+11

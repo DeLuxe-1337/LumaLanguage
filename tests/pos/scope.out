@@ -1,0 +1,7 @@
+inner a
+global b
+outer a
+global a
+assigned from inner
+global a (redeclared)
+nil

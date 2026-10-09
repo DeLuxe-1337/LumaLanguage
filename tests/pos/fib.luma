@@ -1,0 +1,12 @@
+// iterative Fibonacci: after k steps a = fib(k), b = fib(k+1).
+// fib(90) is close to the 63-bit fixnum limit; fib(91) would overflow.
+var a = 0;
+var b = 1;
+var n = 0;
+while (n < 89) {
+  var t = a + b;
+  a = b;
+  b = t;
+  n = n + 1;
+}
+print b;

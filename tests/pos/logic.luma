@@ -1,0 +1,27 @@
+// and/or return operand values; short-circuit skips side effects
+print nil or "default";
+print "first" or "second";
+print false and "unreached";
+print 1 and 2;
+print nil and nil or "x";
+var hits = 0;
+false and (hits = hits + 1);
+true or (hits = hits + 1);
+true and (hits = hits + 1);
+false or (hits = hits + 10);
+print hits;
+print !nil;
+print !0;
+print !!"s";
+print 1 == 1;
+print 1 != 1;
+print nil == false;
+print nil == nil;
+print true == true;
+print 1 == "1";
+print "a" == "a";
+print "a" != "b";
+print 1 < 2;
+print 2 <= 2;
+print 3 > 4;
+print 4 >= 5;

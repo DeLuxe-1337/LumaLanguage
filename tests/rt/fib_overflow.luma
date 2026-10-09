@@ -1,0 +1,11 @@
+// one step further than tests/pos/fib.luma: fib(91) does not fit in 63 bits
+var a = 0;
+var b = 1;
+var n = 0;
+while (n < 90) {
+  var t = a + b;
+  a = b;
+  b = t;
+  n = n + 1;
+}
+print b;

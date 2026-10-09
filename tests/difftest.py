@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Differential tester: random Luma programs, compiled natively by `luma`,
+compared against an independent reference interpreter written here.
+
+Each program is generated as a small AST, rendered to Luma source, and
+evaluated by `Interp` below with Lox semantics plus Luma's integer rules
+(63-bit fixnums, overflow is a runtime error, floor division). Both stdout
+and the runtime error message (if any) must match exactly.
+
+usage: tests/difftest.py [COUNT] [SEED]      (run from the repository root)
+"""
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FIXMAX = 2**62 - 1
+FIXMIN = -2**62
+LUMA = os.environ.get("LUMA", "build/luma")
+HAVE_AS = shutil.which("as") is not None
+
+
+class LumaError(Exception):
+    pass
+
+
+class TooBig(Exception):
+    """Program builds strings too large to be a useful test (e.g. s = s + s in
+    nested loops grows exponentially); it is skipped, not compared."""
+
+
+MAX_STR = 100_000
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def check(n):
+    if n < FIXMIN or n > FIXMAX:
+        raise LumaError("Integer overflow.")
+    return n
+
+
+def truthy(v):
+    return not (v is None or v is False)
+
+
+def equal(a, b):
+    if type(a) is not type(b):
+        return False
+    return a == b
+
+
+def show(v):
+    if v is None:
+        return "nil"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    return str(v)
+
+
+# ---------------------------------------------------------------- AST + render
+# expressions: ('int', n) ('str', s) ('nil',) ('bool', b) ('var', name)
+#              ('assign', name, e) ('un', op, e) ('bin', op, l, r) ('log', op, l, r)
+# statements:  ('print', e) ('expr', e) ('var', name, e) ('block', [stmts])
+#              ('if', c, then, else|None) ('loop', counter, n, [stmts])
+
+
+def esc(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
+
+
+def render_e(e):
+    k = e[0]
+    if k == "int":
+        return str(e[1]) if e[1] >= 0 else "(-%d)" % -e[1]
+    if k == "str":
+        return '"%s"' % esc(e[1])
+    if k == "nil":
+        return "nil"
+    if k == "bool":
+        return "true" if e[1] else "false"
+    if k == "var":
+        return e[1]
+    if k == "assign":
+        return "(%s = %s)" % (e[1], render_e(e[2]))
+    if k == "un":
+        return "(%s%s)" % (e[1], render_e(e[2]))
+    return "(%s %s %s)" % (render_e(e[2]), e[1], render_e(e[3]))
+
+
+def render_s(s, ind=0):
+    p = "  " * ind
+    k = s[0]
+    if k == "print":
+        return p + "print %s;\n" % render_e(s[1])
+    if k == "expr":
+        return p + "%s;\n" % render_e(s[1])
+    if k == "var":
+        return p + "var %s = %s;\n" % (s[1], render_e(s[2]))
+    if k == "block":
+        return p + "{\n" + "".join(render_s(x, ind + 1) for x in s[1]) + p + "}\n"
+    if k == "if":
+        out = p + "if (%s)\n" % render_e(s[1]) + render_s(s[2], ind + 1)
+        if s[3] is not None:
+            out += p + "else\n" + render_s(s[3], ind + 1)
+        return out
+    if k == "loop":
+        c = s[1]
+        body = "".join(render_s(x, ind + 1) for x in s[3])
+        return (p + "var %s = %d;\n" % (c, s[2]) + p + "while (%s > 0) {\n" % c + body
+                + p + "  %s = %s - 1;\n" % (c, c) + p + "}\n")
+    raise ValueError(k)
+
+
+# ---------------------------------------------------------------- interpreter
+class Interp:
+    def __init__(self):
+        self.out = []
+        self.scopes = [{}]
+
+    def lookup(self, name):
+        for sc in reversed(self.scopes):
+            if name in sc:
+                return sc
+        raise AssertionError("generator bug: undefined " + name)
+
+    def ev(self, e):
+        k = e[0]
+        if k == "int":
+            return e[1]
+        if k == "str":
+            return e[1]
+        if k == "nil":
+            return None
+        if k == "bool":
+            return e[1]
+        if k == "var":
+            return self.lookup(e[1])[e[1]]
+        if k == "assign":
+            v = self.ev(e[2])
+            self.lookup(e[1])[e[1]] = v
+            return v
+        if k == "un":
+            v = self.ev(e[2])
+            if e[1] == "!":
+                return not truthy(v)
+            if not is_int(v):
+                raise LumaError("Operand must be a number.")
+            return check(-v)
+        if k == "log":
+            left = self.ev(e[2])
+            if e[1] == "or":
+                return left if truthy(left) else self.ev(e[3])
+            return self.ev(e[3]) if truthy(left) else left
+        op, a, b = e[1], self.ev(e[2]), self.ev(e[3])
+        if op == "==":
+            return equal(a, b)
+        if op == "!=":
+            return not equal(a, b)
+        if op == "+":
+            if is_int(a) and is_int(b):
+                return check(a + b)
+            if isinstance(a, str) and isinstance(b, str):
+                if len(a) + len(b) > MAX_STR:
+                    raise TooBig()
+                return a + b
+            raise LumaError("Operands must be two numbers or two strings.")
+        if not (is_int(a) and is_int(b)):
+            raise LumaError("Operands must be numbers.")
+        if op == "-":
+            return check(a - b)
+        if op == "*":
+            return check(a * b)
+        if op == "/":
+            if b == 0:
+                raise LumaError("Division by zero.")
+            return check(a // b)
+        return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
+
+    def run(self, stmts):
+        for s in stmts:
+            self.ex(s)
+
+    def ex(self, s):
+        k = s[0]
+        if k == "print":
+            self.out.append(show(self.ev(s[1])))
+        elif k == "expr":
+            self.ev(s[1])
+        elif k == "var":
+            v = self.ev(s[2])
+            self.scopes[-1][s[1]] = v
+        elif k == "block":
+            self.scopes.append({})
+            try:
+                self.run(s[1])
+            finally:
+                self.scopes.pop()
+        elif k == "if":
+            if truthy(self.ev(s[1])):
+                self.ex(s[2])
+            elif s[3] is not None:
+                self.ex(s[3])
+        elif k == "loop":
+            c = s[1]
+            self.scopes[-1][c] = s[2]
+            while self.scopes[-1][c] > 0:
+                self.scopes.append({})
+                try:
+                    self.run(s[3])
+                finally:
+                    self.scopes.pop()
+                self.scopes[-1][c] = self.scopes[-1][c] - 1
+
+
+# ---------------------------------------------------------------- generator
+# Programs are mostly well typed so they run long enough to exercise control
+# flow, scoping and arithmetic; with probability ERR_RATE an expression is
+# deliberately ill typed (or a divisor may be zero) to exercise error paths.
+# Each variable keeps one static type for its lifetime; assignments preserve it.
+TYPES = ("int", "str", "bool", "nil")
+ERR_RATE = 0.01
+
+
+class Gen:
+    def __init__(self, rng):
+        self.r = rng
+        self.n = 0
+        self.scopes = [{}]   # per scope: name -> static type (assignable variables)
+
+    def fresh(self, prefix):
+        self.n += 1
+        return "%s%d" % (prefix, self.n)
+
+    def visible(self):
+        seen = {}
+        for sc in self.scopes:
+            seen.update(sc)   # inner declarations shadow outer ones
+        return seen
+
+    def literal(self, t):
+        r = self.r
+        if t == "int":
+            if r.random() < 0.04:   # rare: values near the fixnum limits (overflow paths)
+                return ("int", r.choice([FIXMAX, FIXMIN + 1, 2**31, 3037000499, 2**40]))
+            return ("int", r.choice([0, 1, 2, 3, 7, 10, -1, -5, 100, r.randint(-1000, 1000), r.randint(-10**6, 10**6)]))
+        if t == "str":
+            return ("str", r.choice(["", "a", "ab", "x y", "q\"t", "tab\t", "nl\n", "é", "#"]))
+        if t == "bool":
+            return ("bool", r.random() < 0.5)
+        return ("nil",)
+
+    def expr(self, t, depth, exclude=()):
+        """An expression of static type t (unless an error is injected)."""
+        r = self.r
+        if r.random() < ERR_RATE:
+            t = r.choice(TYPES)   # type confusion: may produce a runtime error
+        names = [v for v, vt in self.visible().items() if vt == t and v not in exclude]
+        if depth <= 0 or r.random() < 0.2:
+            if names and r.random() < 0.6:
+                return ("var", r.choice(names))
+            return self.literal(t)
+        c = r.random()
+        if c < 0.08 and names:
+            return ("assign", r.choice(names), self.expr(t, depth - 1, exclude))
+        if c < 0.2:   # same-typed short-circuit: result has the operands' type
+            return ("log", r.choice(["and", "or"]), self.expr(t, depth - 1, exclude), self.expr(t, depth - 1, exclude))
+        if t == "int":
+            if c < 0.3:
+                return ("un", "-", self.expr("int", depth - 1, exclude))
+            op = r.choice(["+", "+", "-", "-", "*", "/"])
+            right = self.expr("int", depth - 1, exclude)
+            if op == "/" and right[0] == "int" and right[1] == 0 and r.random() > ERR_RATE:
+                right = ("int", r.choice([1, 2, 3, -7]))
+            elif op == "/" and right[0] != "int" and r.random() > ERR_RATE * 5:
+                right = ("int", r.choice([1, 2, 3, 5, -2, -3]))   # avoid dividing by a value that may be 0
+            return ("bin", op, self.expr("int", depth - 1, exclude), right)
+        if t == "str":
+            return ("bin", "+", self.expr("str", depth - 1, exclude), self.expr("str", depth - 1, exclude))
+        if t == "bool":
+            if c < 0.35:
+                return ("un", "!", self.expr(r.choice(TYPES), depth - 1, exclude))
+            if c < 0.65:
+                return ("bin", r.choice(["==", "!="]), self.expr(r.choice(TYPES), depth - 1, exclude),
+                        self.expr(r.choice(TYPES), depth - 1, exclude))
+            return ("bin", r.choice(["<", "<=", ">", ">="]), self.expr("int", depth - 1, exclude),
+                    self.expr("int", depth - 1, exclude))
+        return self.literal("nil")
+
+    def any_type(self):
+        return self.r.choice(("int", "int", "int", "str", "str", "bool", "nil"))
+
+    def stmts(self, n, depth):
+        return [self.stmt(depth) for _ in range(n)]
+
+    def scoped(self, n, depth):
+        self.scopes.append({})
+        body = self.stmts(n, depth)
+        self.scopes.pop()
+        return body
+
+    def stmt(self, depth):
+        r = self.r
+        c = r.random()
+        vis = self.visible()
+        if c < 0.3:
+            return ("print", self.expr(self.any_type(), 3))
+        if c < 0.45:
+            top = len(self.scopes) == 1
+            if top and vis and r.random() < 0.3:
+                name = r.choice(list(vis))                      # top-level redeclaration
+            elif not top and vis and r.random() < 0.3:
+                name = r.choice([v for v in vis if v not in self.scopes[-1]] or [self.fresh("v")])  # shadowing
+            else:
+                name = self.fresh("v")
+            t = self.any_type()
+            init = self.expr(t, 3, exclude=() if top else (name,))
+            self.scopes[-1][name] = t
+            return ("var", name, init)
+        if c < 0.6 and vis:
+            name = r.choice(list(vis))
+            return ("expr", ("assign", name, self.expr(vis[name], 3)))
+        if c < 0.67:
+            return ("expr", self.expr(self.any_type(), 2))
+        if depth <= 0:
+            return ("print", self.expr(self.any_type(), 2))
+        if c < 0.77:
+            return ("block", self.scoped(r.randint(1, 4), depth - 1))
+        if c < 0.88:
+            cond = self.expr(r.choice(("bool", "bool", "int", "nil", "str")), 2)
+            then = ("block", self.scoped(r.randint(1, 3), depth - 1))
+            els = ("block", self.scoped(r.randint(1, 3), depth - 1)) if r.random() < 0.5 else None
+            return ("if", cond, then, els)
+        counter = self.fresh("c")   # never added to the assignable names
+        return ("loop", counter, r.randint(0, 4), self.scoped(r.randint(1, 3), depth - 1))
+
+
+def one(seed, workdir):
+    rng = random.Random(seed)
+    g = Gen(rng)
+    prog = g.stmts(rng.randint(3, 14), 3)
+    src = "".join(render_s(s) for s in prog)
+    it = Interp()
+    err = None
+    try:
+        it.run(prog)
+    except LumaError as e:
+        err = str(e)
+    except TooBig:
+        return "skip"
+    want_out = "".join(line + "\n" for line in it.out)
+    want_err = "" if err is None else "luma: runtime error: %s\n" % err
+    want_rc = 0 if err is None else 1
+
+    path = os.path.join(workdir, "p.luma")
+    with open(path, "w") as f:
+        f.write(src)
+    exe = os.path.join(workdir, "p")
+    c = subprocess.run([LUMA, path, "-o", exe], capture_output=True, text=True)
+    if c.returncode != 0:
+        return src, "compile failed:\n" + c.stderr
+    # The emitted IR, compiled on its own, must give identical assembly.
+    with open(exe + ".lir") as f:
+        lir = f.read()
+    lir_copy = os.path.join(workdir, "copy.lir")
+    with open(lir_copy, "w") as f:
+        f.write(lir)
+    c2 = subprocess.run([LUMA, lir_copy, "-S", "-o", os.path.join(workdir, "copy")], capture_output=True, text=True)
+    with open(exe + ".s") as f1, open(os.path.join(workdir, "copy.s")) as f2:
+        if c2.returncode != 0 or f1.read().split("\n", 1)[1] != f2.read().split("\n", 1)[1]:
+            return src, "IR round trip: .lir did not recompile to identical assembly\n" + c2.stderr
+    # GNU as (validation only) must produce the same bytes from our .s.
+    if HAVE_AS:
+        g = os.path.join(workdir, "gas.o")
+        subprocess.run(["as", "--64", "-o", g, exe + ".s"], check=True)
+        for sec in (".text", ".rodata"):
+            subprocess.run(["objcopy", "-O", "binary", "-j", sec, exe + ".o", g + ".l"], check=True)
+            subprocess.run(["objcopy", "-O", "binary", "-j", sec, g, g + ".g"], check=True)
+            with open(g + ".l", "rb") as a, open(g + ".g", "rb") as b:
+                if a.read() != b.read():
+                    return src, "section %s differs from GNU as" % sec
+    r = subprocess.run([exe], capture_output=True, timeout=30)
+    got_out, got_err = r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+    if (got_out, got_err, r.returncode) != (want_out, want_err, want_rc):
+        return src, ("expected rc=%d out=%r err=%r\n     got rc=%d out=%r err=%r"
+                     % (want_rc, want_out, want_err, r.returncode, got_out, got_err))
+    return None
+
+
+def main():
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    base = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    failures = 0
+    skipped = 0
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(count):
+            res = one(base + i, d)
+            if res == "skip":
+                skipped += 1
+            elif res:
+                failures += 1
+                src, why = res
+                print("MISMATCH seed=%d\n%s\n--- program ---\n%s" % (base + i, why, src))
+                if failures >= 3:
+                    break
+    print("difftest: %d programs (%d skipped: oversized strings), %d mismatch(es)" % (count, skipped, failures))
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

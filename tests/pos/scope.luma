@@ -1,0 +1,19 @@
+// lexical block scoping, shadowing, top-level redeclaration
+var a = "global a";
+var b = "global b";
+{
+  var a = "outer a";
+  {
+    var a = "inner a";
+    print a;
+    print b;
+    b = "assigned from inner";
+  }
+  print a;
+}
+print a;
+print b;
+var a = a + " (redeclared)";
+print a;
+var u;
+print u;

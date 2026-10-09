@@ -1,1 +1,1 @@
-unknown identifier 'echo'
+expected ';' after expression, found string literal
