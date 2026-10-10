@@ -1,4 +1,4 @@
-# LIR: the Luma intermediate representation (spec v0.1)
+# LIR: the Luma intermediate representation (spec v0.2)
 
 **Status:** implemented in milestone 2. The decisions in section 13 are resolved,
 and the places where the implementation refined the original draft are listed in section 14.
@@ -96,14 +96,17 @@ offset 8   …            type-specific
 
 ```
 module      := 'module' STRING NL { toplevel }
-toplevel    := extern | data | function
+toplevel    := extern | data | global | function
 extern      := 'extern' 'fn' GLOBAL '(' INT ')' NL          ; arity
 data        := 'data' GLOBAL '=' 'str' STRING NL
+global      := 'global' GLOBAL NL                            ; module variable (v0.2)
 function    := 'fn' GLOBAL '(' [ VREG { ',' VREG } ] ')' '{' NL { block } '}' NL
 block       := LABEL ':' NL { instr NL } terminator NL
 instr       := VREG '=' op
              | 'call' GLOBAL '(' args ')'                    ; result discarded
+             | 'store' GLOBAL ',' VREG                       ; v0.2
 op          := 'const' ( INT | 'nil' | 'true' | 'false' | GLOBAL )
+             | 'load' GLOBAL                                 ; v0.2
              | 'mov' VREG
              | BINOP VREG ',' VREG
              | UNOP VREG
@@ -151,6 +154,8 @@ All operands and results are `val`.
 | `lt le gt ge` | fixnum compare only. Strings are a type error, as in Lox. | type error |
 | `%d = call @f(%a, …)` | call a LIR function or extern; at most 6 arguments in v0.1 | whatever `@f` does |
 | `call @f(…)` | the same, result discarded | |
+| `%d = load @g` | read global variable `@g` | `Undefined variable 'NAME'.` if `@g` was never stored (v0.2) |
+| `store @g, %a` | write global variable `@g` | no (v0.2) |
 | `jmp L` | unconditional branch | |
 | `br %c, T, F` | go to `T` if `%c` is truthy, otherwise `F` | no |
 | `ret %v` | return `%v` | |
@@ -170,6 +175,8 @@ The verifier runs after `lower.c` and after `ir_parse.c`, and always runs before
 5. vregs may be read before being written on some path from entry. This uses a simple forward data-flow analysis, so the front end's definite-assignment rule is enforced again here;
 6. `const` integers are outside the 63-bit fixnum range;
 7. `const @x` references something other than a `data` global.
+8. `load`/`store` reference something other than a `global` variable, or a
+   call targets a `data` or `global` (v0.2).
 
 Error format: `file.lir:LINE: error: …` for parsed IR, and
 `<function>/<block>: error: …` for IR built in memory.
@@ -181,7 +188,10 @@ These are C functions following the System V ABI. Every argument and return valu
 | Symbol | Purpose |
 |---|---|
 | `main` | Owned by the runtime. Calls `luma_main()`, flushes stdout, and returns 0 (or 1 if the flush fails). Future runtime initialization (GC, argv) lives here. |
-| `luma_print(v)` | Writes `v`'s display form followed by `'\n'`. Strings are written raw; fixnums in decimal; `nil`, `true` and `false` as words. Returns `nil`. |
+| `luma_write(v)` | Writes `v`'s display form: strings raw, fixnums in decimal, `nil`/`true`/`false` as words. Returns `nil`. (v0.2) |
+| `luma_write_space()`, `luma_write_newline()` | Write `' '` / `'\n'`. Together with `luma_write` they implement the variadic builtin `print`. Return `nil`. (v0.2) |
+| `luma_print(v)` | `luma_write(v)` followed by a newline. Kept for hand-written LIR. Returns `nil`. |
+| `luma_undefined_variable(name)` | Called by a checked `load`. Reports `Undefined variable 'name'.` and exits with status 1. (v0.2) |
 | `luma_add/sub/mul/div/mod(a,b)` | Generic arithmetic slow paths, including all error checks. |
 | `luma_neg(a)`, `luma_not(a)` | |
 | `luma_eq/ne/lt/le/gt/ge(a,b)` | |
@@ -311,13 +321,15 @@ undefined symbols are always long, with an `R_X86_64_PC32` relocation.
 ```
 module "examples/hello.luma"
 
-extern fn @luma_print(1)
 data @s0 = str "Hello, world!"
+extern fn @luma_write(1)
+extern fn @luma_write_newline(0)
 
 fn @luma_main() {
 entry:
   %0 = const @s0
-  call @luma_print(%0)
+  call @luma_write(%0)
+  call @luma_write_newline()
   %1 = const nil
   ret %1
 }
@@ -389,3 +401,49 @@ These are deferred, and each is listed with the milestone where it belongs:
   for byte against GNU `as`.
 - **Verifier diagnostics** use the input's line numbers: `.lir` lines for
   parsed IR, and `.luma` lines for lowered IR.
+
+## 15. v0.2 additions (milestone 3)
+
+- **Module globals.** `global @g` declares an 8-byte slot in `.data`,
+  initialized to 0, which is never a valid value.
+  - `%d = load @g` reads the slot. The backend checks it, so a slot that was
+    never stored raises `Undefined variable 'NAME'.` at runtime.
+  - `store @g, %v` writes the slot.
+  - `NAME` in that message is the global's name after its first `.`, so
+    lowering's `@var.count` reports `count`.
+  - Lowering:
+
+    ```asm
+    # %d = load @g
+        mov rax, [rip + .Lvar.g]
+        test rax, rax
+        jne .Lload_ok.N
+        lea rdi, [rip + .Lvarname.g]     # NUL-terminated display name in .rodata
+        call luma_undefined_variable@PLT
+    .Lload_ok.N:
+        mov [rbp - d], rax
+    # store @g, %a
+        mov rax, [rbp - a]
+        mov [rip + .Lvar.g], rax
+    ```
+- **Naming convention used by lowering.** The dots keep these names from ever
+  colliding with C or runtime symbols:
+
+  | LIR name | Meaning |
+  |---|---|
+  | `@luma_main` | top-level code |
+  | `@fn.NAME` | user functions |
+  | `@var.NAME` | top-level variables |
+  | `@sN` | string literals |
+  | `@luma_*` | runtime externs |
+
+- **`print(a, b, …)`** lowers to `call @luma_write(%a)`, then
+  `call @luma_write_space()` and `call @luma_write(%b)` for each further
+  argument, then `call @luma_write_newline()`. All argument values are
+  computed before the first write.
+- **Canonicalization** (`ir_func_canonicalize`) now also drops vregs that no
+  instruction references, such as those left behind when lowering prunes code
+  after a `return`. A lowered module and its re-parsed `.lir` still produce
+  identical assembly, and the test suite checks this for every program.
+- **Unreachable blocks** are removed by lowering, so `ret` can be followed by
+  dead source code without the IR containing it.

@@ -5,16 +5,21 @@ This repository holds the **bootstrap compiler**, which is written in C. It
 includes its own intermediate representation (LIR), x86-64 assembler and ELF64
 object writer.
 
-The current surface syntax follows Lox. It will change before Luma bootstraps.
+The syntax started from Lox and is moving away from it: `print` is a
+builtin function, and optional types and a C FFI are next. Nothing is final
+before Luma bootstraps.
 
 ```js
-// examples/fizzbuzz.luma
-for (var i = 1; i <= 15; i = i + 1) {
-  if (i - i / 15 * 15 == 0) print "FizzBuzz";
-  else if (i - i / 3 * 3 == 0) print "Fizz";
-  else if (i - i / 5 * 5 == 0) print "Buzz";
-  else print i;
+fun fib(n) {
+  if (n < 2) return n;
+  return fib(n - 1) + fib(n - 2);
 }
+
+var calls = 0;
+fun counted(x) { calls = calls + 1; return x * x; }
+
+for (var i = 0; i < 5; i = i + 1) print("fib", i * 5, "=", fib(i * 5));
+print("square:", counted(12), "calls:", calls);
 ```
 
 ## Quick start
@@ -77,10 +82,13 @@ The standalone assembler takes assembly directly:
 | | |
 |---|---|
 | Values | 63-bit integers, strings, `true`, `false`, `nil` |
-| Statements | `var`, `print`, expression statements, `{ }` blocks, `if`/`else`, `while`, `for` |
+| Functions | `fun name(a, b) { … return v; }` at top level, called as `name(x, y)`. Recursion and mutual recursion work, and functions can be called before their definition. Up to 6 parameters. Arity is checked at compile time. A missing `return` returns `nil`. |
+| Builtins | `print(a, b, …)` writes its arguments separated by spaces, then a newline, and returns `nil`. All arguments are evaluated before anything is written. |
+| Statements | `var`, expression statements, `{ }` blocks, `if`/`else`, `while`, `for`, `return` |
 | Operators | `= or and == != < <= > >= + - * / ! -` (unary), and `+` on two strings concatenates them |
-| Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Lexical block scoping is checked at compile time. Integer overflow and type errors are runtime errors (exit status 1). `/` is floor division. |
-| Not yet | functions, classes, floats, `break`, a GC (runtime strings are never freed) |
+| Variables | Top-level variables are globals that functions can read and write. Variables in blocks and functions are local, with lexical scoping checked at compile time. |
+| Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Integer overflow, type errors, reading a global before it is assigned, and stack overflow are runtime errors (exit status 1). `/` is floor division. |
+| Not yet | first-class functions and closures, optional types and C FFI (next milestone), classes, floats, `break`, a GC (runtime strings are never freed) |
 
 ## Inspecting the intermediate files
 
@@ -102,7 +110,7 @@ make selftest    # compile and run examples/selftest.luma
 ```
 
 `examples/selftest.luma` is a Luma program that checks the compiler from the
-inside. It runs 77 checks covering:
+inside. It runs 91 checks covering:
 
 - arithmetic and floor division
 - fixnum limits
@@ -115,13 +123,14 @@ inside. It runs 77 checks covering:
 - loops (gcd, primes and fib(90))
 - evaluation order
 - `else` binding
+- functions: recursion, mutual recursion, hoisting, early return, globals
 
 Each failing check prints `FAIL: <description>`. The program ends with
-`SELFTEST PASSED` (exit 0) or `SELFTEST FAILED` (exit 1). Until Luma has
-functions, each check is written out inline:
+`SELFTEST PASSED` (exit 0) or `SELFTEST FAILED` (exit 1). Each check is one
+call to a `check` function defined in the file:
 
 ```js
-t = t + 1; if (!(-7 / 2 == -4)) { f = f + 1; print "FAIL: -7 / 2 floors toward -infinity"; }
+check(-7 / 2 == -4, "-7 / 2 floors toward -infinity");
 ```
 
 | Location | Contents |

@@ -1,4 +1,4 @@
-# Luma bootstrap compiler: design notes (milestone 2)
+# Luma bootstrap compiler: design notes (milestone 3)
 
 This document describes how the Luma toolchain is built. Its sections cover:
 
@@ -56,17 +56,19 @@ Every stage can be inspected or tested on its own:
 shared by the compiler, which emits tagged constants, and the runtime, which
 interprets them.
 
-## Language (milestone 2: Lox-style)
+## Language (milestone 3)
 
-The grammar is in `src/ast.h`. In summary:
+The grammar is in `src/ast.h`. It started from Lox, and milestone 3 begins
+to diverge: `print` is a builtin function, and functions are compiled
+statically.
 
-- **Declarations:** `var name;`, `var name = expr;`
-- **Statements:**
-  - `print expr;` and expression statements
-  - blocks `{ … }`
-  - `if (…) … else …`, where `else` binds to the nearest `if`
-  - `while (…) …`
-  - `for (init; cond; incr) …`, with every clause optional
+- **Declarations:**
+  - `fun name(a, b) { … }`, at top level only for now
+  - `var name;`, `var name = expr;`
+- **Statements:** expression statements, blocks `{ … }`, `if (…) … else …`
+  (`else` binds to the nearest `if`), `while (…) …`,
+  `for (init; cond; incr) …` with every clause optional, and `return expr;` or
+  `return;` (inside functions only).
 - **Expressions**, from lowest to highest precedence:
   1. assignment (right-associative, target must be a bare identifier)
   2. `or`
@@ -76,28 +78,48 @@ The grammar is in `src/ast.h`. In summary:
   6. `+` and `-`
   7. `*` and `/`
   8. unary `!` and `-`
-  9. literals, variables and parentheses
-- **Values:** integers, strings, `true`, `false` and `nil`.
-  - **Truthiness:** only `nil` and `false` are falsy, so `0` and `""` are truthy.
-  - **Equality:** values of different types are never equal, and strings compare by content.
-  - **`and` / `or`:** they short-circuit and return one of their operand values, as in Lox.
-- **Scoping:** lexical and block-based, resolved at compile time.
-  - Shadowing is allowed in nested blocks.
-  - Redeclaring a name in the same block is an error, but redeclaring at top level is allowed.
-  - A block-local variable cannot be read in its own initializer.
-  - Reading or assigning an undeclared name is a compile error.
-
-  Reference Lox reports these at run time for globals; Luma reports them at compile time.
+  9. calls `name(args…)`
+  10. literals, variables and parentheses
+- **Values:** integers, strings, `true`, `false` and `nil`. Truthiness, equality
+  and the values returned by `and`/`or` follow Lox.
+- **Functions:**
+  - They are hoisted: any function can call any other, before or after its definition.
+  - Arity is checked at compile time, with at most 6 parameters for now.
+  - A missing `return` returns `nil`.
+  - Parameters and the body's top-level declarations share one scope, so
+    redeclaring a parameter is an error.
+  - Functions are **not first-class values yet**. A function name may only
+    be used as a callee, and nested functions (closures) are rejected with a
+    specific error.
+- **`print(a, b, …)`** is a builtin function:
+  - It evaluates all of its arguments first, then writes them separated by single spaces, followed by a newline.
+  - `print()` writes just a newline.
+  - It returns `nil`.
+  - Using `print` without calling it, or redefining it, is an error. The old
+    statement form `print x;` gets the hint "print is a function now".
+- **Variables:**
+  - **Top-level variables** are module globals.
+    - Top-level code sees those declared earlier.
+    - Function bodies see all of them.
+    - A function reading a global whose declaration hasn't executed yet gets
+      the runtime error `Undefined variable 'x'.`
+    - Redeclaring a global at top level reuses its slot, and the initializer sees the previous value.
+  - **Block and function variables** are lexically scoped locals, resolved at compile time.
+    - Shadowing is allowed in nested blocks.
+    - Redeclaring a name in the same block is an error.
+    - A local cannot be read in its own initializer.
 - **Comments:** `//` to end of line.
 
 Differences from reference Lox:
 
-| | Reference Lox | Luma (v0.1) |
+| | Reference Lox | Luma (milestone 3) |
 |---|---|---|
 | Numbers | doubles | 63-bit integers; literals 0 … 2⁶²−1; overflow is a runtime error; `/` is floor division |
-| Float literals | yes | rejected ("not supported yet") |
+| `print` | statement: `print x;` | builtin function: `print(a, b, …)` |
+| Functions | first-class closures | top-level, hoisted, statically resolved; not first-class (yet) |
+| Undefined names | runtime errors | compile errors; a global read before its declaration executes is a runtime error |
 | Strings | multi-line, no escapes | single line; `\"` `\\` `\n` `\t` |
-| `fun`, `return`, `class`, `this`, `super` | yes | rejected ("not supported yet") |
+| `class`, `this`, `super`, float literals | yes | rejected ("not supported yet") |
 
 Compile errors have the form `path:line:col: error: message`, and compilation
 stops at the first one. When it does, no `.lir`, `.s`, `.o` or executable is
@@ -112,8 +134,10 @@ which calls `luma_main()`, flushes stdout, and exits with status 0.
 
 | Function | Purpose |
 |---|---|
-| `luma_print` | prints a value and a newline |
+| `luma_write`, `luma_write_space`, `luma_write_newline` | back `print(...)`: each argument is written, separated by spaces, and the line is ended with a newline |
+| `luma_print` | writes a value and a newline (kept for hand-written LIR) |
 | `luma_add/sub/mul/div/mod/neg/not/eq/ne/lt/le/gt/ge` | generic operations |
+| `luma_undefined_variable(name)` | called by a checked global `load` that finds an unassigned slot |
 
 The generic operations behave as follows:
 
@@ -124,7 +148,19 @@ The generic operations behave as follows:
   because v0.1 has no GC.
 
 A runtime error flushes stdout, prints `luma: runtime error: <Lox-style
-message>` to stderr, and exits with status 1. The runtime is compiled with
+message>` to stderr, and exits with status 1.
+
+**Stack overflow.** `main` installs a `SIGSEGV` handler on an alternate signal
+stack. Unbounded recursion therefore reports `luma: runtime error: Stack
+overflow.` (exit 1) instead of crashing with a bare segmentation fault.
+Generated code only touches its own frame, the globals and runtime objects, so
+a fault is almost always the stack. Any other memory fault would be reported
+the same way.
+
+Frames are large for now, because every virtual register has its own stack
+slot. A small recursive function uses about 100 bytes per call, so with the
+default 8 MB stack recursion overflows somewhere between 80,000 and 100,000
+calls deep. The runtime is compiled with
 `RT_CFLAGS`, separate from the compiler's `CFLAGS`, so a sanitizer build of
 the compiler doesn't leak instrumentation into user programs.
 
@@ -142,7 +178,17 @@ See [IR.md](IR.md) section 8 for the per-instruction templates.
   - Jumps to the next block are omitted.
 - **Comments:** every LIR instruction appears as a `#` comment above its code,
   so `OUT.s` can be read side by side with `OUT.lir`.
+- **Calls:** arguments are passed in `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`
+  (System V), and the callee spills them into its parameter slots. The result
+  comes back in `rax`.
+- **Globals:** each one is an 8-byte slot in `.data` (`.Lvar.NAME`),
+  initialized to 0, which is never a valid value. `store` writes the slot.
+  `load` reads it, and calls `luma_undefined_variable` with the variable's
+  name if it's still 0.
 - **Symbols:**
+  - Lowering names user functions `@fn.NAME`, globals `@var.NAME` and strings
+    `@sN`. The dots keep them from ever colliding with C or runtime symbols
+    such as `puts` or `luma_add`, because C identifiers can't contain dots.
   - LIR functions are emitted as global `FUNC` symbols.
   - String literals become static objects in `.rodata`, each 8-aligned with a header and length.
   - The data label `@sN` becomes `.Ldata.sN`, and the block `B` of function `F` becomes `.LF.B`.
@@ -334,4 +380,5 @@ tests.
 |---|---|
 | `make unit` | lexer, parser, lowering, IR parse/print/verify, assembler encodings and relaxation, ELF layout (built by hand) |
 | `make e2e` (`tests/run_e2e.sh`) | hello world pipeline and object inspection; for every `tests/pos` program: exact output, GNU `as` byte equivalence, `.lir` recompilation identity and IR round trip; compile errors with locations; runtime errors (exact stdout, stderr and exit status); hand-written `.lir` programs; lasm on its own |
-| `make difftest` (`tests/difftest.py`) | random, mostly well-typed programs (with injected type errors, overflow and division by zero) compiled natively and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks for each program |
+| `make difftest` (`tests/difftest.py`) | random, mostly well-typed programs with functions (an acyclic call graph, early returns, globals) and multi-argument `print`, with injected type errors, overflow and division by zero. Each program is compiled natively and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
+| `make selftest` | `examples/selftest.luma`: 91 checks written in Luma itself, built on a `check()` function |

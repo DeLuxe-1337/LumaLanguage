@@ -137,7 +137,7 @@ if "$LUMA" examples/selftest.luma -o "$st" >"$OUT/last.log" 2>&1; then
     stst=$?
     # exact match pins the number of checks run, so silently skipped checks also fail
     if [ $stst -eq 0 ] && cmp -s "$st.actual" tests/selftest.out && [ ! -s "$st.stderr" ]; then
-        ok "selftest: $(sed -n 2p "$st.actual") checks passed, exit 0"
+        ok "$(sed -n 1p "$st.actual"), exit 0"
     else
         bad "selftest (exit $stst)"; cat "$st.actual" "$st.stderr" | sed 's/^/      /'
     fi
