@@ -104,10 +104,13 @@ module      := 'module' STRING NL { toplevel }
 toplevel    := extern | cextern | data | global | function
 extern      := 'extern' 'fn' GLOBAL '(' INT ')' NL          ; arity
 data        := 'data' GLOBAL '=' 'str' STRING NL
-global      := 'global' GLOBAL NL                            ; module variable (v0.2)
+global      := 'global' GLOBAL [ ':' TYPE ] NL               ; module variable (v0.2; type v0.4)
 cextern     := 'extern' 'c' 'fn' GLOBAL '(' [ IDENT ':' CTYPE { ',' IDENT ':' CTYPE } ] ')' ':' CTYPE NL  ; v0.3
 CTYPE       := i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64 | bool | cstr | cstr '?' | ptr | void
-function    := 'fn' GLOBAL '(' [ VREG { ',' VREG } ] ')' '{' NL { block } '}' NL
+function    := 'fn' GLOBAL '(' [ param { ',' param } ] ')' [ ':' TYPE ] '{' NL { block } '}' NL
+param       := VREG [ ':' TYPE ]                             ; types v0.4
+TYPE        := TNAME [ '?' ] { '|' TNAME [ '?' ] }           ; v0.4
+TNAME       := int | str | bool | nil | any
 block       := LABEL ':' NL { instr NL } terminator NL
 instr       := VREG '=' op
              | 'call' GLOBAL '(' args ')'                    ; result discarded
@@ -118,6 +121,7 @@ op          := 'const' ( INT | 'nil' | 'true' | 'false' | GLOBAL )
              | BINOP VREG ',' VREG
              | UNOP VREG
              | 'call' GLOBAL '(' args ')'
+             | 'check' VREG ',' TYPE ',' GLOBAL              ; v0.4
 terminator  := 'jmp' LABEL
              | 'br' VREG ',' LABEL ',' LABEL
              | 'ret' VREG
@@ -563,9 +567,10 @@ goes through:
 4. out of SSA (one fresh temporary per phi), copy coalescing, a final CFG
    cleanup, and canonical vreg numbering.
 
-`phi` and `nop` exist only inside the optimizer: they print and parse, so a
-dump taken mid-pipeline can be read, but the verifier rejects them, so they
-never reach a backend. Optimization never changes observable behaviour,
+`phi` (`%d = phi [%a, B1], [%b, B2]`) and `nop` exist only inside the
+optimizer. The printer can show them, so a dump taken mid-pipeline can be
+read, but the parser and the verifier reject them, so they never reach a
+backend. Optimization never changes observable behaviour,
 including which runtime error a program stops with and the output printed
 before it.
 
