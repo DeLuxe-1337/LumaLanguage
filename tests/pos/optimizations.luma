@@ -1,0 +1,24 @@
+// Each function gives the optimizer one thing to do. tests/run_e2e.sh checks
+// the optimized IR (OUT.opt.lir) for it; the output must not change at any -O.
+
+fun folded() { return 6 * 7; }                         // constant folding
+
+fun branch() {                                         // branch simplification
+  if (1 < 2) return "yes";
+  return "no";
+}
+
+fun dead(x: int) {                                     // dead-code elimination
+  var unused = x == 3;                                 // (== can never fail)
+  return x;
+}
+
+fun cse(a: int, b: int) { return (a + b) * (a + b); }  // common subexpressions
+
+fun hoist(n: int) {                                    // loop-invariant code motion
+  var s = 0;
+  for (var k = 0; k < n; k = k + 1) s = s + n * 3;
+  return s;
+}
+
+print(folded(), branch(), dead(5), cse(2, 3), hoist(4));

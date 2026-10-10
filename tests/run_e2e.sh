@@ -172,6 +172,33 @@ check "tail calls become jumps" sh -c "grep -q 'jmp fn.count    # tail call' $OU
 check "-O1 uses the optimizing backend (registers), -O0 the stack-slot one" sh -c \
     "grep -q 'Optimizing backend' $OUT/cg_o1.s && $LUMA -O0 bench/fib.luma -S -o $OUT/cg_o0 && ! grep -q 'Optimizing backend' $OUT/cg_o0.s"
 
+# The optimizer on tests/pos/optimizations.luma: one function per pass,
+# checked in the optimized IR. (Its output at every level is checked above.)
+printf '== optimizer (tests/pos/optimizations.luma) ==\n'
+"$LUMA" tests/pos/optimizations.luma -o "$OUT/opt" >/dev/null 2>&1
+# fn_body FILE NAME: the instructions of LIR function @fn.NAME
+fn_body() { sed -n "/^fn @fn.$2(/,/^}/p" "$1" | sed '1d;$d'; }
+for f in folded branch dead cse hoist; do
+    fn_body "$OUT/opt.lir" "$f" >"$OUT/opt_$f.lir"
+    fn_body "$OUT/opt.opt.lir" "$f" >"$OUT/opt_$f.opt"
+done
+check "the unoptimized IR still has the work (test is not vacuous)" sh -c \
+    "grep -q ' mul ' $OUT/opt_folded.lir && grep -q ' br ' $OUT/opt_branch.lir && grep -q ' eq ' $OUT/opt_dead.lir && test \$(grep -c ' add ' $OUT/opt_cse.lir) -eq 2"
+check "constant folding: 6 * 7 becomes const 42" sh -c \
+    "grep -q 'const 42' $OUT/opt_folded.opt && ! grep -q ' mul ' $OUT/opt_folded.opt"
+check "branch simplification: if (1 < 2) leaves no compare or branch" sh -c \
+    "! grep -Eq ' (lt|br) ' $OUT/opt_branch.opt"
+check "dead-code elimination: the unused == is gone" sh -c "! grep -q ' eq ' $OUT/opt_dead.opt"
+check "CSE: (a + b) * (a + b) computes a + b once" sh -c "test \$(grep -c ' add ' $OUT/opt_cse.opt) -eq 1"
+# LICM: n * 3 must be computed once, outside the block that branches back to itself
+awk '/^[A-Za-z0-9_.]+:$/ { lbl = substr($0, 1, length($0) - 1); body = ""; next }
+     { body = body $0 "\n" }
+     /^ +br / && index($0, " " lbl ",") { printf "%s", body }' "$OUT/opt_hoist.opt" >"$OUT/opt_hoist.loop"
+check "LICM: n * 3 is hoisted out of the loop" sh -c \
+    "test -s $OUT/opt_hoist.loop && ! grep -q ' mul ' $OUT/opt_hoist.loop && test \$(grep -c ' mul ' $OUT/opt_hoist.opt) -eq 1"
+check "the optimized IR is accepted as input and gives the same output" sh -c \
+    "cp $OUT/opt.opt.lir $OUT/opt_re.lir && $LUMA $OUT/opt_re.lir -o $OUT/opt_re && $OUT/opt_re | cmp -s - tests/pos/optimizations.out"
+
 # ---------------------------------------------------------- self-checking program
 printf '== self-test (examples/selftest.luma) ==\n'
 st="$OUT/selftest"
