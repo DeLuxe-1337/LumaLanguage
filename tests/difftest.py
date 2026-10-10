@@ -17,6 +17,10 @@ For every program the tester also checks that the emitted .lir recompiles to
 identical assembly and that GNU as (validation only) assembles our .s into
 identical bytes.
 
+Every program is compiled and run at each level in DIFFTEST_LEVELS
+(default "0 1 2": the naive backend, the optimizing backend alone, and the
+IR optimizer plus the optimizing backend).
+
 usage: tests/difftest.py [COUNT] [SEED]      (run from the repository root)
 """
 import os
@@ -30,6 +34,8 @@ FIXMAX = 2**62 - 1
 FIXMIN = -2**62
 LUMA = os.environ.get("LUMA", "build/luma")
 HAVE_AS = shutil.which("as") is not None
+# optimization levels every program is compiled and run at
+LEVELS = os.environ.get("DIFFTEST_LEVELS", "0 1 2").split()
 
 
 class LumaError(Exception):
@@ -525,20 +531,29 @@ def one(seed, workdir):
     path = os.path.join(workdir, "p.luma")
     with open(path, "w") as f:
         f.write(src)
+    for level in LEVELS:
+        bad = compile_and_run(src, path, workdir, level, want_out, want_err, want_rc)
+        if bad:
+            return src, "at -O%s: %s" % (level, bad)
+    return None
+
+
+def compile_and_run(src, path, workdir, level, want_out, want_err, want_rc):
+    opt = "-O" + level
     exe = os.path.join(workdir, "p")
-    c = subprocess.run([LUMA, path, "-o", exe], capture_output=True, text=True)
+    c = subprocess.run([LUMA, opt, path, "-o", exe], capture_output=True, text=True)
     if c.returncode != 0:
-        return src, "compile failed:\n" + c.stderr
+        return "compile failed:\n" + c.stderr
     # The emitted IR, compiled on its own, must give identical assembly.
     with open(exe + ".lir") as f:
         lir = f.read()
     lir_copy = os.path.join(workdir, "copy.lir")
     with open(lir_copy, "w") as f:
         f.write(lir)
-    c2 = subprocess.run([LUMA, lir_copy, "-S", "-o", os.path.join(workdir, "copy")], capture_output=True, text=True)
+    c2 = subprocess.run([LUMA, opt, lir_copy, "-S", "-o", os.path.join(workdir, "copy")], capture_output=True, text=True)
     with open(exe + ".s") as f1, open(os.path.join(workdir, "copy.s")) as f2:
         if c2.returncode != 0 or f1.read().split("\n", 1)[1] != f2.read().split("\n", 1)[1]:
-            return src, "IR round trip: .lir did not recompile to identical assembly\n" + c2.stderr
+            return "IR round trip: .lir did not recompile to identical assembly\n" + c2.stderr
     # GNU as (validation only) must produce the same bytes from our .s.
     if HAVE_AS:
         g = os.path.join(workdir, "gas.o")
@@ -548,12 +563,12 @@ def one(seed, workdir):
             subprocess.run(["objcopy", "-O", "binary", "-j", sec, g, g + ".g"], check=True)
             with open(g + ".l", "rb") as a, open(g + ".g", "rb") as b:
                 if a.read() != b.read():
-                    return src, "section %s differs from GNU as" % sec
+                    return "section %s differs from GNU as" % sec
     r = subprocess.run([exe], capture_output=True, timeout=30)
     got_out, got_err = r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
     if (got_out, got_err, r.returncode) != (want_out, want_err, want_rc):
-        return src, ("expected rc=%d out=%r err=%r\n     got rc=%d out=%r err=%r"
-                     % (want_rc, want_out, want_err, r.returncode, got_out, got_err))
+        return ("expected rc=%d out=%r err=%r\n     got rc=%d out=%r err=%r"
+                % (want_rc, want_out, want_err, r.returncode, got_out, got_err))
     return None
 
 

@@ -195,6 +195,15 @@ void ir_types_free(IrTypes *t);
 IrTy ir_types_result(const IrModule *m, const IrInstr *in, const IrTy *state);
 /* Applies one instruction to a state (non-phi instructions). */
 void ir_types_step(const IrModule *m, const IrInstr *in, IrTy *state);
+/* Narrows the operands of an instruction that would have raised a runtime
+ * error otherwise (sub/mul/div/mod/neg/ordered compares: int; check: its
+ * type). Call after ir_types_step; operands that are also the destination
+ * keep the result type. */
+void ir_types_refine(const IrInstr *in, IrTy *state);
+/* ir_types_compute with ir_types_refine applied after every instruction
+ * (non-SSA code only: a vreg's type then differs before and after a use).
+ * Used by the backend to drop redundant tag checks. */
+void ir_types_compute_refined(const IrModule *m, const IrFunc *f, IrTypes *t);
 
 /* ---- verification ---- */
 /* Checks the rules in docs/IR.md section 6. Prints diagnostics prefixed with

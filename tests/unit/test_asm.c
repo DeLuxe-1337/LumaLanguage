@@ -191,6 +191,21 @@ static void test_relaxation(void) {
     CHECK_EQ_INT(o.relocs[0].type, OBJ_R_X86_64_PLT32);
     CHECK_EQ_INT(o.relocs[1].offset, 7);
     obj_free(&o);
+    /* jumps to a GLOBAL symbol defined in the same section bind locally and
+     * relax (as GNU as does: tail calls); calls keep their PLT32 relocation */
+    CHECK(assemble_str(".text\n.globl f\nf: jmp g\ncall g\n.globl g\ng: ret\n", &o));
+    {
+        const Buf *tx = &o.sections[0].data;
+        CHECK(tx->len == 2 + 5 + 1 && tx->data[0] == 0xeb && tx->data[1] == 5 && tx->data[2] == 0xe8);
+    }
+    CHECK_EQ_INT(o.nrelocs, 1);
+    CHECK_EQ_INT(o.relocs[0].offset, 3);
+    obj_free(&o);
+    src = nops(".text\n.globl f\nf: jmp g\n", 200, ".globl g\ng: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->data[0] == 0xe9 && t->data[1] == 200 && t->data[2] == 0);
+    CHECK_EQ_INT(o.nrelocs, 0);
+    obj_free(&o); free(src);
 }
 
 static void test_data_directives(void) {

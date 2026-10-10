@@ -124,7 +124,7 @@ static void describe_mask(unsigned mask, char *buf, size_t n) {
 LumaValue luma_check_type(LumaValue v, LumaValue mask, LumaValue context) {
     check_valid(v);
     unsigned m = (unsigned)fixnum_val(mask);
-    if (value_mask(v) & m) return LUMA_NIL;
+    if (value_mask(v) & m) return v; /* the optimizing backend uses the result */
     char want[64];
     describe_mask(m, want, sizeof want);
     const char *ctx = is_string(context) ? as_string(context)->bytes : "value";
@@ -255,6 +255,11 @@ LumaValue luma_print(LumaValue v) {
     luma_write(v);
     return luma_write_newline();
 }
+
+/* Error exits of the optimizing backend's inline fast paths (noreturn;
+ * called with the stack aligned, from out-of-line stubs). */
+_Noreturn void luma_int_overflow(void) { luma_panic("Integer overflow."); }
+_Noreturn void luma_div_zero(void) { luma_panic("Division by zero."); }
 
 /* Called by a checked `load` of a global slot that was never assigned. */
 _Noreturn void luma_undefined_variable(const char *name) {

@@ -1,0 +1,9 @@
+// Deep tail recursion: compiled as jumps at -O1/-O2, so it needs no stack.
+fun count(n, acc) {
+    if (n == 0) return acc;
+    return count(n - 1, acc + 2);
+}
+fun is_even(n) { if (n == 0) return true; return is_odd(n - 1); }
+fun is_odd(n) { if (n == 0) return false; return is_even(n - 1); }
+print(count(10000000, 0));
+print(is_even(1000001), is_odd(1000001));

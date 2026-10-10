@@ -329,7 +329,7 @@ void loops_find(const Cfg *c, Loop **out, int *nout) {
         }
     }
     free(stack);
-    qsort(loops, (size_t)n, sizeof *loops, cmp_loop_size);
+    if (n > 1) qsort(loops, (size_t)n, sizeof *loops, cmp_loop_size);
     *out = loops;
     *nout = n;
 }

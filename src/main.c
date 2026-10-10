@@ -35,6 +35,7 @@
 #include "opt.h"
 #include "parser.h"
 #include "util.h"
+#include "x86_gen.h"
 #include "x86_isel.h"
 
 extern char **environ;
@@ -257,7 +258,8 @@ int main(int argc, char **argv) {
     }
 
     /* 4. instruction selection */
-    x86_emit_module(&ir, &asm_buf);
+    if (opt_level >= 1) x86_gen_module(&ir, &asm_buf);
+    else x86_emit_module(&ir, &asm_buf);
     if (!write_file(asm_path, asm_buf.data, asm_buf.len)) goto done;
     if (verbose) fprintf(stderr, "luma: wrote assembly %s (%zu bytes)\n", asm_path, asm_buf.len);
     if (stop_s) { rc = 0; goto done; }

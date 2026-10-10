@@ -57,6 +57,27 @@ void ir_types_step(const IrModule *m, const IrInstr *in, IrTy *state) {
     if (in->dst >= 0) state[in->dst] = ir_types_result(m, in, state);
 }
 
+/* After an instruction that raises a runtime error unless an operand is an
+ * int, that operand is an int (if it may be one at all). Operands the
+ * instruction redefines keep the result type. */
+void ir_types_refine(const IrInstr *in, IrTy *state) {
+    switch (in->op) {
+    case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+    case IR_LT: case IR_LE: case IR_GT: case IR_GE:
+        if (in->b >= 0 && in->b != in->dst && (state[in->b] & TY_INT)) state[in->b] = TY_INT;
+        /* fallthrough */
+    case IR_NEG:
+        if (in->a >= 0 && in->a != in->dst && (state[in->a] & TY_INT)) state[in->a] = TY_INT;
+        break;
+    case IR_CHECK:
+        if (in->a >= 0 && in->a != in->dst && (state[in->a] & in->ty)) state[in->a] &= in->ty;
+        break;
+    default: break;
+    }
+}
+
+static bool refining; /* ir_types_compute_refined in progress */
+
 void ir_types_free(IrTypes *t) {
     free(t->in);
     free(t->out);
@@ -95,7 +116,10 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
             st[in->dst] = ty;
         }
         for (int k = 0; k < blk->n; k++)
-            if (blk->instrs[k].op != IR_PHI) ir_types_step(m, &blk->instrs[k], st);
+            if (blk->instrs[k].op != IR_PHI) {
+                ir_types_step(m, &blk->instrs[k], st);
+                if (refining) ir_types_refine(&blk->instrs[k], st);
+            }
         bool changed = !seen[bi] || memcmp(st, &t->out[(size_t)bi * nv], (size_t)nv * sizeof *st) != 0;
         seen[bi] = true;
         if (!changed) continue;
@@ -126,4 +150,10 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
     free(queued);
     free(work);
     free(seen);
+}
+
+void ir_types_compute_refined(const IrModule *m, const IrFunc *f, IrTypes *t) {
+    refining = true;
+    ir_types_compute(m, f, t);
+    refining = false;
 }

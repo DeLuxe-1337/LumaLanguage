@@ -13,7 +13,7 @@
 /*                                                                          */
 /* The source is assembled in one or more full passes. Every jump to a     */
 /* label starts out short (rel8). After a pass, any short jump whose target */
-/* is out of range, in another section, global, or undefined is marked long */
+/* is out of range, in another section, or undefined is marked long     */
 /* and the source is assembled again. Jumps only ever grow, so this reaches */
 /* a fixed point in at most (number of jumps + 1) passes. This matches GNU  */
 /* as, which keeps generated code byte-identical with it.                    */
@@ -24,6 +24,9 @@
 typedef enum {
     FX_PC32,  /* 4-byte field, R_X86_64_PC32 if it becomes a relocation */
     FX_PLT32, /* 4-byte field, R_X86_64_PLT32 if it becomes a relocation */
+    FX_JMP32, /* 4-byte jmp/jcc field: resolved here when the target is defined
+                 in the same section (even if global, as GNU as does); else
+                 R_X86_64_PLT32 */
     FX_REL8,  /* 1-byte short-jump field; never a relocation */
 } FixKind;
 
@@ -597,7 +600,7 @@ static void assemble_jump(Asm *a, const char *mn, int kind, Operand *ops, int n)
     } else {
         if (kind == 16) buf_byte(b, 0xE9); /* E9 cd */
         else { buf_byte(b, 0x0F); buf_byte(b, (uint8_t)(0x80 + kind)); } /* 0F 8x cd */
-        add_fixup(a, ops[0].sym, 0, FX_PLT32, 0);
+        add_fixup(a, ops[0].sym, 0, FX_JMP32, 0);
     }
 }
 
@@ -1103,8 +1106,10 @@ static void mark_long(Asm *a, size_t jump) {
  *    symbol table).
  *  - Global or undefined symbol: relocation against the symbol itself, so the
  *    linker (or dynamic linker) can interpose/resolve it.
- *  - Short jumps (rel8) must be local, same-section, and in range; otherwise
- *    they are marked long for the next pass. */
+ *  - Jumps (rel8 and rel32) to a symbol defined in their own section are
+ *    resolved here even when it is global (GNU as does the same; calls keep
+ *    their relocation). Short jumps must also be in range; otherwise they are
+ *    marked long for the next pass. */
 static void resolve_fixups(Asm *a) {
     for (size_t i = 0; i < a->nfixups; i++) {
         Fixup *f = &a->fixups[i];
@@ -1115,13 +1120,15 @@ static void resolve_fixups(Asm *a) {
             continue;
         }
         bool local_same = s->section != OBJ_UNDEF && !s->global && s->section == f->section;
+        /* jumps bind to any definition in their own section, global or not */
+        if (f->kind == FX_REL8 || f->kind == FX_JMP32) local_same = s->section != OBJ_UNDEF && s->section == f->section;
         int64_t v = local_same ? (int64_t)s->value + f->addend - (int64_t)f->offset : 0;
         if (f->kind == FX_REL8) {
             if (local_same && fits_i8(v)) a->o->sections[f->section].data.data[f->offset] = (uint8_t)v;
             else mark_long(a, f->jump);
             continue;
         }
-        uint32_t rtype = f->kind == FX_PC32 ? OBJ_R_X86_64_PC32 : OBJ_R_X86_64_PLT32;
+        uint32_t rtype = f->kind == FX_PC32 ? OBJ_R_X86_64_PC32 : OBJ_R_X86_64_PLT32; /* PLT32 for calls and jumps */
         if (s->section == OBJ_UNDEF) {
             s->global = true; /* undefined => external */
             obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, rtype, f->symbol, -1, f->addend});

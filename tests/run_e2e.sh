@@ -81,10 +81,15 @@ check "FILE symbol names the .luma source" grep -q 'FILE.*examples/hello.luma' "
 check "no .comment section (not produced by GNU as)" sh -c '! readelf -S build/hello.o | grep -q "\.comment"'
 check "objdump -d -r accepts hello.o" objdump -d -r build/hello.o
 objdump -d -r -M intel build/hello.o >"$OUT/dis.txt"
-check "objdump decodes the generated instructions" sh -c '
+check "objdump decodes the generated instructions (-O2)" sh -c '
+    for i in "push +rbp" "mov +rbp,rsp" "lea +rdi,\[rip\+0x0\]" "call" "mov +eax,0x6" "pop +rbp" "ret"; do
+        grep -Eq "$i" '"$OUT"'/dis.txt || { echo "missing: $i"; exit 1; }; done'
+"$LUMA" -O0 examples/hello.luma -c -o "$OUT/hello0" >/dev/null 2>&1
+objdump -d -r -M intel "$OUT/hello0.o" >"$OUT/dis0.txt" 2>&1
+check "objdump decodes the generated instructions (-O0, stack slots)" sh -c '
     for i in "push +rbp" "mov +rbp,rsp" "sub +rsp,0x10" "lea +rax,\[rip\+0x0\]" "mov +QWORD PTR \[rbp-0x8\],rax" \
              "mov +rdi,QWORD PTR \[rbp-0x8\]" "call" "mov +rsp,rbp" "pop +rbp" "ret"; do
-        grep -Eq "$i" '"$OUT"'/dis.txt || { echo "missing: $i"; exit 1; }; done'
+        grep -Eq "$i" '"$OUT"'/dis0.txt || { echo "missing: $i"; exit 1; }; done'
 check "objdump shows relocations inline" sh -c 'grep -q "R_X86_64_PC32" '"$OUT"'/dis.txt && grep -q "R_X86_64_PLT32.*luma_write" '"$OUT"'/dis.txt'
 check "final executable is native x86-64 ELF" sh -c 'readelf -h build/hello | grep -q "Machine:.*X86-64"'
 
@@ -129,6 +134,44 @@ for src in tests/pos/*.luma; do
         "$LUMA $OUT/rt_$name.lir -S -o $OUT/rt2_$name --dump-ir > $OUT/rt_$name.reprint && cmp $exe.lir $OUT/rt_$name.reprint"
 done
 
+# The same programs through the other optimization levels: -O0 (naive
+# stack-slot backend) and -O1 (optimizing backend without IR passes).
+printf '== positive programs at -O0 and -O1 ==\n'
+for lvl in 0 1; do
+    for src in tests/pos/*.luma; do
+        name=$(basename "$src" .luma)
+        # deep tail recursion needs the tail calls of -O1/-O2
+        [ "$lvl" = 0 ] && [ "$name" = tail_calls ] && continue
+        exe="$OUT/pos${lvl}_$name"
+        if ! "$LUMA" -O$lvl "$src" -o "$exe" >"$OUT/last.log" 2>&1; then bad "pos/$name -O$lvl compiles"; sed 's/^/      /' "$OUT/last.log"; continue; fi
+        "$exe" >"$exe.actual" 2>"$exe.stderr"
+        st=$?
+        if [ $st -eq 0 ] && cmp -s "$exe.actual" "tests/pos/$name.out" && [ ! -s "$exe.stderr" ]; then ok "pos/$name -O$lvl output + exit 0"
+        else bad "pos/$name -O$lvl (exit $st)"; diff "tests/pos/$name.out" "$exe.actual" | head -20 | sed 's/^/      /'; cat "$exe.stderr"; fi
+        check "pos/$name -O$lvl: object identical to GNU as" same_as_gas "$name" "$exe.s" "$exe.o"
+    done
+done
+
+# Properties of the optimizing backend's output (default -O2).
+printf '== optimizing backend ==\n'
+"$LUMA" bench/fib_typed.luma -S -o "$OUT/cg_fib" >/dev/null 2>&1
+sed -n '/^fn.fib:/,/\.size fn.fib/p' "$OUT/cg_fib.s" | grep -v '^ *#' >"$OUT/cg_fib.body"
+check "typed fib: inline fixnum arithmetic, no runtime calls" sh -c \
+    "grep -q 'jo ' $OUT/cg_fib.body && test -z \"\$(grep 'call luma_' $OUT/cg_fib.body | grep -v luma_int_overflow)\""
+check "typed fib: n and fib(n-1) live in callee-saved registers across the calls" sh -c \
+    "grep -q 'push rbx' $OUT/cg_fib.body && grep -q 'push r12' $OUT/cg_fib.body && ! grep -q 'rbp - ' $OUT/cg_fib.body"
+check "typed fib: compare fused into cmp + jcc" grep -Eq '^ +cmp rbx, 5$' "$OUT/cg_fib.body"
+"$LUMA" bench/loop_sum.luma -S -o "$OUT/cg_loop" >/dev/null 2>&1
+sed -n '/^fn.run:/,/\.size fn.run/p' "$OUT/cg_loop.s" | grep -v '^ *#' >"$OUT/cg_loop.body"
+check "loop_sum: leaf function needs no frame and calls nothing" sh -c \
+    "! grep -q 'push rbp' $OUT/cg_loop.body && ! grep -Eq 'call (luma_add|luma_sub|luma_mul|luma_div|luma_lt)' $OUT/cg_loop.body"
+check "loop_sum: division by 4 is a shift" grep -q 'sar ' "$OUT/cg_loop.body"
+"$LUMA" tests/pos/tail_calls.luma -S -o "$OUT/cg_tail" >/dev/null 2>&1
+check "tail calls become jumps" sh -c "grep -q 'jmp fn.count    # tail call' $OUT/cg_tail.s && grep -q 'jmp fn.is_odd    # tail call' $OUT/cg_tail.s"
+"$LUMA" -O1 bench/fib.luma -S -o "$OUT/cg_o1" >/dev/null 2>&1
+check "-O1 uses the optimizing backend (registers), -O0 the stack-slot one" sh -c \
+    "grep -q 'Optimizing backend' $OUT/cg_o1.s && $LUMA -O0 bench/fib.luma -S -o $OUT/cg_o0 && ! grep -q 'Optimizing backend' $OUT/cg_o0.s"
+
 # ---------------------------------------------------------- self-checking program
 printf '== self-test (examples/selftest.luma) ==\n'
 st="$OUT/selftest"
@@ -172,17 +215,19 @@ check "unknown option is reported"     sh -c "! $LUMA --frobnicate 2>$OUT/e && g
 
 # ---------------------------------------------------------- runtime errors
 printf '== runtime errors ==\n'
+for lvl in 0 1 2; do
 for src in tests/rt/*.luma; do
     name=$(basename "$src" .luma)
-    exe="$OUT/rt_err_$name"
-    if ! "$LUMA" "$src" -o "$exe" >"$OUT/last.log" 2>&1; then bad "rt/$name compiles"; sed 's/^/      /' "$OUT/last.log"; continue; fi
+    exe="$OUT/rt_err${lvl}_$name"
+    if ! "$LUMA" -O$lvl "$src" -o "$exe" >"$OUT/last.log" 2>&1; then bad "rt/$name -O$lvl compiles"; sed 's/^/      /' "$OUT/last.log"; continue; fi
     "$exe" >"$exe.stdout" 2>"$exe.stderr"
     st=$?
     if [ $st -eq 1 ] && cmp -s "$exe.stdout" "tests/rt/$name.out" && cmp -s "$exe.stderr" "tests/rt/$name.err"; then
-        ok "rt/$name: exit 1, $(cat "$exe.stderr")"
+        ok "rt/$name -O$lvl: exit 1, $(cat "$exe.stderr")"
     else
-        bad "rt/$name (exit $st)"; cat "$exe.stdout" "$exe.stderr" | sed 's/^/      /'
+        bad "rt/$name -O$lvl (exit $st)"; cat "$exe.stdout" "$exe.stderr" | sed 's/^/      /'
     fi
+done
 done
 
 # ---------------------------------------------------------- C FFI
@@ -191,23 +236,25 @@ FFILIB="$OUT/ffilib"
 mkdir -p "$FFILIB"
 check "build C helper library (test-only, system cc)" sh -c \
     "cc -c -O2 -o $FFILIB/ffi_helper.o tests/ffi/ffi_helper.c && ar rcs $FFILIB/libffihelper.a $FFILIB/ffi_helper.o"
+for lvl in 0 1 2; do
 for src in tests/ffi/*.luma; do
     name=$(basename "$src" .luma)
-    exe="$OUT/ffi_$name"
-    if ! "$LUMA" "$src" -o "$exe" -L "$FFILIB" -l ffihelper >"$OUT/last.log" 2>&1; then
-        bad "ffi/$name compiles + links"; sed 's/^/      /' "$OUT/last.log"; continue
+    exe="$OUT/ffi${lvl}_$name"
+    if ! "$LUMA" -O$lvl "$src" -o "$exe" -L "$FFILIB" -l ffihelper >"$OUT/last.log" 2>&1; then
+        bad "ffi/$name -O$lvl compiles + links"; sed 's/^/      /' "$OUT/last.log"; continue
     fi
     "$exe" >"$exe.stdout" 2>"$exe.stderr"
     st=$?
     if [ -f "tests/ffi/$name.err" ]; then
         if [ $st -eq 1 ] && cmp -s "$exe.stdout" "tests/ffi/$name.out" && cmp -s "$exe.stderr" "tests/ffi/$name.err"; then
-            ok "ffi/$name: exit 1, $(sed 's/^luma: runtime error: //' "$exe.stderr")"
-        else bad "ffi/$name (exit $st)"; cat "$exe.stdout" "$exe.stderr" | sed 's/^/      /'; fi
+            ok "ffi/$name -O$lvl: exit 1, $(sed 's/^luma: runtime error: //' "$exe.stderr")"
+        else bad "ffi/$name -O$lvl (exit $st)"; cat "$exe.stdout" "$exe.stderr" | sed 's/^/      /'; fi
     else
-        if [ $st -eq 0 ] && cmp -s "$exe.stdout" "tests/ffi/$name.out" && [ ! -s "$exe.stderr" ]; then ok "ffi/$name output + exit 0"
-        else bad "ffi/$name (exit $st)"; diff "tests/ffi/$name.out" "$exe.stdout" | sed 's/^/      /'; cat "$exe.stderr"; fi
-        check "ffi/$name: object identical to GNU as" same_as_gas "$name" "$exe.s" "$exe.o"
+        if [ $st -eq 0 ] && cmp -s "$exe.stdout" "tests/ffi/$name.out" && [ ! -s "$exe.stderr" ]; then ok "ffi/$name -O$lvl output + exit 0"
+        else bad "ffi/$name -O$lvl (exit $st)"; diff "tests/ffi/$name.out" "$exe.stdout" | sed 's/^/      /'; cat "$exe.stderr"; fi
+        check "ffi/$name -O$lvl: object identical to GNU as" same_as_gas "$name" "$exe.s" "$exe.o"
     fi
+done
 done
 check "ffi: link a C object file given on the command line" sh -c \
     "$LUMA tests/ffi/types.luma -o $OUT/ffi_obj $FFILIB/ffi_helper.o && $OUT/ffi_obj | cmp -s - tests/ffi/types.out"
@@ -218,7 +265,7 @@ check "ffi: libc functions need no flags (examples/ffi.luma)" sh -c \
 check "ffi: an unresolved C symbol is a link error" sh -c \
     "printf 'extern fun no_such_function_xyz(): void;\nno_such_function_xyz();\n' > $OUT/unres.luma && ! $LUMA $OUT/unres.luma -o $OUT/unres 2>$OUT/e && grep -q 'no_such_function_xyz' $OUT/e && grep -q 'linker' $OUT/e"
 check "ffi: the call zeroes eax (variadic-safe) and converts via the runtime" sh -c \
-    "grep -q 'xor eax, eax' $OUT/ffi_types.s && grep -q 'call luma_ffi_arg_i8@PLT' $OUT/ffi_types.s && grep -q 'call luma_ffi_ret_u64@PLT' $OUT/ffi_types.s"
+    "grep -q 'xor eax, eax' $OUT/ffi2_types.s && grep -q 'call luma_ffi_arg_i8@PLT' $OUT/ffi2_types.s && grep -q 'call luma_ffi_ret_u64@PLT' $OUT/ffi2_types.s"
 
 # ---------------------------------------------------------- hand-written IR
 printf '== hand-written LIR ==\n'
