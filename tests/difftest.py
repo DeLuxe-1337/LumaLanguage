@@ -8,6 +8,10 @@ fixnums (overflow is a runtime error), floor division, functions, globals,
 variadic print, and gradual types (annotated slots are guarded at runtime).
 Stdout, the runtime error message (if any) and the exit status must match.
 
+Programs may declare structs with impl blocks: struct literals, field reads
+and writes and method calls appear in expressions, and struct types appear
+as annotations, so both static (typed) and dynamic (untyped) accesses run.
+
 Programs are mostly well typed. Deliberate type errors are injected through
 an untyped identity function `dyn(x)`, so the compiler's static checker
 cannot see them and they surface as runtime errors (or runtime type guards
@@ -64,19 +68,35 @@ def truthy(v):
     return not (v is None or v is False)
 
 
+class Obj:
+    """A struct instance: reference semantics, fields in declaration order."""
+
+    def __init__(self, sname, fields):
+        self.sname = sname
+        self.fields = fields   # dict, insertion order = declaration order
+
+
 def equal(a, b):
     if type(a) is not type(b):
         return False
+    if isinstance(a, Obj):
+        return a is b          # identity
     return a == b
 
 
-def show(v):
+def show(v, quoted=False):
     if v is None:
         return "nil"
     if v is True:
         return "true"
     if v is False:
         return "false"
+    if isinstance(v, Obj):
+        if not v.fields:
+            return "%s {}" % v.sname
+        return "%s { %s }" % (v.sname, ", ".join("%s: %s" % (k, show(x, True)) for k, x in v.fields.items()))
+    if isinstance(v, str) and quoted:
+        return '"%s"' % esc(v)
     return str(v)
 
 
@@ -87,6 +107,8 @@ def type_of(v):
         return "bool"
     if isinstance(v, int):
         return "int"
+    if isinstance(v, Obj):
+        return v.sname
     return "str"
 
 
@@ -96,7 +118,11 @@ def type_of(v):
 #              ('call', fname, [args])
 # statements:  ('print', [exprs]) ('expr', e) ('var', name, e, ann|None) ('block', [stmts])
 #              ('if', c, then, else|None) ('loop', counter, n, [stmts]) ('return', e)
+#              ('new', S, [(field, e)]) ('get', obj, field) ('set', obj, field, e)
+#              ('callm', obj, method, [args])
 # functions:   ('fun', name, [params], [stmts], [param anns], ret ann)   -- rendered first
+# structs:     ('struct', S, [(field, type, ann)])  ('impl', S, [fun])   -- rendered first;
+#              a method is a fun whose first parameter is `self`
 
 
 def esc(s):
@@ -125,6 +151,16 @@ def render_e(e):
         return "(%s%s)" % (e[1], render_e(e[2]))
     if k == "call":
         return "%s(%s)" % (e[1], ", ".join(render_e(a) for a in e[2]))
+    if k == "new":
+        if not e[2]:
+            return "%s {}" % e[1]
+        return "%s { %s }" % (e[1], ", ".join("%s: %s" % (f, render_e(x)) for f, x in e[2]))
+    if k == "get":
+        return "(%s).%s" % (render_e(e[1]), e[2])
+    if k == "set":
+        return "((%s).%s = %s)" % (render_e(e[1]), e[2], render_e(e[3]))
+    if k == "callm":
+        return "(%s).%s(%s)" % (render_e(e[1]), e[2], ", ".join(render_e(a) for a in e[3]))
     return "(%s %s %s)" % (render_e(e[2]), e[1], render_e(e[3]))
 
 
@@ -135,8 +171,12 @@ def render_s(s, ind=0):
         return p + "print(%s);\n" % ", ".join(render_e(a) for a in s[1])
     if k == "return":
         return p + "return %s;\n" % render_e(s[1])
+    if k == "struct":
+        return p + "struct %s {\n" % s[1] + "".join(p + "  %s%s,\n" % (f, ann(a)) for f, _, a in s[2]) + p + "}\n"
+    if k == "impl":
+        return p + "impl %s {\n" % s[1] + "".join(render_s(x, ind + 1) for x in s[2]) + p + "}\n"
     if k == "fun":
-        params = ", ".join(n + ann(a) for n, a in zip(s[2], s[4]))
+        params = ", ".join(n + ("" if n == "self" else ann(a)) for n, a in zip(s[2], s[4]))
         return (p + "fun %s(%s)%s {\n" % (s[1], params, ann(s[5])) + "".join(render_s(x, ind + 1) for x in s[3])
                 + p + "}\n")
     if k == "expr":
@@ -173,7 +213,13 @@ class Interp:
     def __init__(self, funs=()):
         self.out = []
         self.scopes = [{}]
-        self.funs = {f[1]: f for f in funs}
+        self.funs = {f[1]: f for f in funs if f[0] == "fun"}
+        self.structs = {f[1]: f[2] for f in funs if f[0] == "struct"}   # S -> [(field, type, ann)]
+        self.methods = {}                                                # (S, m) -> fun named "S::m"
+        for f in funs:
+            if f[0] == "impl":
+                for m in f[2]:
+                    self.methods[(f[1], m[1])] = ("fun", "%s::%s" % (f[1], m[1])) + m[2:]
         self.depth = 0
 
     def guard(self, value, annotation, what):
@@ -211,25 +257,38 @@ class Interp:
             if not is_int(v):
                 raise LumaError("Operand must be a number.")
             return check(-v)
+        if k == "new":
+            vals = {f: self.ev(x) for f, x in e[2]}   # written order
+            fields = {}
+            for f, _, a in self.structs[e[1]]:          # then each field's guard, in declaration order
+                self.guard(vals[f], a, "field '%s' of '%s'" % (f, e[1]))
+                fields[f] = vals[f]
+            return Obj(e[1], fields)
+        if k == "get":
+            o = self.ev(e[1])
+            if not isinstance(o, Obj):
+                raise LumaError("Only struct instances have fields, got %s." % type_of(o))
+            return o.fields[e[2]]
+        if k == "set":
+            o = self.ev(e[1])
+            v = self.ev(e[3])
+            if not isinstance(o, Obj):
+                raise LumaError("Only struct instances have fields, got %s." % type_of(o))
+            a = [fa for f, _, fa in self.structs[o.sname] if f == e[2]][0]
+            self.guard(v, a, "field '%s' of '%s'" % (e[2], o.sname))
+            o.fields[e[2]] = v
+            return v
+        if k == "callm":
+            o = self.ev(e[1])
+            args = [self.ev(a) for a in e[3]]
+            if not isinstance(o, Obj):
+                raise LumaError("Only struct instances have methods, got %s." % type_of(o))
+            fn = self.methods[(o.sname, e[2])]
+            return self.invoke(fn, [o] + args, self_ann=o.sname)
         if k == "call":
             fn = self.funs[e[1]]
             args = [self.ev(a) for a in e[2]]      # all arguments, left to right
-            for name, value, a in zip(fn[2], args, fn[4]):   # then each typed parameter's guard
-                self.guard(value, a, "argument '%s' of '%s'" % (name, fn[1]))
-            saved = self.scopes
-            self.scopes = [saved[0], {n: [v, a] for n, v, a in zip(fn[2], args, fn[4])}]
-            self.depth += 1
-            if self.depth > 200:
-                raise AssertionError("generator bug: runaway recursion")
-            try:
-                self.run(fn[3])
-                result = None                       # implicit return nil
-            except Return as r:
-                result = r.value
-            finally:
-                self.scopes = saved
-                self.depth -= 1
-            return result
+            return self.invoke(fn, args)
         if k == "log":
             left = self.ev(e[2])
             if e[1] == "or":
@@ -259,6 +318,29 @@ class Interp:
                 raise LumaError("Division by zero.")
             return check(a // b)
         return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
+
+    def invoke(self, fn, args, self_ann=None):
+        for name, value, a in zip(fn[2], args, fn[4]):   # then each typed parameter's guard
+            if name == "self":
+                continue
+            self.guard(value, a, "argument '%s' of '%s'" % (name, fn[1]))
+        saved = self.scopes
+        self.scopes = [saved[0], {n: [v, self_ann if n == "self" else a] for n, v, a in zip(fn[2], args, fn[4])}]
+        self.depth += 1
+        if self.depth > 200:
+            raise AssertionError("generator bug: runaway recursion")
+        saved_fun = self.current_fun
+        self.current_fun = fn
+        try:
+            self.run(fn[3])
+            result = None                       # implicit return nil
+        except Return as r:
+            result = r.value
+        finally:
+            self.scopes = saved
+            self.depth -= 1
+            self.current_fun = saved_fun
+        return result
 
     def run(self, stmts):
         for s in stmts:
@@ -309,17 +391,8 @@ class Interp:
 
 
 class FunInterp(Interp):
-    """Tracks the function whose body is executing, for return-value guards."""
-
-    def ev(self, e):
-        if e[0] != "call":
-            return super().ev(e)
-        saved = self.current_fun
-        self.current_fun = self.funs[e[1]]
-        try:
-            return super().ev(e)
-        finally:
-            self.current_fun = saved
+    """(Interp.invoke tracks the function whose body is executing, for
+    return-value guards.)"""
 
 
 # ---------------------------------------------------------------- generator
@@ -342,6 +415,8 @@ class Gen:
         self.callable = 0    # calls may target funs[:callable] (no recursion: always terminates)
         self.ret_type = None # inside a function body: its return type
         self.ret_ann = None  # ... and its annotation
+        self.structs = {}    # S -> {"fields": [(field, type, ann)], "methods": [(m, [ptypes], [panns], ret)]}
+        self.methods_ok = False  # may expressions call methods? (only from main code: no recursion)
 
     def fresh(self, prefix):
         self.n += 1
@@ -355,6 +430,10 @@ class Gen:
 
     def literal(self, t):
         r = self.r
+        if t in self.structs:
+            fields = list(self.structs[t]["fields"])
+            r.shuffle(fields)   # any order in the literal
+            return ("new", t, [(f, self.literal(ft)) for f, ft, _ in fields])
         if t == "int":
             if r.random() < 0.04:   # rare: values near the fixnum limits (overflow paths)
                 return ("int", r.choice([FIXMAX, FIXMIN + 1, 2**31, 3037000499, 2**40]))
@@ -379,12 +458,29 @@ class Gen:
         c = r.random()
         if c < 0.08 and names:
             return ("assign", r.choice(names), self.expr(t, depth - 1, exclude))
+        if self.structs and r.random() < 0.12:   # a field or a method result of type t
+            gets = [(S, f, a) for S, d in self.structs.items() for f, ft, a in d["fields"] if ft == t]
+            calls = [(S, m) for S, d in self.structs.items() for m in d["methods"] if m[3] == t] if self.methods_ok else []
+            if calls and (not gets or r.random() < 0.4):
+                S, (m, ptypes, panns, _) = r.choice(calls)
+                return ("callm", self.expr(S, depth - 1, exclude), m,
+                        [self.slot_expr(pt, pa, depth - 1, exclude) for pt, pa in zip(ptypes, panns)])
+            if gets:
+                S, f, a = r.choice(gets)
+                obj = self.expr(S, depth - 1, exclude)
+                if r.random() < 0.15:   # an assignment to the field, used as a value
+                    return ("set", obj, f, self.slot_expr(t, a, depth - 1, exclude))
+                return ("get", obj, f)
         cands = [f for f in self.funs[:self.callable] if f[2] == t]
         if cands and r.random() < 0.15:
             name, ptypes, _, panns = r.choice(cands)
             return ("call", name, [self.slot_expr(pt, pa, depth - 1, exclude) for pt, pa in zip(ptypes, panns)])
         if c < 0.2:   # same-typed short-circuit: result has the operands' type
             return ("log", r.choice(["and", "or"]), self.expr(t, depth - 1, exclude), self.expr(t, depth - 1, exclude))
+        if t in self.structs:
+            fields = list(self.structs[t]["fields"])
+            r.shuffle(fields)
+            return ("new", t, [(f, self.slot_expr(ft, fa, depth - 1, exclude)) for f, ft, fa in fields])
         if t == "int":
             if c < 0.3:
                 return ("un", "-", self.expr("int", depth - 1, exclude))
@@ -422,6 +518,8 @@ class Gen:
         return None
 
     def any_type(self):
+        if self.structs and self.r.random() < 0.15:
+            return self.r.choice(sorted(self.structs))
         return self.r.choice(("int", "int", "int", "str", "str", "bool", "nil"))
 
     def annotation(self, t):
@@ -463,6 +561,11 @@ class Gen:
         if c < 0.6 and vis:
             name = r.choice(list(vis))
             return ("expr", ("assign", name, self.slot_expr(vis[name], self.ann_of(name), 3)))
+        if c < 0.64 and self.structs:   # a field assignment as a statement
+            S = r.choice(sorted(self.structs))
+            if self.structs[S]["fields"]:
+                f, ft, fa = r.choice(self.structs[S]["fields"])
+                return ("expr", ("set", self.expr(S, 2), f, self.slot_expr(ft, fa, 2)))
         if c < 0.67:
             return ("expr", self.expr(self.any_type(), 2))
         if c < 0.71 and self.funs[:self.callable]:
@@ -500,17 +603,51 @@ class Gen:
         return ("fun", name, params, body, panns, rann)
 
 
+    def struct(self):
+        """A struct with 0-3 fields of base types (annotated or not)."""
+        name = self.fresh("S")
+        fields = []
+        for _ in range(self.r.choice((0, 1, 2, 2, 3, 3))):
+            t = self.r.choice(("int", "int", "str", "bool", "nil"))
+            fields.append((self.fresh("x"), t, self.annotation(t)))
+        self.structs[name] = {"fields": fields, "methods": []}
+        return ("struct", name, fields)
+
+    def method(self, S):
+        """A method of struct S: like a function, with `self` in scope. Methods
+        call functions but no methods (so calls always terminate)."""
+        r = self.r
+        name = self.fresh("m")
+        ptypes = [self.any_type() for _ in range(r.randint(0, 2))]
+        params = [self.fresh("p") for _ in ptypes]
+        panns = [self.annotation(t) for t in ptypes]
+        ret = self.any_type()
+        rann = self.annotation(ret)
+        saved = (self.scopes, self.callable, self.ret_type, self.ret_ann)
+        self.scopes = [dict(self.scopes[0]), dict({"self": (S, S)}, **{p: (t, a) for p, t, a in zip(params, ptypes, panns)})]
+        self.callable = len(self.funs)
+        self.ret_type, self.ret_ann = ret, rann
+        body = self.stmts(r.randint(1, 3), 2) + [("return", self.slot_expr(ret, rann, 2))]
+        self.scopes, self.callable, self.ret_type, self.ret_ann = saved
+        self.structs[S]["methods"].append((name, ptypes, panns, ret))
+        return ("fun", name, ["self"] + params, body, [None] + panns, rann)
+
+
 def generate(seed):
-    """Returns (functions, main statements). Globals are declared first so the
-    functions (generated next, rendered first because they are hoisted) can use them."""
+    """Returns (declarations, main statements). Structs come first, then
+    globals (so the functions, generated next and rendered first because they
+    are hoisted, can use them), then functions, then the structs' methods."""
     rng = random.Random(seed)
     g = Gen(rng)
+    structs = [g.struct() for _ in range(rng.choice((0, 0, 1, 1, 2)))]
     globals_ = [g.stmt(0) for _ in range(rng.randint(0, 3))]
     globals_ = [s for s in globals_ if s[0] == "var"]
     funs = [g.function() for _ in range(rng.randint(0, 4))]
     g.callable = len(g.funs)
+    impls = [("impl", s[1], [g.method(s[1]) for _ in range(rng.randint(1, 2))]) for s in structs]
+    g.methods_ok = True
     prog = globals_ + g.stmts(rng.randint(3, 14), 3)
-    return [DYN] + funs, prog
+    return structs + impls + [DYN] + funs, prog
 
 
 def one(seed, workdir):
