@@ -1,0 +1,36 @@
+; Structs in hand-written LIR: a struct with a method table, `new`,
+; static and dynamic field access, and a dynamic method call (callm).
+module "tests/ir/structs.lir"
+
+struct Pair {left: int, right} methods {sum = @pair_sum}
+
+extern fn @luma_print(1)
+
+fn @luma_main() {
+entry:
+  %a = const 20
+  %b = const 22
+  %p = new Pair(%a, %b)
+  %l = getfield %p, Pair.left
+  call @luma_print(%l)
+  %r = getfield %p, .right
+  call @luma_print(%r)
+  %s = callm %p, .sum()
+  call @luma_print(%s)
+  %c = const 100
+  setfield %p, Pair.left, %c
+  setfield %p, .right, %c
+  %t = callm %p, .sum()
+  call @luma_print(%t)
+  call @luma_print(%p)
+  %n = const nil
+  ret %n
+}
+
+fn @pair_sum(%self: Pair) {
+entry:
+  %x = getfield %self, Pair.left
+  %y = getfield %self, Pair.right
+  %z = add %x, %y
+  ret %z
+}

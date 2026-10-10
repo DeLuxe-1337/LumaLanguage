@@ -49,13 +49,35 @@ static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) 
         break;
     case IR_CALL:
     case IR_PHI:
+    case IR_NEW:
+        for (int i = 0; i < in->nargs; i++) fn(ctx, in->args[i]);
+        break;
+    case IR_GETFIELD:
+        fn(ctx, in->a);
+        break;
+    case IR_SETFIELD:
+        fn(ctx, in->a);
+        fn(ctx, in->b);
+        break;
+    case IR_CALLM:
+        fn(ctx, in->a);
         for (int i = 0; i < in->nargs; i++) fn(ctx, in->args[i]);
         break;
     default: break;
     }
 }
 
-static bool op_has_dst(IrOp op) { return !ir_op_is_terminator(op) && op != IR_CALL && op != IR_STORE; }
+static bool op_has_dst(IrOp op) {
+    return !ir_op_is_terminator(op) && op != IR_CALL && op != IR_STORE && op != IR_SETFIELD && op != IR_CALLM;
+}
+
+static bool ty_valid(const IrModule *m, IrTy t) {
+    if (t == 0 || (t & 0xE0)) return false;
+    if (!(t & TY_STRUCT)) return (t >> TY_SID_SHIFT) == 0;
+    return ty_sid(t) < m->nstructs;
+}
+
+static bool sid_ok(const IrModule *m, int sid) { return sid >= 0 && sid < m->nstructs; }
 
 /* ---- structural checks for one instruction ---- */
 typedef struct { V *v; const IrFunc *f; int b; const IrInstr *in; } UseCtx;
@@ -71,7 +93,9 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
         verr(v, f, b, in, "'%s' needs a destination register", ir_op_name(in->op));
     if (in->op == IR_CALL && in->dst != IR_NONE && !vreg_ok(f, in->dst))
         verr(v, f, b, in, "call has an invalid destination register");
-    if ((ir_op_is_terminator(in->op) || in->op == IR_STORE) && in->dst != IR_NONE)
+    if ((in->op == IR_CALL || in->op == IR_CALLM) && in->dst != IR_NONE && !vreg_ok(f, in->dst))
+        verr(v, f, b, in, "'%s' has an invalid destination register", ir_op_name(in->op));
+    if ((ir_op_is_terminator(in->op) || in->op == IR_STORE || in->op == IR_SETFIELD) && in->dst != IR_NONE)
         verr(v, f, b, in, "'%s' cannot have a destination", ir_op_name(in->op));
     UseCtx c = {v, f, b, in};
     for_each_use(in, check_use_index, &c);
@@ -88,7 +112,26 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
     case IR_CHECK:
         if (in->global < 0 || in->global >= m->nglobals || m->globals[in->global].kind != IRG_DATA)
             verr(v, f, b, in, "'check' needs a data global as its error context");
-        if (in->ty == 0 || (in->ty & ~(IrTy)TY_ANY)) verr(v, f, b, in, "'check' has an invalid type");
+        if (!ty_valid(m, in->ty)) verr(v, f, b, in, "'check' has an invalid type");
+        break;
+    case IR_NEW:
+        if (!sid_ok(m, in->sid)) verr(v, f, b, in, "'new' of an unknown struct");
+        else if (in->nargs != m->structs[in->sid].nfields)
+            verr(v, f, b, in, "'new %s' gives %d field value%s, the struct has %d", m->structs[in->sid].name, in->nargs,
+                 in->nargs == 1 ? "" : "s", m->structs[in->sid].nfields);
+        break;
+    case IR_GETFIELD:
+    case IR_SETFIELD:
+        if (in->sid >= 0) {
+            if (!sid_ok(m, in->sid) || in->field < 0 || in->field >= m->structs[in->sid].nfields)
+                verr(v, f, b, in, "'%s' of an unknown struct field", ir_op_name(in->op));
+        } else if (!in->name || !*in->name) {
+            verr(v, f, b, in, "'%s' needs a field name", ir_op_name(in->op));
+        }
+        break;
+    case IR_CALLM:
+        if (!in->name || !*in->name) verr(v, f, b, in, "'callm' needs a method name");
+        if (in->nargs + 1 > MAX_ARGS) verr(v, f, b, in, "calls with more than %d arguments are not supported yet", MAX_ARGS);
         break;
     case IR_PHI:
     case IR_NOP:
@@ -188,9 +231,9 @@ static void verify_def_before_use(V *v, const IrFunc *f) {
 /* ---- declared types (proved with ir_types) ---- */
 
 static void type_error(V *v, const IrFunc *f, int b, const IrInstr *in, const char *what, IrTy got, IrTy want) {
-    char g[64], w[64];
-    ir_ty_name(got, g, sizeof g);
-    ir_ty_name(want, w, sizeof w);
+    char g[300], w[300];
+    ir_ty_name(v->m, got, g, sizeof g);
+    ir_ty_name(v->m, want, w, sizeof w);
     verr(v, f, b, in, "%s may be %s, but it is declared %s (add a 'check')", what, g, w);
 }
 
@@ -210,17 +253,33 @@ static void verify_types(V *v, const IrFunc *f) {
                 const IrGlobal *g = &m->globals[in->global];
                 for (int i = 0; i < in->nargs && i < g->arity; i++) {
                     IrTy want = ir_param_ty(g, i);
-                    if (st[in->args[i]] & ~want) {
+                    if (!ir_ty_sub(st[in->args[i]], want)) {
                         snprintf(what, sizeof what, "argument %d of '@%s'", i + 1, g->name);
                         type_error(v, f, b, in, what, st[in->args[i]], want);
                     }
                 }
-            } else if (in->op == IR_RET && (st[in->a] & ~self->ty)) {
+            } else if (in->op == IR_RET && !ir_ty_sub(st[in->a], self->ty)) {
                 snprintf(what, sizeof what, "the return value of '@%s'", self->name);
                 type_error(v, f, b, in, what, st[in->a], self->ty);
-            } else if (in->op == IR_STORE && (st[in->a] & ~m->globals[in->global].ty)) {
+            } else if (in->op == IR_STORE && !ir_ty_sub(st[in->a], m->globals[in->global].ty)) {
                 snprintf(what, sizeof what, "the value stored to '@%s'", m->globals[in->global].name);
                 type_error(v, f, b, in, what, st[in->a], m->globals[in->global].ty);
+            } else if (in->op == IR_NEW) {
+                const IrStruct *sd = &m->structs[in->sid];
+                for (int i = 0; i < in->nargs; i++)
+                    if (!ir_ty_sub(st[in->args[i]], sd->ftys[i])) {
+                        snprintf(what, sizeof what, "field '%s' of a new %s", sd->fields[i], sd->name);
+                        type_error(v, f, b, in, what, st[in->args[i]], sd->ftys[i]);
+                    }
+            } else if ((in->op == IR_GETFIELD || in->op == IR_SETFIELD) && in->sid >= 0) {
+                const IrStruct *sd = &m->structs[in->sid];
+                if (!ir_ty_sub(st[in->a], ty_struct_of(in->sid))) {
+                    snprintf(what, sizeof what, "the object of '%s %s.%s'", ir_op_name(in->op), sd->name, sd->fields[in->field]);
+                    type_error(v, f, b, in, what, st[in->a], ty_struct_of(in->sid));
+                } else if (in->op == IR_SETFIELD && !ir_ty_sub(st[in->b], sd->ftys[in->field])) {
+                    snprintf(what, sizeof what, "the value stored to %s.%s", sd->name, sd->fields[in->field]);
+                    type_error(v, f, b, in, what, st[in->b], sd->ftys[in->field]);
+                }
             }
             ir_types_step(m, in, st);
         }
@@ -242,6 +301,33 @@ bool ir_verify(const IrModule *m, const char *path) {
             verr(&v, NULL, -1, NULL, "C function '@%s' has more than %d parameters (not supported yet)", g->name, MAX_ARGS);
         for (int k = 0; k < g->arity; k++)
             if (g->cparams[k] == CT_VOID) verr(&v, NULL, -1, NULL, "C function '@%s': parameter '%s' cannot be void", g->name, g->cnames[k]);
+    }
+    for (int si = 0; si < m->nstructs; si++) {
+        const IrStruct *sd = &m->structs[si];
+        for (int k = 0; k < sd->nfields; k++) {
+            if (!ty_valid(m, sd->ftys[k])) verr(&v, NULL, -1, NULL, "struct '%s': field '%s' has an invalid type", sd->name, sd->fields[k]);
+            for (int j = k + 1; j < sd->nfields; j++)
+                if (strcmp(sd->fields[k], sd->fields[j]) == 0) verr(&v, NULL, -1, NULL, "struct '%s': duplicate field '%s'", sd->name, sd->fields[k]);
+        }
+        for (int k = 0; k < sd->nmethods; k++) {
+            /* callm passes (self, args...) unchecked: self is an instance of
+             * this struct (the runtime found the method on it), the other
+             * arguments may be anything */
+            const IrGlobal *g = sd->mglobals[k] >= 0 && sd->mglobals[k] < m->nglobals ? &m->globals[sd->mglobals[k]] : NULL;
+            if (!g || g->kind != IRG_FUNC || g->arity < 1) {
+                verr(&v, NULL, -1, NULL, "struct '%s': method '%s' must be a function taking self", sd->name, sd->mnames[k]);
+                continue;
+            }
+            if (!ir_ty_sub(ty_struct_of(si), ir_param_ty(g, 0)))
+                verr(&v, NULL, -1, NULL, "struct '%s': method '%s' (@%s) must accept a %s as its first parameter", sd->name,
+                     sd->mnames[k], g->name, sd->name);
+            for (int i = 1; i < g->arity; i++)
+                if (ir_param_ty(g, i) != TY_ANY)
+                    verr(&v, NULL, -1, NULL, "struct '%s': method '%s' (@%s) is called dynamically, so its parameter %d must be untyped",
+                         sd->name, sd->mnames[k], g->name, i + 1);
+            for (int j = k + 1; j < sd->nmethods; j++)
+                if (strcmp(sd->mnames[k], sd->mnames[j]) == 0) verr(&v, NULL, -1, NULL, "struct '%s': duplicate method '%s'", sd->name, sd->mnames[k]);
+        }
     }
     for (int fi = 0; fi < m->nfuncs; fi++) {
         const IrFunc *f = &m->funcs[fi];

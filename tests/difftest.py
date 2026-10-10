@@ -558,7 +558,7 @@ def compile_and_run(src, path, workdir, level, want_out, want_err, want_rc):
     if HAVE_AS:
         g = os.path.join(workdir, "gas.o")
         subprocess.run(["as", "--64", "-o", g, exe + ".s"], check=True)
-        for sec in (".text", ".rodata"):
+        for sec in (".text", ".rodata", ".data"):
             subprocess.run(["objcopy", "-O", "binary", "-j", sec, exe + ".o", g + ".l"], check=True)
             subprocess.run(["objcopy", "-O", "binary", "-j", sec, g, g + ".g"], check=True)
             with open(g + ".l", "rb") as a, open(g + ".g", "rb") as b:

@@ -29,6 +29,12 @@ typedef struct {
 } Pending;
 
 typedef struct {
+    int sid;
+    char method[256], global[256];
+    int line;
+} PendingMethod;
+
+typedef struct {
     const char *path;
     const char *src;
     size_t len, pos;
@@ -38,6 +44,8 @@ typedef struct {
     IrModule *m;
     Pending *pend;
     size_t npend, cap_pend;
+    PendingMethod *pmeth;
+    size_t npmeth;
 } P;
 
 static void perr(P *p, int line, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
@@ -161,7 +169,7 @@ static void next(P *p) {
         t->kind = T_STRING;
         return;
     }
-    if (strchr("(){},=:?|", c)) {
+    if (strchr("(){},=:?|.", c)) {
         p->pos++;
         t->kind = T_PUNCT;
         t->text[0] = (char)c;
@@ -230,7 +238,8 @@ static bool take_vreg(P *p, IrFunc *f, int *out) {
     return true;
 }
 
-/* type := NAME ( '|' NAME )* '?'?   with NAME in int, str, bool, nil, any */
+/* type := NAME ( '|' NAME )* '?'?   with NAME in int, str, bool, nil, any,
+ * struct, or the name of a struct */
 static bool take_type(P *p, IrTy *out) {
     char text[256] = "";
     int line = p->tok.line;
@@ -250,8 +259,8 @@ static bool take_type(P *p, IrTy *out) {
         strcat(text, "?");
         next(p);
     }
-    if (!ir_ty_parse(text, out)) {
-        perr(p, line, "invalid type '%s' (int, str, bool, nil, any, T?, A|B)", text);
+    if (!ir_ty_parse(p->m, text, out)) {
+        perr(p, line, "invalid type '%s' (int, str, bool, nil, any, struct, a struct name, T?, A|B)", text);
         return false;
     }
     return true;
@@ -308,6 +317,78 @@ static bool parse_call_tail(P *p, int fi, int bi) {
     }
     next(p);
     return true;
+}
+
+/* STRUCT.FIELD (static) or .FIELD (dynamic) into in->sid/field or in->name. */
+static bool take_field_ref(P *p, IrInstr *in) {
+    if (is_punct(p, '.')) {
+        next(p);
+        if (p->tok.kind != T_IDENT || strchr(p->tok.text, '.')) {
+            perr(p, p->tok.line, "expected a field name after '.', found %s", tok_desc(&p->tok));
+            return false;
+        }
+        in->sid = IR_NONE;
+        in->name = xstrdup(p->tok.text);
+        next(p);
+        return true;
+    }
+    if (p->tok.kind != T_IDENT || !strchr(p->tok.text, '.')) {
+        perr(p, p->tok.line, "expected STRUCT.FIELD or .FIELD, found %s", tok_desc(&p->tok));
+        return false;
+    }
+    char sname[256];
+    snprintf(sname, sizeof sname, "%s", p->tok.text);
+    char *dot = strchr(sname, '.');
+    *dot = '\0';
+    int sid = ir_find_struct(p->m, sname);
+    if (sid < 0) {
+        perr(p, p->tok.line, "unknown struct '%s'", sname);
+        return false;
+    }
+    int k = ir_struct_field(&p->m->structs[sid], dot + 1);
+    if (k < 0) {
+        perr(p, p->tok.line, "struct '%s' has no field '%s'", sname, dot + 1);
+        return false;
+    }
+    in->sid = sid;
+    in->field = k;
+    next(p);
+    return true;
+}
+
+/* (%a, %b, ...) into the last instruction of block bi */
+static bool take_arg_list(P *p, int fi, int bi) {
+    if (!expect_punct(p, '(')) return false;
+    int ii = p->m->funcs[fi].blocks[bi].n - 1;
+    while (!is_punct(p, ')')) {
+        IrInstr *in = &p->m->funcs[fi].blocks[bi].instrs[ii];
+        if (in->nargs > 0 && !expect_punct(p, ',')) return false;
+        int v;
+        if (!take_vreg(p, &p->m->funcs[fi], &v)) return false;
+        in = &p->m->funcs[fi].blocks[bi].instrs[ii];
+        in->args = xrealloc(in->args, (size_t)(in->nargs + 1) * sizeof(int));
+        in->args[in->nargs++] = v;
+    }
+    next(p);
+    return true;
+}
+
+/* callm %o, .NAME(%args)   (after "callm") */
+static bool parse_callm_tail(P *p, int fi, int bi, int dst, int line) {
+    IrFunc *f = &p->m->funcs[fi];
+    int o;
+    if (!take_vreg(p, f, &o) || !expect_punct(p, ',') || !expect_punct(p, '.')) return false;
+    if (p->tok.kind != T_IDENT || strchr(p->tok.text, '.')) {
+        perr(p, p->tok.line, "expected a method name after '.', found %s", tok_desc(&p->tok));
+        return false;
+    }
+    IrInstr *in = ir_emit(f, bi, IR_CALLM);
+    in->dst = dst;
+    in->a = o;
+    in->line = line;
+    in->name = xstrdup(p->tok.text);
+    next(p);
+    return take_arg_list(p, fi, bi);
 }
 
 static const struct { const char *name; IrOp op; } BINOPS[] = {
@@ -389,6 +470,27 @@ static bool parse_instr(P *p, int fi, int bi) {
             in->line = line;
             return take_global_ref(p, fi, bi, f->blocks[bi].n - 1);
         }
+        if (strcmp(op, "new") == 0) { /* %d = new STRUCT(%a, ...) */
+            if (p->tok.kind != T_IDENT) { perr(p, p->tok.line, "expected a struct name after 'new'"); return false; }
+            int sid = ir_find_struct(p->m, p->tok.text);
+            if (sid < 0) { perr(p, p->tok.line, "unknown struct '%s'", p->tok.text); return false; }
+            next(p);
+            IrInstr *in = ir_emit(f, bi, IR_NEW);
+            in->dst = dst;
+            in->sid = sid;
+            in->line = line;
+            return take_arg_list(p, fi, bi);
+        }
+        if (strcmp(op, "getfield") == 0) { /* %d = getfield %o, STRUCT.FIELD | .FIELD */
+            int o;
+            if (!take_vreg(p, f, &o) || !expect_punct(p, ',')) return false;
+            IrInstr *in = ir_emit(f, bi, IR_GETFIELD);
+            in->dst = dst;
+            in->a = o;
+            in->line = line;
+            return take_field_ref(p, in);
+        }
+        if (strcmp(op, "callm") == 0) return parse_callm_tail(p, fi, bi, dst, line);
         if (strcmp(op, "load") == 0) {
             IrInstr *in = ir_emit(f, bi, IR_LOAD);
             in->dst = dst;
@@ -403,6 +505,21 @@ static bool parse_instr(P *p, int fi, int bi) {
         IrInstr *in = ir_emit(f, bi, IR_CALL);
         in->line = line;
         return parse_call_tail(p, fi, bi);
+    }
+    if (is_ident(p, "setfield")) { /* setfield %o, STRUCT.FIELD | .FIELD, %v */
+        next(p);
+        int o, v;
+        if (!take_vreg(p, f, &o) || !expect_punct(p, ',')) return false;
+        IrInstr *in = ir_emit(f, bi, IR_SETFIELD);
+        in->a = o;
+        in->line = line;
+        if (!take_field_ref(p, in) || !expect_punct(p, ',') || !take_vreg(p, f, &v)) return false;
+        p->m->funcs[fi].blocks[bi].instrs[p->m->funcs[fi].blocks[bi].n - 1].b = v;
+        return true;
+    }
+    if (is_ident(p, "callm")) {
+        next(p);
+        return parse_callm_tail(p, fi, bi, IR_NONE, line);
     }
     if (is_ident(p, "store")) {
         next(p);
@@ -560,6 +677,114 @@ static bool parse_function(P *p) {
     return true;
 }
 
+/* Registers every "struct NAME" line first, so that types may name structs
+ * declared later (a field of type Node?, a function parameter of type Point). */
+static bool prescan_structs(P *p) {
+    size_t i = 0;
+    int line = 1;
+    while (i < p->len) {
+        size_t j = i;
+        while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
+        if (p->len - j > 7 && memcmp(p->src + j, "struct", 6) == 0 && (p->src[j + 6] == ' ' || p->src[j + 6] == '\t')) {
+            j += 6;
+            while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
+            size_t k = j;
+            while (k < p->len && name_char((unsigned char)p->src[k], k == j) && p->src[k] != '.') k++;
+            char name[256];
+            if (k == j || k - j >= sizeof name) {
+                perr(p, line, "expected a struct name");
+                return false;
+            }
+            memcpy(name, p->src + j, k - j);
+            name[k - j] = '\0';
+            if (ir_find_struct(p->m, name) >= 0) {
+                perr(p, line, "duplicate struct '%s'", name);
+                return false;
+            }
+            static const char *const reserved[] = {"int", "str", "bool", "nil", "any", "struct", "never"};
+            for (size_t r = 0; r < sizeof reserved / sizeof *reserved; r++)
+                if (strcmp(name, reserved[r]) == 0) {
+                    perr(p, line, "'%s' is a builtin type and cannot name a struct", name);
+                    return false;
+                }
+            int sid = ir_add_struct(p->m, name);
+            p->m->structs[sid].line = line;
+        }
+        while (i < p->len && p->src[i] != '\n') i++;
+        i++;
+        line++;
+    }
+    return true;
+}
+
+/* struct NAME {field: type, field, ...} [methods {name = @fn, ...}] */
+static bool parse_struct(P *p) {
+    next(p); /* 'struct' */
+    int sid = p->tok.kind == T_IDENT ? ir_find_struct(p->m, p->tok.text) : -1;
+    if (sid < 0) {
+        perr(p, p->tok.line, "expected a struct name, found %s", tok_desc(&p->tok));
+        return false;
+    }
+    next(p);
+    if (!expect_punct(p, '{')) return false;
+    char names[256][256];
+    const char *np[256];
+    IrTy tys[256];
+    int n = 0;
+    while (!is_punct(p, '}')) {
+        if (n > 0 && !expect_punct(p, ',')) return false;
+        if (n == 256) { perr(p, p->tok.line, "too many fields"); return false; }
+        if (p->tok.kind != T_IDENT || strchr(p->tok.text, '.')) {
+            perr(p, p->tok.line, "expected a field name, found %s", tok_desc(&p->tok));
+            return false;
+        }
+        for (int i = 0; i < n; i++)
+            if (strcmp(names[i], p->tok.text) == 0) {
+                perr(p, p->tok.line, "duplicate field '%s'", p->tok.text);
+                return false;
+            }
+        snprintf(names[n], 256, "%s", p->tok.text);
+        np[n] = names[n];
+        tys[n] = TY_ANY;
+        next(p);
+        if (is_punct(p, ':')) {
+            next(p);
+            if (!take_type(p, &tys[n])) return false;
+        }
+        n++;
+    }
+    next(p);
+    ir_struct_set_fields(p->m, sid, n, np, tys);
+    if (is_ident(p, "methods")) {
+        next(p);
+        if (!expect_punct(p, '{')) return false;
+        int k = 0;
+        while (!is_punct(p, '}')) {
+            if (k > 0 && !expect_punct(p, ',')) return false;
+            if (p->tok.kind != T_IDENT) { perr(p, p->tok.line, "expected a method name, found %s", tok_desc(&p->tok)); return false; }
+            p->pmeth = xrealloc(p->pmeth, (p->npmeth + 1) * sizeof *p->pmeth);
+            PendingMethod *q = &p->pmeth[p->npmeth];
+            q->sid = sid;
+            q->line = p->tok.line;
+            snprintf(q->method, sizeof q->method, "%s", p->tok.text);
+            for (size_t i = 0; i < p->npmeth; i++)
+                if (p->pmeth[i].sid == sid && strcmp(p->pmeth[i].method, q->method) == 0) {
+                    perr(p, q->line, "duplicate method '%s'", q->method);
+                    return false;
+                }
+            next(p);
+            if (!expect_punct(p, '=')) return false;
+            if (p->tok.kind != T_GLOBAL) { perr(p, p->tok.line, "expected a function name, found %s", tok_desc(&p->tok)); return false; }
+            snprintf(q->global, sizeof q->global, "%s", p->tok.text);
+            p->npmeth++;
+            next(p);
+            k++;
+        }
+        next(p);
+    }
+    return expect_nl(p);
+}
+
 bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
     P p = {0};
     p.path = path;
@@ -572,6 +797,7 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
     }
     ir_module_init(out, "");
     p.m = out;
+    if (!prescan_structs(&p)) goto fail;
     next(&p);
     skip_nl(&p);
     if (!expect_ident(&p, "module")) goto fail;
@@ -675,10 +901,12 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
                 out->globals[g].ty = ty;
             }
             if (!expect_nl(&p)) goto fail;
+        } else if (is_ident(&p, "struct")) {
+            if (!parse_struct(&p)) goto fail;
         } else if (is_ident(&p, "fn")) {
             if (!parse_function(&p)) goto fail;
         } else {
-            perr(&p, line, "expected 'extern', 'data', 'global' or 'fn', found %s", tok_desc(&p.tok));
+            perr(&p, line, "expected 'struct', 'extern', 'data', 'global' or 'fn', found %s", tok_desc(&p.tok));
             goto fail;
         }
     }
@@ -693,11 +921,23 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
         }
         out->funcs[q->func].blocks[q->block].instrs[q->instr].global = g;
     }
+    for (size_t i = 0; i < p.npmeth; i++) {
+        PendingMethod *q = &p.pmeth[i];
+        int g = ir_find_global(out, q->global);
+        if (g < 0 || out->globals[g].kind != IRG_FUNC) {
+            perr(&p, q->line, "method '%s' of struct '%s' must name a function, not '@%s'", q->method,
+                 out->structs[q->sid].name, q->global);
+            goto fail;
+        }
+        ir_struct_add_method(out, q->sid, q->method, g);
+    }
+    free(p.pmeth);
     free(p.pend);
     buf_free(&p.tok.str);
     return true;
 fail:
     if (!p.failed) fprintf(stderr, "%s: error: malformed IR\n", path);
+    free(p.pmeth);
     free(p.pend);
     buf_free(&p.tok.str);
     ir_module_free(out);

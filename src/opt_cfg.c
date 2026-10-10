@@ -44,7 +44,7 @@ static bool dup_candidate(IrFunc *f, int h) {
     if (bl->n == 0 || bl->n > TAIL_DUP_MAX || bl->instrs[bl->n - 1].op != IR_BR) return false;
     for (int k = 0; k < bl->n; k++) {
         IrOp op = bl->instrs[k].op;
-        if (op == IR_CALL || op == IR_STORE || op == IR_PHI) return false; /* keep calls in one place */
+        if (op == IR_CALL || op == IR_CALLM || op == IR_STORE || op == IR_PHI) return false; /* keep calls in one place */
     }
     return true;
 }

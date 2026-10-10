@@ -25,8 +25,13 @@ check() { # check LABEL COMMAND...   (sh has no locals: never reuse loop variabl
     if "$@" >"$OUT/last.log" 2>&1; then ok "$_label"; else bad "$_label"; sed 's/^/      /' "$OUT/last.log"; fi
 }
 
-# Relocations as "offset type symbol+addend", for comparing two objects.
-norm_relocs() { readelf -r -W "$1" | awk '/^[0-9a-f]+ /{print $1, $3, $5, $6, $7}'; }
+# Relocations as "section offset type symbol+addend", for comparing two objects.
+# Grouped by relocation section (in source order within each), since GNU as
+# creates .text and .data before other sections while lasm creates sections
+# in the order the source first uses them.
+norm_relocs() {
+    readelf -r -W "$1" | awk '/^Relocation section/{sec=$3} /^[0-9a-f]+ /{print sec, $1, $3, $5, $6, $7}' | sort -s -k1,1
+}
 
 # same_as_gas NAME FILE.s FILE.o : assemble FILE.s with GNU as and compare
 # section bytes and relocations with Luma's FILE.o.

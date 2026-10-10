@@ -1,0 +1,3 @@
+struct P { x }
+var p: P = P { x: 1 };
+p.y = 2;

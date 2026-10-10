@@ -9,8 +9,10 @@
  *   luma: runtime error: <message>
  * to stderr and exit with status 1. Messages follow Lox wording.
  *
- * Memory: strings created at runtime (concatenation) are allocated with
- * malloc and never freed. There is no GC in v0.1. */
+ * Memory: strings created at runtime (concatenation) and struct instances
+ * are allocated through luma_alloc (malloc) and never freed: there is no
+ * collector yet. Every allocation goes through luma_alloc, and every object
+ * header names its layout, so a collector can be added behind them. */
 #define _XOPEN_SOURCE 700 /* sigaction, sigaltstack, SA_ONSTACK (XSI) */
 #include <inttypes.h>
 #include <signal.h>
@@ -28,6 +30,34 @@ typedef struct {
     uint64_t len;
     char bytes[];    /* len bytes + NUL */
 } LumaString;
+
+/* Struct descriptors are emitted by the compiler (src/x86_isel.c,
+ * x86_emit_data) into .data; luma_structs lists them: [count, desc...]. */
+typedef LumaValue (*LumaFn)(void); /* a compiled Luma function (called with its real arguments) */
+
+typedef struct {
+    const char *name;
+    LumaFn fn;             /* called with `arity` LumaValue arguments */
+    int64_t arity;         /* including self */
+} LumaMethod;
+
+typedef struct {
+    int64_t id;            /* struct index + 1, as in instance headers */
+    const char *name;
+    int64_t nfields;
+    const char *const *fields;
+    const int64_t *ftys;   /* declared type mask of each field */
+    int64_t nmethods;
+    const LumaMethod *methods;
+} LumaStructDesc;
+
+typedef struct {
+    uint64_t header;
+    const LumaStructDesc *desc;
+    LumaValue fields[];
+} LumaStruct;
+
+extern const uintptr_t luma_structs[]; /* emitted into every program: [count, desc...] */
 
 LumaValue luma_main(void);
 
@@ -52,6 +82,19 @@ static bool is_string(LumaValue v) {
 
 static const LumaString *as_string(LumaValue v) { return (const LumaString *)(uintptr_t)v; }
 
+static bool is_struct(LumaValue v) {
+    return is_object(v) && (((const LumaString *)(uintptr_t)v)->header & 0xff) == LUMA_TYPE_STRUCT;
+}
+
+static LumaStruct *as_struct(LumaValue v) { return (LumaStruct *)(uintptr_t)v; }
+
+/* Every heap allocation of the runtime: 8-aligned, never NULL. */
+static void *luma_alloc(size_t size) {
+    void *p = malloc(size ? size : 1);
+    if (!p) luma_panic("Out of memory.");
+    return p;
+}
+
 static LumaValue make_fixnum_checked(int64_t n) {
     if (n < LUMA_FIXNUM_MIN || n > LUMA_FIXNUM_MAX) luma_panic("Integer overflow.");
     return luma_fixnum(n);
@@ -71,7 +114,8 @@ static void need_numbers(LumaValue a, LumaValue b) {
  * cannot type statically ("any") flows into an annotated variable, parameter
  * or return value. */
 
-enum { MASK_INT = 1, MASK_STR = 2, MASK_BOOL = 4, MASK_NIL = 8 };
+enum { MASK_INT = 1, MASK_STR = 2, MASK_BOOL = 4, MASK_NIL = 8, MASK_STRUCT = 16 };
+#define MASK_SID_SHIFT 8 /* a mask's struct bits: 0 = any struct, k = struct with id k */
 
 static _Noreturn void panicf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static _Noreturn void panicf(const char *fmt, ...) {
@@ -90,11 +134,30 @@ static unsigned value_mask(LumaValue v) {
     if (v == LUMA_NIL) return MASK_NIL;
     if (v == LUMA_TRUE || v == LUMA_FALSE) return MASK_BOOL;
     if (is_string(v)) return MASK_STR;
+    if (is_struct(v)) return MASK_STRUCT | (unsigned)(as_struct(v)->desc->id << MASK_SID_SHIFT);
     return 0;
 }
 
+/* Does a value of mask vm (from value_mask) belong to type mask m? */
+static bool mask_accepts(unsigned m, unsigned vm) {
+    if (vm & MASK_STRUCT) {
+        unsigned want = m >> MASK_SID_SHIFT;
+        return (m & MASK_STRUCT) && (want == 0 || want == vm >> MASK_SID_SHIFT);
+    }
+    return (vm & m & 15) != 0;
+}
+
+/* Name of the struct with id k (index + 1). */
+static const char *struct_name(unsigned id) {
+    if (id >= 1 && id <= luma_structs[0])
+        return ((const LumaStructDesc *)luma_structs[id])->name;
+    return "?struct";
+}
+
 static const char *value_type_name(LumaValue v) {
-    switch (value_mask(v)) {
+    unsigned vm = value_mask(v);
+    if (vm & MASK_STRUCT) return as_struct(v)->desc->name;
+    switch (vm) {
     case MASK_INT: return "int";
     case MASK_STR: return "str";
     case MASK_BOOL: return "bool";
@@ -103,29 +166,36 @@ static const char *value_type_name(LumaValue v) {
     }
 }
 
-/* "int", "str?", "int or str", ... (the same spelling the compiler uses) */
+/* "int", "str?", "int or str", "Point?", ... (the same spelling the compiler uses) */
 static void describe_mask(unsigned mask, char *buf, size_t n) {
     static const struct { unsigned bit; const char *name; } T[] = {
         {MASK_INT, "int"}, {MASK_STR, "str"}, {MASK_BOOL, "bool"}, {MASK_NIL, "nil"}};
-    if ((mask & 15) == 15) { snprintf(buf, n, "any"); return; }
-    unsigned rest = mask & ~(unsigned)MASK_NIL;
-    if ((mask & MASK_NIL) && rest && (rest & (rest - 1)) == 0) { /* exactly one type plus nil: T? */
-        for (int i = 0; i < 3; i++)
-            if (T[i].bit == rest) { snprintf(buf, n, "%s?", T[i].name); return; }
+    unsigned sid = mask >> MASK_SID_SHIFT;
+    const char *sname = (mask & MASK_STRUCT) ? (sid ? struct_name(sid) : "struct") : NULL;
+    if ((mask & 31) == 31 && sid == 0) { snprintf(buf, n, "any"); return; }
+    unsigned rest = mask & (MASK_INT | MASK_STR | MASK_BOOL);
+    int members = __builtin_popcount(rest) + (sname ? 1 : 0);
+    if ((mask & MASK_NIL) && members == 1) { /* exactly one type plus nil: T? */
+        const char *one = sname;
+        for (int i = 0; i < 3 && !one; i++)
+            if (T[i].bit == rest) one = T[i].name;
+        snprintf(buf, n, "%s?", one);
+        return;
     }
     buf[0] = '\0';
-    for (int i = 0; i < 4; i++) {
-        if (!(mask & T[i].bit)) continue;
+    for (int i = 0; i < 5; i++) {
+        const char *name = i < 4 ? ((mask & T[i].bit) ? T[i].name : NULL) : sname;
+        if (!name) continue;
         if (buf[0]) strncat(buf, " or ", n - strlen(buf) - 1);
-        strncat(buf, T[i].name, n - strlen(buf) - 1);
+        strncat(buf, name, n - strlen(buf) - 1);
     }
 }
 
 LumaValue luma_check_type(LumaValue v, LumaValue mask, LumaValue context) {
     check_valid(v);
     unsigned m = (unsigned)fixnum_val(mask);
-    if (value_mask(v) & m) return v; /* the optimizing backend uses the result */
-    char want[64];
+    if (mask_accepts(m, value_mask(v))) return v; /* the optimizing backend uses the result */
+    char want[300];
     describe_mask(m, want, sizeof want);
     const char *ctx = is_string(context) ? as_string(context)->bytes : "value";
     panicf("%s expects %s, got %s.", ctx, want, value_type_name(v));
@@ -205,8 +275,7 @@ LumaValue luma_ffi_ret_bool(uint64_t r, const char *c) { (void)c; return make_bo
 
 static LumaValue string_from_c(const char *p) {
     size_t n = strlen(p);
-    LumaString *s = aligned_alloc(8, (sizeof *s + n + 1 + 7) & ~(size_t)7);
-    if (!s) luma_panic("Out of memory.");
+    LumaString *s = luma_alloc((sizeof *s + n + 1 + 7) & ~(size_t)7);
     s->header = LUMA_TYPE_STRING;
     s->len = n;
     memcpy(s->bytes, p, n + 1);
@@ -228,7 +297,13 @@ LumaValue luma_ffi_ret_cstr_opt(uint64_t r, const char *c) {
  *     luma_write(a); luma_write_space(); luma_write(b); ...; luma_write_newline();
  * luma_print(v) (= write + newline) is kept for hand-written LIR. */
 
-LumaValue luma_write(LumaValue v) {
+/* Structs print as  Point { x: 1, label: "hi" }  (strings inside quoted). An
+ * instance that is already being printed (a cycle) prints as  Point { ... }. */
+#define MAX_PRINT_DEPTH 64
+static const LumaStruct *printing[MAX_PRINT_DEPTH];
+static int nprinting;
+
+static void write_value(LumaValue v, bool quoted) {
     check_valid(v);
     if (is_fixnum(v)) printf("%" PRId64, fixnum_val(v));
     else if (v == LUMA_NIL) fputs("nil", stdout);
@@ -236,8 +311,44 @@ LumaValue luma_write(LumaValue v) {
     else if (v == LUMA_FALSE) fputs("false", stdout);
     else if (is_string(v)) {
         const LumaString *s = as_string(v);
-        fwrite(s->bytes, 1, s->len, stdout);
+        if (!quoted) {
+            fwrite(s->bytes, 1, s->len, stdout);
+            return;
+        }
+        putchar('"');
+        for (uint64_t i = 0; i < s->len; i++) {
+            char c = s->bytes[i];
+            if (c == '"' || c == '\\') printf("\\%c", c);
+            else if (c == '\n') fputs("\\n", stdout);
+            else if (c == '\t') fputs("\\t", stdout);
+            else putchar(c);
+        }
+        putchar('"');
+    } else if (is_struct(v)) {
+        const LumaStruct *o = as_struct(v);
+        bool cycle = nprinting == MAX_PRINT_DEPTH;
+        for (int i = 0; i < nprinting && !cycle; i++) cycle = printing[i] == o;
+        if (cycle) {
+            printf("%s { ... }", o->desc->name);
+            return;
+        }
+        if (o->desc->nfields == 0) {
+            printf("%s {}", o->desc->name);
+            return;
+        }
+        printing[nprinting++] = o;
+        printf("%s { ", o->desc->name);
+        for (int64_t i = 0; i < o->desc->nfields; i++) {
+            printf("%s%s: ", i ? ", " : "", o->desc->fields[i]);
+            write_value(o->fields[i], true);
+        }
+        fputs(" }", stdout);
+        nprinting--;
     } else luma_panic("cannot print value of unknown type");
+}
+
+LumaValue luma_write(LumaValue v) {
+    write_value(v, false);
     return LUMA_NIL;
 }
 
@@ -268,6 +379,65 @@ _Noreturn void luma_undefined_variable(const char *name) {
     exit(1);
 }
 
+/* ---- structs -----------------------------------------------------------
+ * `new` allocates with luma_new_struct and the compiler stores the fields;
+ * accesses whose struct is known statically are plain loads and stores. The
+ * functions below serve values whose struct is not known at compile time. */
+
+LumaValue luma_new_struct(const LumaStructDesc *d) {
+    LumaStruct *o = luma_alloc(sizeof *o + (size_t)d->nfields * sizeof(LumaValue));
+    o->header = LUMA_TYPE_STRUCT | ((uint64_t)d->id << LUMA_STRUCT_ID_SHIFT);
+    o->desc = d;
+    for (int64_t i = 0; i < d->nfields; i++) o->fields[i] = LUMA_NIL;
+    return (LumaValue)(uintptr_t)o;
+}
+
+static LumaStruct *need_instance(LumaValue o, const char *what) {
+    check_valid(o);
+    if (!is_struct(o)) panicf("Only struct instances have %s, got %s.", what, value_type_name(o));
+    return as_struct(o);
+}
+
+static int64_t field_index(const LumaStruct *s, const char *name) {
+    for (int64_t i = 0; i < s->desc->nfields; i++)
+        if (strcmp(s->desc->fields[i], name) == 0) return i;
+    panicf("Struct '%s' has no field '%s'.", s->desc->name, name);
+}
+
+LumaValue luma_getfield(LumaValue o, const char *name) {
+    LumaStruct *s = need_instance(o, "fields");
+    return s->fields[field_index(s, name)];
+}
+
+LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
+    LumaStruct *s = need_instance(o, "fields");
+    int64_t k = field_index(s, name);
+    check_valid(v);
+    unsigned m = (unsigned)s->desc->ftys[k];
+    if (!mask_accepts(m, value_mask(v))) {
+        char want[300];
+        describe_mask(m, want, sizeof want);
+        panicf("field '%s' of '%s' expects %s, got %s.", name, s->desc->name, want, value_type_name(v));
+    }
+    s->fields[k] = v;
+    return v;
+}
+
+/* The code of method `name` of o's struct, for a call with nargs arguments
+ * after self. */
+LumaFn luma_method(LumaValue o, const char *name, int64_t nargs) {
+    LumaStruct *s = need_instance(o, "methods");
+    for (int64_t i = 0; i < s->desc->nmethods; i++) {
+        const LumaMethod *mt = &s->desc->methods[i];
+        if (strcmp(mt->name, name) != 0) continue;
+        if (mt->arity - 1 != nargs)
+            panicf("'%s::%s' expects %" PRId64 " argument%s, got %" PRId64 ".", s->desc->name, name, mt->arity - 1,
+                   mt->arity == 2 ? "" : "s", nargs);
+        return mt->fn;
+    }
+    panicf("Struct '%s' has no method '%s'.", s->desc->name, name);
+}
+
 /* ---- arithmetic -------------------------------------------------------- */
 
 LumaValue luma_add(LumaValue a, LumaValue b) {
@@ -282,8 +452,7 @@ LumaValue luma_add(LumaValue a, LumaValue b) {
         const LumaString *x = as_string(a), *y = as_string(b);
         if (x->len > SIZE_MAX / 2 || y->len > SIZE_MAX / 2) luma_panic("String too long.");
         size_t n = x->len + y->len;
-        LumaString *s = aligned_alloc(8, (sizeof *s + n + 1 + 7) & ~(size_t)7);
-        if (!s) luma_panic("Out of memory.");
+        LumaString *s = luma_alloc((sizeof *s + n + 1 + 7) & ~(size_t)7);
         s->header = LUMA_TYPE_STRING;
         s->len = n;
         memcpy(s->bytes, x->bytes, x->len);

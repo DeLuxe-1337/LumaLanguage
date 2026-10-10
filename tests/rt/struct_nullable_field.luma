@@ -1,0 +1,4 @@
+struct N { v: int, next: N? }
+var n = N { v: 1, next: nil };
+print(n.v);
+print(n.next.v);

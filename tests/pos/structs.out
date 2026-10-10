@@ -1,0 +1,14 @@
+3 4 nil 25
+5 6 61
+3 4 nil 25
+5 6 moved 11
+Point { x: 5, y: 6, label: 42 }
+100 true false false
+false true true
+Line { a: Point { x: 0, y: 0, label: nil }, b: Point { x: 3, y: 4, label: "tip \"b\"" } }
+25 tip "b"
+Empty {} false
+Node { value: 1, next: Node { ... } }
+5050 100 1
+truthy
+none 100

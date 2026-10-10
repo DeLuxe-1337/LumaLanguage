@@ -162,6 +162,52 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         load(out, "rax", in->a);
         store(out, in->dst, "rax");
         break;
+    case IR_NEW: {
+        buf_printf(out, "    lea rdi, [rip + .Lstruct.%d]\n", in->sid);
+        buf_printf(out, "    call luma_new_struct@PLT\n");
+        for (int i = 0; i < in->nargs; i++) {
+            load(out, "rcx", in->args[i]);
+            buf_printf(out, "    mov [rax + %d], rcx\n", LUMA_STRUCT_FIELDS_OFFSET + 8 * i);
+        }
+        store(out, in->dst, "rax");
+        break;
+    }
+    case IR_GETFIELD:
+        if (in->sid >= 0) {
+            load(out, "rax", in->a);
+            buf_printf(out, "    mov rax, [rax + %d]\n", LUMA_STRUCT_FIELDS_OFFSET + 8 * in->field);
+        } else {
+            load(out, "rdi", in->a);
+            buf_printf(out, "    lea rsi, [rip + .Lname.%s]\n", in->name);
+            buf_printf(out, "    call luma_getfield@PLT\n");
+        }
+        store(out, in->dst, "rax");
+        break;
+    case IR_SETFIELD:
+        if (in->sid >= 0) {
+            load(out, "rax", in->a);
+            load(out, "rcx", in->b);
+            buf_printf(out, "    mov [rax + %d], rcx\n", LUMA_STRUCT_FIELDS_OFFSET + 8 * in->field);
+        } else {
+            load(out, "rdi", in->a);
+            buf_printf(out, "    lea rsi, [rip + .Lname.%s]\n", in->name);
+            load(out, "rdx", in->b);
+            buf_printf(out, "    call luma_setfield@PLT\n");
+        }
+        break;
+    case IR_CALLM:
+        /* find the method on the object's struct (the runtime checks the
+         * arity), then call it with (self, args...) */
+        load(out, "rdi", in->a);
+        buf_printf(out, "    lea rsi, [rip + .Lname.%s]\n", in->name);
+        buf_printf(out, "    mov edx, %d\n", in->nargs);
+        buf_printf(out, "    call luma_method@PLT\n");
+        buf_printf(out, "    mov r11, rax\n");
+        load(out, ARG_REGS[0], in->a);
+        for (int i = 0; i < in->nargs; i++) load(out, ARG_REGS[i + 1], in->args[i]);
+        buf_printf(out, "    call r11\n");
+        if (in->dst != IR_NONE) store(out, in->dst, "rax");
+        break;
     case IR_PHI:
     case IR_NOP:
         break; /* never reach the backend (the verifier rejects them) */
@@ -223,7 +269,84 @@ static void emit_func(const IrModule *m, const IrFunc *f, Buf *out) {
     buf_printf(out, "    .size %s, .-%s\n", name, name);
 }
 
+/* Does the name `n` occur as a dynamic field or method name in the module? */
+static bool name_seen(const char *const *names, int n, const char *s) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(names[i], s) == 0) return true;
+    return false;
+}
+
+/* Struct descriptors (runtime/luma_rt.c, LumaStructDesc) and the luma_structs
+ * table the runtime reads; plus the C strings of field and method names that
+ * are looked up at run time. */
+static void emit_structs(const IrModule *m, Buf *out) {
+    buf_printf(out, "\n    .data\n    .p2align 3\n    .globl luma_structs\n    .type luma_structs, @object\n");
+    buf_printf(out, "luma_structs:    # struct count, then one descriptor per struct\n    .quad %d\n", m->nstructs);
+    for (int i = 0; i < m->nstructs; i++) buf_printf(out, "    .quad .Lstruct.%d    # %s\n", i, m->structs[i].name);
+    buf_printf(out, "    .size luma_structs, .-luma_structs\n");
+    for (int i = 0; i < m->nstructs; i++) {
+        const IrStruct *st = &m->structs[i];
+        buf_printf(out, ".Lstruct.%d:    # struct %s\n", i, st->name);
+        buf_printf(out, "    .quad %d    # id (index + 1)\n", i + 1);
+        buf_printf(out, "    .quad .Lsname.%d\n", i);
+        buf_printf(out, "    .quad %d    # fields\n", st->nfields);
+        if (st->nfields) buf_printf(out, "    .quad .Lsfields.%d\n    .quad .Lsftys.%d\n", i, i);
+        else buf_printf(out, "    .quad 0\n    .quad 0\n");
+        buf_printf(out, "    .quad %d    # methods\n", st->nmethods);
+        if (st->nmethods) buf_printf(out, "    .quad .Lsmeth.%d\n", i);
+        else buf_printf(out, "    .quad 0\n");
+        if (st->nfields) {
+            buf_printf(out, ".Lsfields.%d:\n", i);
+            for (int k = 0; k < st->nfields; k++) buf_printf(out, "    .quad .Lsfname.%d.%d    # %s\n", i, k, st->fields[k]);
+            buf_printf(out, ".Lsftys.%d:\n", i);
+            for (int k = 0; k < st->nfields; k++) buf_printf(out, "    .quad %u\n", st->ftys[k]);
+        }
+        if (st->nmethods) {
+            buf_printf(out, ".Lsmeth.%d:\n", i);
+            for (int k = 0; k < st->nmethods; k++) {
+                const IrGlobal *g = &m->globals[st->mglobals[k]];
+                buf_printf(out, "    .quad .Lsmname.%d.%d, %s, %d    # %s\n", i, k, g->name, g->arity, st->mnames[k]);
+            }
+        }
+    }
+    buf_printf(out, "\n    .section .rodata\n");
+    for (int i = 0; i < m->nstructs; i++) {
+        const IrStruct *st = &m->structs[i];
+        buf_printf(out, ".Lsname.%d:\n", i);
+        x86_emit_ascii(out, st->name, strlen(st->name));
+        buf_printf(out, "    .byte 0\n");
+        for (int k = 0; k < st->nfields; k++) {
+            buf_printf(out, ".Lsfname.%d.%d:\n", i, k);
+            x86_emit_ascii(out, st->fields[k], strlen(st->fields[k]));
+            buf_printf(out, "    .byte 0\n");
+        }
+        for (int k = 0; k < st->nmethods; k++) {
+            buf_printf(out, ".Lsmname.%d.%d:\n", i, k);
+            x86_emit_ascii(out, st->mnames[k], strlen(st->mnames[k]));
+            buf_printf(out, "    .byte 0\n");
+        }
+    }
+    /* names looked up at run time (dynamic getfield / setfield / callm) */
+    const char **names = NULL;
+    int nnames = 0;
+    for (int fi = 0; fi < m->nfuncs; fi++)
+        for (int b = 0; b < m->funcs[fi].nblocks; b++)
+            for (int k = 0; k < m->funcs[fi].blocks[b].n; k++) {
+                const IrInstr *in = &m->funcs[fi].blocks[b].instrs[k];
+                if (!in->name || name_seen(names, nnames, in->name)) continue;
+                names = xrealloc(names, (size_t)(nnames + 1) * sizeof *names);
+                names[nnames++] = in->name;
+            }
+    for (int i = 0; i < nnames; i++) {
+        buf_printf(out, ".Lname.%s:\n", names[i]);
+        x86_emit_ascii(out, names[i], strlen(names[i]));
+        buf_printf(out, "    .byte 0\n");
+    }
+    free(names);
+}
+
 void x86_emit_data(const IrModule *m, Buf *out) {
+    emit_structs(m, out);
     bool any_data = false;
     for (int i = 0; i < m->nglobals; i++) {
         const IrGlobal *g = &m->globals[i];

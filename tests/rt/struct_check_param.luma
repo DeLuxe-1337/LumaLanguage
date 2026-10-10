@@ -1,0 +1,6 @@
+struct P {}
+struct Q {}
+fun f(p: P) { return 1; }
+fun dyn(v) { return v; }
+print(f(dyn(P {})));
+f(dyn(Q {}));

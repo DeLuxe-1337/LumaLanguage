@@ -972,7 +972,16 @@ m2:
     lea rax, [rip + external_d]
     jmp .Lin_rodata
     call .Lin_rodata
+    call r11                # indirect calls (FF /2)
+    call rax
     ret
+
+# Absolute addresses in data (R_X86_64_64): a local label (via its section
+# symbol), a global defined here, an external symbol with an addend.
+    .data
+    .p2align 3
+.Ltable:
+    .quad .Lin_rodata, entry, external_e + 8, .Ltable
 
     .section .rodata
 .Lin_rodata:

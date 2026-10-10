@@ -1,0 +1,107 @@
+// Structs and impls: literals, fields, methods, associated functions,
+// reference semantics, printing, typed and untyped (dynamic) access.
+struct Point {
+  x: int,
+  y: int,
+  label,
+}
+
+struct Node {
+  value: int,
+  next: Node?,
+}
+
+struct Empty {}
+
+struct Line { a: Point, b: Point }
+
+impl Point {
+  fun new(x: int, y: int): Point { return Point { x, y, label: nil }; }
+  fun origin(): Point { return Point::new(0, 0); }
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+  fun shift(self, dx: int, dy: int): Point {
+    self.x = self.x + dx;
+    self.y = self.y + dy;
+    return self; // chaining
+  }
+  fun named(self, label) { self.label = label; return self; }
+}
+
+impl Point { // a second impl block for the same struct
+  fun manhattan(self, other: Point): int {
+    return abs(self.x - other.x) + abs(self.y - other.y);
+  }
+}
+
+impl Node {
+  fun sum(self): int {
+    var total = 0;
+    var n: Node? = self;
+    while (n != nil) {
+      total = total + n.value;
+      n = n.next;
+    }
+    return total;
+  }
+  fun length(self): int {
+    if (self.next == nil) return 1;
+    return 1 + self.next.length();
+  }
+  fun last(self) { // tail recursion through a method
+    if (self.next == nil) return self.value;
+    return self.next.last();
+  }
+}
+
+impl Line {
+  fun len2(self): int {
+    var dx = self.b.x - self.a.x;
+    var dy = self.b.y - self.a.y;
+    return dx * dx + dy * dy;
+  }
+}
+
+fun abs(n: int): int { if (n < 0) return -n; return n; }
+fun dyn(x) { return x; } // hides static types: accesses through it are dynamic
+
+// typed access
+var p: Point = Point::new(3, 4);
+print(p.x, p.y, p.label, p.len2());
+p.shift(1, 1).shift(1, 1);
+print(p.x, p.y, Point::len2(p));
+
+// untyped (dynamic) access gives the same results
+var d = dyn(Point::new(3, 4));
+print(d.x, d.y, d.label, d.len2());
+d.shift(2, 2).named("moved");
+print(d.x, d.y, d.label, d.manhattan(Point::origin()));
+d.label = 42;
+print(d);
+
+// reference semantics and identity
+var q = p;
+q.x = 100;
+print(p.x, p == q, p == Point::new(100, 6), p != q);
+var a = Point::new(1, 2);
+var b = Point::new(1, 2);
+print(a == b, a == a, a.len2() == b.len2());
+
+// printing: nested structs, quoted strings, empty structs, cycles
+var line = Line { a: Point::new(0, 0), b: Point { x: 3, y: 4, label: "tip \"b\"" } };
+print(line);
+print(line.len2(), line.b.label);
+print(Empty {}, dyn(Empty {}) == nil);
+var ring = Node { value: 1, next: nil };
+ring.next = ring;
+print(ring);
+ring.next = nil;
+
+// a linked list
+var list: Node? = nil;
+for (var i = 1; i <= 100; i = i + 1) list = Node { value: i, next: list };
+print(list.sum(), list.length(), list.last());
+
+// structs are truthy, and work in logic and as values
+if (Empty {}) print("truthy");
+var maybe: Point? = nil;
+print(maybe or "none", (maybe = p) and maybe.x);

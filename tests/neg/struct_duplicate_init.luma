@@ -1,0 +1,2 @@
+struct P { x }
+var p = P { x: 1, x: 2 };

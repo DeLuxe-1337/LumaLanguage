@@ -1,0 +1,6 @@
+struct P {}
+impl P { fun f(self, a) { return a; } }
+fun dyn(v) { return v; }
+var p = dyn(P {});
+print(p.f(1));
+p.f(1, 2);

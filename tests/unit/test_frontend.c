@@ -109,6 +109,26 @@ static void test_parse(void) {
     CHECK(e->kind == EXPR_LOGICAL && e->op == TOK_OR && e->right->op == TOK_AND);
     program_free(&p);
 
+    /* structs and impls */
+    CHECK(parse_str("struct P { x: int, y, } impl P { fun new(x) { return P { x, y: 1 }; } fun m(self, d) {} }", &p));
+    CHECK_EQ_INT(p.len, 2);
+    CHECK(p.stmts[0]->kind == STMT_STRUCT && p.stmts[0]->nparams == 2 && strcmp(p.stmts[0]->param_types[0].name, "int") == 0 &&
+          p.stmts[0]->param_types[1].name == NULL);
+    CHECK(p.stmts[1]->kind == STMT_IMPL && p.stmts[1]->n == 2 && p.stmts[1]->stmts[1]->nparams == 2);
+    e = p.stmts[1]->stmts[0]->stmts[0]->expr; /* P { x, y: 1 }: x is short for x: x */
+    CHECK(e->kind == EXPR_STRUCT && e->nargs == 2 && strcmp(e->fields[0], "x") == 0 && e->args[0]->kind == EXPR_VAR &&
+          strcmp(e->fields[1], "y") == 0 && e->args[1]->kind == EXPR_INT);
+    program_free(&p);
+    CHECK(parse_str("a.b.c = P::new(1).m(2).d;", &p));
+    e = p.stmts[0]->expr; /* (set (get a b) c (get (callm (call P::new 1) m 2) d)) */
+    CHECK(e->kind == EXPR_SET && strcmp(e->name, "c") == 0 && e->left->kind == EXPR_GET);
+    CHECK(e->right->kind == EXPR_GET && e->right->left->kind == EXPR_METHOD && e->right->left->left->kind == EXPR_ASSOC &&
+          strcmp(e->right->left->left->str, "new") == 0);
+    program_free(&p);
+    CHECK(parse_str("if (a) { b; }", &p)); /* NAME '{' is a block here, not a struct literal */
+    CHECK(p.stmts[0]->kind == STMT_IF && p.stmts[0]->then_branch->kind == STMT_BLOCK);
+    program_free(&p);
+
     CHECK(parse_str("for (var i = 0; i < 3; i = i + 1) print(i);", &p)); /* desugared */
     Stmt *s = p.stmts[0];
     CHECK(s->kind == STMT_BLOCK && s->n == 2 && s->stmts[0]->kind == STMT_VAR && s->stmts[1]->kind == STMT_WHILE);
@@ -180,7 +200,18 @@ static void test_parse(void) {
     CHECK(!parse_str("return 1;", &p));
     CHECK(!parse_str("class A {}", &p));
     CHECK(!parse_str("this;", &p));
-    CHECK(!parse_str("a.b;", &p));
+    CHECK(!parse_str("a.;", &p));
+    CHECK(!parse_str("struct P { x: }", &p));
+    CHECK(!parse_str("struct P { x y }", &p));
+    CHECK(!parse_str("var p = P { x: 1;", &p));
+    CHECK(!parse_str("a.b() = 1;", &p));      /* a call result is not a target */
+    CHECK(!parse_str("(a.b) = 1;", &p));
+    CHECK(!parse_str("impl P { var x; }", &p));
+    CHECK(!parse_str("{ struct P {} }", &p));  /* only at top level */
+    CHECK(!parse_str("fun f() { impl P {} }", &p));
+    CHECK(!parse_str("P::;", &p));
+    CHECK(!parse_str("P::f;", &p));            /* associated functions must be called */
+    CHECK(!parse_str("p.f()();", &p));
     CHECK(!parse_str("for (var i = 0; i < 1) print(i);", &p));
 
     /* nesting is bounded rather than overflowing the stack */

@@ -1,0 +1,4 @@
+struct P {}
+impl P { fun new(): P { return P {}; } }
+var p: P = P {};
+p.new();

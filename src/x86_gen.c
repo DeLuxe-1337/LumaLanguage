@@ -59,7 +59,7 @@ static bool fits32(int64_t w) { return w >= INT32_MIN && w <= INT32_MAX; }
 /* ------------------------------------------------------------------------ */
 /* Locations and output lines                                               */
 
-typedef enum { LOC_NONE, LOC_REG, LOC_STACK, LOC_IMM, LOC_DATA } LocKind;
+typedef enum { LOC_NONE, LOC_REG, LOC_STACK, LOC_IMM, LOC_DATA, LOC_SYM } LocKind;
 
 typedef struct {
     LocKind kind;
@@ -67,6 +67,7 @@ typedef struct {
     int slot;    /* LOC_STACK */
     int64_t imm; /* LOC_IMM: the tagged word */
     int global;  /* LOC_DATA */
+    const char *sym; /* LOC_SYM: address of a local label (lea) */
 } Loc;
 
 static Loc loc_reg(int r) { return (Loc){.kind = LOC_REG, .reg = r}; }
@@ -199,6 +200,7 @@ static void load_loc(G *g, int r, Loc L) {
     case LOC_STACK: E(g, "    mov %s, %s", R64[r], mem_text(g, L.slot, "qword")); break;
     case LOC_IMM: emit_imm(g, r, L.imm); break;
     case LOC_DATA: E(g, "    lea %s, [rip + .Ldata.%s]", R64[r], g->m->globals[L.global].name); break;
+    case LOC_SYM: E(g, "    lea %s, [rip + %s]", R64[r], L.sym); break;
     case LOC_NONE: emit_imm(g, r, (int64_t)LUMA_NIL); break; /* never read in practice */
     }
 }
@@ -858,7 +860,7 @@ static void emit_fused_br(G *g, int b, int idx, const IrInstr *br) {
 
 static void emit_check(G *g, int idx, const IrInstr *in) {
     IrTy ta = g->tya[idx];
-    if (ta != 0 && (ta & ~in->ty) == 0) {
+    if (ta != 0 && ir_ty_sub(ta, in->ty)) {
         move_v(g, in->dst, in->a); /* statically proven */
         return;
     }
@@ -877,6 +879,16 @@ static void emit_check(G *g, int idx, const IrInstr *in) {
         E(g, "    and r10, -9"); /* false 2, true 10 -> 2 */
         E(g, "    cmp r10, 2");
         E(g, "    je .Lk%d", ok);
+    }
+    if (ty_sid(in->ty) >= 0 && ir_ty_inter(ta, in->ty) & TY_STRUCT) {
+        /* an instance of exactly this struct: an object whose header is
+         * LUMA_TYPE_STRUCT | id << 8 */
+        int no = new_label();
+        E(g, "    test %s, 7", R8B[ra]);
+        E(g, "    jnz .Lk%d", no);
+        E(g, "    cmp qword ptr [%s], %d", R64[ra], LUMA_TYPE_STRUCT | ((ty_sid(in->ty) + 1) << LUMA_STRUCT_ID_SHIFT));
+        E(g, "    je .Lk%d", ok);
+        E(g, ".Lk%d:", no);
     }
     E(g, "    jmp .Lk%d", slow);
     E(g, ".Lk%d:", ok);
@@ -997,6 +1009,80 @@ static void emit_instr(G *g, int b, int idx, const IrInstr *in) {
         break;
     }
     case IR_CHECK: emit_check(g, idx, in); break;
+    case IR_NEW: {
+        /* allocate (a call: the field values live across it in callee-saved
+         * registers or slots), then store the fields */
+        E(g, "    lea rdi, [rip + .Lstruct.%d]", in->sid);
+        E(g, "    call luma_new_struct@PLT");
+        for (int i = 0; i < in->nargs; i++) {
+            Loc A = g->loc[in->args[i]];
+            char *dst = tbuf();
+            snprintf(dst, 128, "qword ptr [rax + %d]", LUMA_STRUCT_FIELDS_OFFSET + 8 * i);
+            if (A.kind == LOC_REG) E(g, "    mov %s, %s", dst, R64[A.reg]);
+            else if (A.kind == LOC_IMM && fits32(A.imm)) E(g, "    mov %s, %s", dst, num_text(A.imm));
+            else {
+                load_loc(g, R11, A);
+                E(g, "    mov %s, r11", dst);
+            }
+        }
+        store_reg(g, d, RAX);
+        break;
+    }
+    case IR_GETFIELD:
+    case IR_SETFIELD: {
+        if (in->sid >= 0) {
+            int ro = use_r(g, in->a, R11);
+            char *mem = tbuf();
+            snprintf(mem, 128, "qword ptr [%s + %d]", R64[ro], LUMA_STRUCT_FIELDS_OFFSET + 8 * in->field);
+            if (in->op == IR_GETFIELD) {
+                int T = dst_reg(g, d, -1);
+                E(g, "    mov %s, %s", R64[T], mem);
+                store_reg(g, d, T);
+            } else {
+                Loc B = g->loc[in->b];
+                if (B.kind == LOC_REG) E(g, "    mov %s, %s", mem, R64[B.reg]);
+                else if (B.kind == LOC_IMM && fits32(B.imm)) E(g, "    mov %s, %s", mem, num_text(B.imm));
+                else {
+                    load_loc(g, R10, B);
+                    E(g, "    mov %s, r10", mem);
+                }
+            }
+            break;
+        }
+        /* dynamic: the runtime looks the field up by name */
+        char *label = tbuf();
+        snprintf(label, 128, ".Lname.%s", in->name);
+        int saved[NREGS];
+        int ns = live_caller(g, 2 * idx, 2 * idx + 2, d, saved);
+        Loc args[3] = {g->loc[in->a], (Loc){.kind = LOC_SYM, .sym = label}, in->op == IR_SETFIELD ? g->loc[in->b] : loc_imm(0)};
+        int r = preserving_call(g, saved, ns, in->op == IR_GETFIELD ? "luma_getfield" : "luma_setfield", args,
+                                in->op == IR_GETFIELD ? 2 : 3);
+        if (in->op == IR_GETFIELD) store_reg(g, d, r);
+        break;
+    }
+    case IR_CALLM: {
+        /* self and the arguments go to their registers first; they are kept
+         * (pushed) across the method lookup, then the method is called */
+        int n = in->nargs + 1 > 6 ? 6 : in->nargs + 1; /* the verifier allows at most 6 */
+        Loc dst[6] = {{0}}, src[6] = {{0}};
+        for (int i = 0; i < n; i++) {
+            dst[i] = loc_reg(ARGREG[i]);
+            src[i] = g->loc[i == 0 ? in->a : in->args[i - 1]];
+        }
+        parallel_move(g, dst, src, n);
+        for (int i = 0; i < n; i++) E(g, "    push %s", R64[ARGREG[i]]);
+        bool pad = n % 2 != 0; /* the frame keeps rsp 16-aligned at calls */
+        if (pad) E(g, "    sub rsp, 8");
+        E(g, "    lea rsi, [rip + .Lname.%s]", in->name);
+        E(g, "    mov edx, %d", in->nargs);
+        E(g, "    call luma_method@PLT");
+        E(g, "    mov r11, rax");
+        if (pad) E(g, "    add rsp, 8");
+        for (int i = n - 1; i >= 0; i--) E(g, "    pop %s", R64[ARGREG[i]]);
+        E(g, "    call r11");
+        store_reg(g, d, RAX);
+        break;
+    }
     case IR_PHI: case IR_NOP: break; /* never reach the backend */
     case IR_JMP: emit_goto(g, b, in->target[0]); break;
     case IR_BR:
@@ -1190,6 +1276,7 @@ static void analyze(G *g) {
     for (int idx = 0; idx < g->ninstr; idx++) {
         IrInstr *in = (IrInstr *)g->ins[idx];
         int upos = g->fused[idx] ? 2 * g->fuse_br[idx] : 2 * idx; /* fused: operands are read at the br */
+        if (in->op == IR_NEW) upos = 2 * idx + 2; /* the fields are stored after the allocation call */
         int nu = uses_of(in, ubuf);
         for (int i = 0; i < nu; i++) {
             int v = *ubuf[i];
@@ -1214,7 +1301,7 @@ static void analyze(G *g) {
     /* values live across a call need callee-saved registers */
     for (int idx = 0; idx < g->ninstr; idx++) {
         const IrInstr *in = g->ins[idx];
-        if (in->op != IR_CALL || g->tail[idx]) continue;
+        if (!((in->op == IR_CALL && !g->tail[idx]) || in->op == IR_NEW || in->op == IR_CALLM)) continue;
         for (int v = 0; v < nv; v++)
             if (g->start[v] <= 2 * idx && g->end[v] >= 2 * idx + 2) g->cross[v] = true;
     }
@@ -1321,7 +1408,7 @@ static void allocate(G *g) {
     bool calls = false;
     for (int idx = 0; idx < g->ninstr; idx++) {
         const IrInstr *in = g->ins[idx];
-        if (in->op == IR_CALL && !g->tail[idx]) calls = true;
+        if ((in->op == IR_CALL && !g->tail[idx]) || in->op == IR_NEW || in->op == IR_CALLM) calls = true;
         if (in->op == IR_CALL && g->m->globals[in->global].kind == IRG_CEXTERN && in->nargs > g->ffi_slots)
             g->ffi_slots = in->nargs;
     }

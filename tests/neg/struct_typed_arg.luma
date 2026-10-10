@@ -1,0 +1,4 @@
+struct P {}
+struct Q {}
+fun f(p: P) {}
+f(Q {});

@@ -11,13 +11,13 @@ IrTy *opt_value_types(const IrModule *m, const IrFunc *f) {
     ir_types_compute(m, f, &t);
     IrTy *vty = xcalloc((size_t)(f->nvregs ? f->nvregs : 1), sizeof *vty);
     for (int b = 0; b < f->nblocks; b++)
-        for (int v = 0; v < f->nvregs; v++) vty[v] |= t.out[(size_t)b * f->nvregs + v];
-    for (int p = 0; p < f->nparams; p++) vty[p] |= ir_param_ty(&m->globals[f->global], p);
+        for (int v = 0; v < f->nvregs; v++) vty[v] = ir_ty_union(vty[v], t.out[(size_t)b * f->nvregs + v]);
+    for (int p = 0; p < f->nparams; p++) vty[p] = ir_ty_union(vty[p], ir_param_ty(&m->globals[f->global], p));
     ir_types_free(&t);
     return vty;
 }
 
-static bool sub(IrTy t, IrTy of) { return (t & ~of) == 0; }
+static bool sub(IrTy t, IrTy of) { return ir_ty_sub(t, of); }
 
 bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty) {
     (void)m;
@@ -33,7 +33,12 @@ bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty) {
         return !(sub(ta, TY_STR) && sub(tb, TY_STR)); /* str + str never fails; ints may overflow */
     case IR_CHECK:
         return !sub(ta, in->ty);
-    default: /* sub, mul, div, mod, neg (overflow / type / zero), load (unassigned), call */
+    case IR_NEW:
+        return false;
+    case IR_GETFIELD:
+    case IR_SETFIELD:
+        return in->sid < 0; /* static accesses are proven; dynamic ones may not find the field */
+    default: /* sub, mul, div, mod, neg (overflow / type / zero), load (unassigned), call, callm */
         return true;
     }
 }
@@ -41,6 +46,8 @@ bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty) {
 bool opt_has_effect(const IrModule *m, const IrInstr *in, const IrTy *vty) {
     switch (in->op) {
     case IR_CALL: case IR_STORE: case IR_JMP: case IR_BR: case IR_RET: return true;
+    /* a new object's identity is observable; fields are mutable memory */
+    case IR_NEW: case IR_GETFIELD: case IR_SETFIELD: case IR_CALLM: return true;
     default: return opt_may_trap(m, in, vty);
     }
 }

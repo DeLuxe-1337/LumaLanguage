@@ -1,0 +1,6 @@
+struct P { x: int }
+fun dyn(v) { return v; }
+var p = dyn(P { x: 1 });
+p.x = 2;
+print(p.x);
+p.x = "no";

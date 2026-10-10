@@ -7,40 +7,87 @@
 
 /* ---- types ---- */
 
-void ir_ty_name(IrTy t, char *buf, size_t n) {
+#define TY_BASE 15u /* int, str, bool, nil */
+
+/* The struct component of a type: -2 none, -1 any struct, k struct k. */
+static int scomp(IrTy t) { return (t & TY_STRUCT) ? (int)(t >> TY_SID_SHIFT) - 1 : -2; }
+static IrTy with_scomp(IrTy base, int c) {
+    base &= TY_BASE;
+    if (c == -2) return base;
+    return base | TY_STRUCT | ((IrTy)(c + 1) << TY_SID_SHIFT);
+}
+
+IrTy ir_ty_union(IrTy a, IrTy b) {
+    int ca = scomp(a), cb = scomp(b);
+    int c = ca == -2 ? cb : cb == -2 ? ca : ca == cb ? ca : -1;
+    return with_scomp(a | b, c);
+}
+
+IrTy ir_ty_inter(IrTy a, IrTy b) {
+    int ca = scomp(a), cb = scomp(b);
+    int c = (ca == -2 || cb == -2) ? -2 : ca == -1 ? cb : cb == -1 ? ca : ca == cb ? ca : -2;
+    return with_scomp(a & b, c);
+}
+
+bool ir_ty_sub(IrTy a, IrTy b) {
+    if (a & TY_BASE & ~b) return false;
+    int ca = scomp(a), cb = scomp(b);
+    if (ca == -2) return true;
+    if (cb == -2) return false;
+    return cb == -1 || ca == cb;
+}
+
+void ir_ty_describe(const IrModule *m, IrTy t, const char *sep, char *buf, size_t n) {
     static const struct { IrTy bit; const char *name; } T[] = {
         {TY_INT, "int"}, {TY_STR, "str"}, {TY_BOOL, "bool"}, {TY_NIL, "nil"}};
-    t &= TY_ANY;
-    if (t == TY_ANY) { snprintf(buf, n, "any"); return; }
-    if (t == 0) { snprintf(buf, n, "never"); return; }
-    IrTy rest = t & ~(IrTy)TY_NIL;
-    if ((t & TY_NIL) && rest && (rest & (rest - 1)) == 0) {
-        for (int i = 0; i < 3; i++)
-            if (T[i].bit == rest) { snprintf(buf, n, "%s?", T[i].name); return; }
+    int c = scomp(t);
+    const char *sname = c == -1 ? "struct"
+                      : (c >= 0 && m && c < m->nstructs) ? m->structs[c].name : c >= 0 ? "?struct" : NULL;
+    if ((t & TY_ANY) == TY_ANY && c == -1) { snprintf(buf, n, "any"); return; }
+    if ((t & TY_ANY) == 0) { snprintf(buf, n, "never"); return; }
+    /* T? : exactly one non-nil member plus nil */
+    IrTy rest = t & (TY_INT | TY_STR | TY_BOOL);
+    int members = (rest ? __builtin_popcount(rest) : 0) + (sname ? 1 : 0);
+    if ((t & TY_NIL) && members == 1) {
+        const char *one = sname;
+        for (int i = 0; i < 3 && !one; i++)
+            if (T[i].bit == rest) one = T[i].name;
+        snprintf(buf, n, "%s?", one);
+        return;
     }
     buf[0] = '\0';
-    for (int i = 0; i < 4; i++) {
-        if (!(t & T[i].bit)) continue;
-        if (buf[0]) strncat(buf, "|", n - strlen(buf) - 1);
-        strncat(buf, T[i].name, n - strlen(buf) - 1);
+    for (int i = 0; i < 5; i++) {
+        const char *name = i < 4 ? ((t & T[i].bit) ? T[i].name : NULL) : sname;
+        if (!name) continue;
+        if (buf[0]) strncat(buf, sep, n - strlen(buf) - 1);
+        strncat(buf, name, n - strlen(buf) - 1);
     }
 }
 
-bool ir_ty_parse(const char *s, IrTy *out) {
+void ir_ty_name(const IrModule *m, IrTy t, char *buf, size_t n) { ir_ty_describe(m, t, "|", buf, n); }
+
+bool ir_ty_parse(const IrModule *m, const char *s, IrTy *out) {
     static const struct { const char *name; IrTy ty; } N[] = {
-        {"int", TY_INT}, {"str", TY_STR}, {"bool", TY_BOOL}, {"nil", TY_NIL}, {"any", TY_ANY}};
+        {"int", TY_INT}, {"str", TY_STR}, {"bool", TY_BOOL}, {"nil", TY_NIL}, {"any", TY_ANY}, {"struct", TY_STRUCT}};
     IrTy t = 0;
     const char *p = s;
     if (!*p) return false;
     for (;;) {
         size_t len = strcspn(p, "|?");
+        IrTy part = 0;
         bool found = false;
-        for (size_t i = 0; i < sizeof N / sizeof *N; i++)
+        for (size_t i = 0; i < sizeof N / sizeof *N && !found; i++)
             if (strlen(N[i].name) == len && strncmp(p, N[i].name, len) == 0) {
-                t |= N[i].ty;
+                part = N[i].ty;
+                found = true;
+            }
+        for (int k = 0; m && k < m->nstructs && !found; k++)
+            if (strlen(m->structs[k].name) == len && strncmp(p, m->structs[k].name, len) == 0) {
+                part = ty_struct_of(k);
                 found = true;
             }
         if (!found) return false;
+        t = t ? ir_ty_union(t, part) : part;
         p += len;
         if (*p == '?') {
             t |= TY_NIL;
@@ -53,6 +100,57 @@ bool ir_ty_parse(const char *s, IrTy *out) {
     }
     *out = t;
     return true;
+}
+
+/* ---- structs ---- */
+
+int ir_add_struct(IrModule *m, const char *name) {
+    m->structs = xrealloc(m->structs, (size_t)(m->nstructs + 1) * sizeof *m->structs);
+    IrStruct *st = &m->structs[m->nstructs];
+    memset(st, 0, sizeof *st);
+    st->name = xstrdup(name);
+    return m->nstructs++;
+}
+
+void ir_struct_set_fields(IrModule *m, int sid, int nfields, const char *const *names, const IrTy *tys) {
+    IrStruct *st = &m->structs[sid];
+    for (int i = 0; i < st->nfields; i++) free(st->fields[i]);
+    free(st->fields);
+    free(st->ftys);
+    st->nfields = nfields;
+    st->fields = xmalloc((size_t)(nfields ? nfields : 1) * sizeof *st->fields);
+    st->ftys = xmalloc((size_t)(nfields ? nfields : 1) * sizeof *st->ftys);
+    for (int i = 0; i < nfields; i++) {
+        st->fields[i] = xstrdup(names[i]);
+        st->ftys[i] = tys ? tys[i] : TY_ANY;
+    }
+}
+
+void ir_struct_add_method(IrModule *m, int sid, const char *name, int global) {
+    IrStruct *st = &m->structs[sid];
+    st->mnames = xrealloc(st->mnames, (size_t)(st->nmethods + 1) * sizeof *st->mnames);
+    st->mglobals = xrealloc(st->mglobals, (size_t)(st->nmethods + 1) * sizeof *st->mglobals);
+    st->mnames[st->nmethods] = xstrdup(name);
+    st->mglobals[st->nmethods] = global;
+    st->nmethods++;
+}
+
+int ir_find_struct(const IrModule *m, const char *name) {
+    for (int i = 0; i < m->nstructs; i++)
+        if (strcmp(m->structs[i].name, name) == 0) return i;
+    return -1;
+}
+
+int ir_struct_field(const IrStruct *st, const char *name) {
+    for (int i = 0; i < st->nfields; i++)
+        if (strcmp(st->fields[i], name) == 0) return i;
+    return -1;
+}
+
+int ir_struct_method(const IrStruct *st, const char *name) {
+    for (int i = 0; i < st->nmethods; i++)
+        if (strcmp(st->mnames[i], name) == 0) return i;
+    return -1;
 }
 
 IrTy ir_param_ty(const IrGlobal *g, int i) { return g->ptys ? g->ptys[i] : TY_ANY; }
@@ -69,6 +167,7 @@ IrTy ir_ctype_ty(CType c) {
 
 IrInstr ir_instr_clone(const IrInstr *in) {
     IrInstr c = *in;
+    c.name = in->name ? xstrdup(in->name) : NULL;
     if (in->nargs > 0) {
         c.args = xmalloc((size_t)in->nargs * sizeof *c.args);
         memcpy(c.args, in->args, (size_t)in->nargs * sizeof *c.args);
@@ -96,6 +195,18 @@ int ir_instr_uses(IrInstr *in, int **ptrs) {
         break;
     case IR_CALL:
     case IR_PHI:
+    case IR_NEW:
+        for (int i = 0; i < in->nargs; i++) ptrs[n++] = &in->args[i];
+        break;
+    case IR_GETFIELD:
+        ptrs[n++] = &in->a;
+        break;
+    case IR_SETFIELD:
+        ptrs[n++] = &in->a;
+        ptrs[n++] = &in->b;
+        break;
+    case IR_CALLM:
+        ptrs[n++] = &in->a;
         for (int i = 0; i < in->nargs; i++) ptrs[n++] = &in->args[i];
         break;
     default: break;
@@ -148,8 +259,10 @@ void ir_func_compact(IrFunc *f) {
 void ir_instr_free(IrInstr *in) {
     free(in->args);
     free(in->phi_blocks);
+    free(in->name);
     in->args = NULL;
     in->phi_blocks = NULL;
+    in->name = NULL;
 }
 
 void ir_module_init(IrModule *m, const char *source) {
@@ -179,6 +292,17 @@ void ir_module_free(IrModule *m) {
         free(g->name);
         free(g->data);
     }
+    for (int i = 0; i < m->nstructs; i++) {
+        IrStruct *st = &m->structs[i];
+        for (int k = 0; k < st->nfields; k++) free(st->fields[k]);
+        for (int k = 0; k < st->nmethods; k++) free(st->mnames[k]);
+        free(st->fields);
+        free(st->ftys);
+        free(st->mnames);
+        free(st->mglobals);
+        free(st->name);
+    }
+    free(m->structs);
     free(m->funcs);
     free(m->globals);
     free(m->source);
@@ -361,6 +485,7 @@ IrInstr *ir_emit(IrFunc *f, int block, IrOp op) {
     in->op = op;
     in->dst = in->a = in->b = IR_NONE;
     in->global = IR_NONE;
+    in->sid = IR_NONE;
     in->target[0] = in->target[1] = IR_NONE;
     return in;
 }
@@ -394,6 +519,10 @@ const char *ir_op_name(IrOp op) {
     case IR_LOAD: return "load";
     case IR_STORE: return "store";
     case IR_CHECK: return "check";
+    case IR_NEW: return "new";
+    case IR_GETFIELD: return "getfield";
+    case IR_SETFIELD: return "setfield";
+    case IR_CALLM: return "callm";
     case IR_PHI: return "phi";
     case IR_NOP: return "nop";
     case IR_JMP: return "jmp";
@@ -440,6 +569,10 @@ static void print_string(Buf *out, const char *s, size_t n) {
 static const char *vname(const IrFunc *f, int v) { return v >= 0 && v < f->nvregs ? f->vregs[v] : "?"; }
 static const char *gname(const IrModule *m, int g) { return g >= 0 && g < m->nglobals ? m->globals[g].name : "?"; }
 static const char *bname(const IrFunc *f, int b) { return b >= 0 && b < f->nblocks ? f->blocks[b].label : "?"; }
+static const char *sname(const IrModule *m, int s) { return s >= 0 && s < m->nstructs ? m->structs[s].name : "?"; }
+static const char *fname(const IrModule *m, int s, int k) {
+    return s >= 0 && s < m->nstructs && k >= 0 && k < m->structs[s].nfields ? m->structs[s].fields[k] : "?";
+}
 
 void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *out) {
     if (in->dst != IR_NONE) buf_printf(out, "%%%s = ", vname(f, in->dst));
@@ -464,11 +597,28 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
     case IR_LOAD: buf_printf(out, "load @%s", gname(m, in->global)); break;
     case IR_STORE: buf_printf(out, "store @%s, %%%s", gname(m, in->global), vname(f, in->a)); break;
     case IR_CHECK: {
-        char tn[64];
-        ir_ty_name(in->ty, tn, sizeof tn);
+        char tn[300];
+        ir_ty_name(m, in->ty, tn, sizeof tn);
         buf_printf(out, "check %%%s, %s, @%s", vname(f, in->a), tn, gname(m, in->global));
         break;
     }
+    case IR_NEW:
+        buf_printf(out, "new %s(", sname(m, in->sid));
+        for (int i = 0; i < in->nargs; i++) buf_printf(out, "%s%%%s", i ? ", " : "", vname(f, in->args[i]));
+        buf_printf(out, ")");
+        break;
+    case IR_GETFIELD:
+    case IR_SETFIELD:
+        buf_printf(out, "%s %%%s, ", ir_op_name(in->op), vname(f, in->a));
+        if (in->sid >= 0) buf_printf(out, "%s.%s", sname(m, in->sid), fname(m, in->sid, in->field));
+        else buf_printf(out, ".%s", in->name ? in->name : "?");
+        if (in->op == IR_SETFIELD) buf_printf(out, ", %%%s", vname(f, in->b));
+        break;
+    case IR_CALLM:
+        buf_printf(out, "callm %%%s, .%s(", vname(f, in->a), in->name ? in->name : "?");
+        for (int i = 0; i < in->nargs; i++) buf_printf(out, "%s%%%s", i ? ", " : "", vname(f, in->args[i]));
+        buf_printf(out, ")");
+        break;
     case IR_NOP: buf_printf(out, "nop"); break;
     case IR_PHI:
         buf_printf(out, "phi");
@@ -485,18 +635,18 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
 
 static void print_func(const IrModule *m, const IrFunc *f, Buf *out) {
     const IrGlobal *g = &m->globals[f->global];
-    char tn[64];
+    char tn[300];
     buf_printf(out, "fn @%s(", g->name);
     for (int i = 0; i < f->nparams; i++) {
         buf_printf(out, "%s%%%s", i ? ", " : "", f->vregs[i]);
         if (ir_param_ty(g, i) != TY_ANY) {
-            ir_ty_name(ir_param_ty(g, i), tn, sizeof tn);
+            ir_ty_name(m, ir_param_ty(g, i), tn, sizeof tn);
             buf_printf(out, ": %s", tn);
         }
     }
     buf_printf(out, ")");
     if (g->ty != TY_ANY) {
-        ir_ty_name(g->ty, tn, sizeof tn);
+        ir_ty_name(m, g->ty, tn, sizeof tn);
         buf_printf(out, ": %s", tn);
     }
     buf_printf(out, " {\n");
@@ -515,7 +665,29 @@ void ir_print_module(const IrModule *m, Buf *out) {
     buf_printf(out, "module ");
     print_string(out, m->source, strlen(m->source));
     buf_byte(out, '\n');
-    /* Canonical order: externs and data (in declaration order), then functions. */
+    /* Canonical order: structs, then externs and data (in declaration order),
+     * then functions. */
+    if (m->nstructs) buf_byte(out, '\n');
+    for (int i = 0; i < m->nstructs; i++) {
+        const IrStruct *st = &m->structs[i];
+        buf_printf(out, "struct %s {", st->name);
+        for (int k = 0; k < st->nfields; k++) {
+            buf_printf(out, "%s%s", k ? ", " : "", st->fields[k]);
+            if (st->ftys[k] != TY_ANY) {
+                char tn[300];
+                ir_ty_name(m, st->ftys[k], tn, sizeof tn);
+                buf_printf(out, ": %s", tn);
+            }
+        }
+        buf_printf(out, "}");
+        if (st->nmethods) {
+            buf_printf(out, " methods {");
+            for (int k = 0; k < st->nmethods; k++)
+                buf_printf(out, "%s%s = @%s", k ? ", " : "", st->mnames[k], gname(m, st->mglobals[k]));
+            buf_printf(out, "}");
+        }
+        buf_byte(out, '\n');
+    }
     bool first = true;
     for (int i = 0; i < m->nglobals; i++) {
         const IrGlobal *g = &m->globals[i];
@@ -527,8 +699,8 @@ void ir_print_module(const IrModule *m, Buf *out) {
         } else if (g->kind == IRG_VAR) {
             buf_printf(out, "global @%s", g->name);
             if (g->ty != TY_ANY) {
-                char tn[64];
-                ir_ty_name(g->ty, tn, sizeof tn);
+                char tn[300];
+                ir_ty_name(m, g->ty, tn, sizeof tn);
                 buf_printf(out, ": %s", tn);
             }
             buf_byte(out, '\n');

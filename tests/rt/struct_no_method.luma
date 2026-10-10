@@ -1,0 +1,5 @@
+struct P {}
+fun dyn(v) { return v; }
+var p = dyn(P {});
+print("before");
+p.m();

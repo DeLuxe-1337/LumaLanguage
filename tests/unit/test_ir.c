@@ -78,7 +78,30 @@ static const char *LOOP =
     "  ret %d\n"
     "}\n";
 
+static const char *STRUCTS =
+    "module \"s.luma\"\n"
+    "\n"
+    "struct Node {value: int, next: Node?} methods {sum = @m.Node.sum}\n"
+    "struct Box {item}\n"
+    "\n"
+    "data @s0 = str \"ctx\"\n"
+    "\n"
+    "fn @m.Node.sum(%self: Node): int {\n"
+    "entry:\n"
+    "  %0 = getfield %self, Node.value\n"
+    "  %1 = getfield %self, .next\n"
+    "  %2 = new Box(%1)\n"
+    "  setfield %2, Box.item, %0\n"
+    "  setfield %2, .item, %0\n"
+    "  %3 = callm %2, .size(%0, %1)\n"
+    "  callm %2, .size()\n"
+    "  %4 = check %3, int|nil|Node, @s0\n"
+    "  %5 = check %4, struct, @s0\n"
+    "  ret %0\n"
+    "}\n";
+
 static void test_roundtrip(void) {
+    expect_roundtrip(STRUCTS);
     expect_roundtrip(LOOP);
     expect_roundtrip("module \"\"\n");
     expect_roundtrip("module \"t\"\n\nglobal @g: int\nglobal @h: str|bool\ndata @c = str \"x\"\n\n"
@@ -235,6 +258,15 @@ static void test_verifier(void) {
     expect_verify_fails("module \"m\"\nextern c fn @f(a: i32): void\nfn @g() {\ne:\n  %0 = call @f()\n  ret %0\n}\n");
     /* cannot call data */
     expect_verify_fails("module \"m\"\ndata @s = str \"x\"\nfn @f() {\ne:\n  %0 = call @s()\n  ret %0\n}\n");
+    /* structs (v0.5) */
+    expect_verify_fails("module \"m\"\nstruct P {x: int, y} methods {m = @pm}\nfn @pm(%self: P) {\ne:\n  ret %self\n}\n" "fn @f() {\ne:\n  %0 = const 1\n  %1 = new P(%0)\n  ret %1\n}\n"); /* too few fields */
+    expect_verify_fails("module \"m\"\nstruct P {x: int, y} methods {m = @pm}\nfn @pm(%self: P) {\ne:\n  ret %self\n}\n" "fn @f(%a) {\ne:\n  %0 = getfield %a, P.x\n  ret %0\n}\n"); /* static access needs a P */
+    expect_verify_fails("module \"m\"\nstruct P {x: int, y} methods {m = @pm}\nfn @pm(%self: P) {\ne:\n  ret %self\n}\n" "fn @f(%a: P) {\ne:\n  %0 = const nil\n  setfield %a, P.x, %0\n  ret %0\n}\n"); /* x: int */
+    expect_verify_fails("module \"m\"\nstruct P {x: int, y} methods {m = @pm}\nfn @pm(%self: P) {\ne:\n  ret %self\n}\n" "fn @f() {\ne:\n  %0 = const 1\n  %1 = const nil\n  %2 = new P(%1, %0)\n  ret %2\n}\n"); /* x: int */
+    expect_verify_fails("module \"m\"\nstruct P {} methods {m = @pm}\nfn @pm(%self: P, %a: int) {\ne:\n  ret %a\n}\n"); /* callm args are unchecked */
+    expect_verify_fails("module \"m\"\nstruct P {} methods {m = @pm}\nstruct Q {}\nfn @pm(%self: Q) {\ne:\n  ret %self\n}\n"); /* self must accept P */
+    expect_verify_fails("module \"m\"\nstruct P {} methods {m = @pm}\nfn @pm() {\ne:\n  %0 = const 1\n  ret %0\n}\n"); /* no self */
+    expect_verify_fails("module \"m\"\nstruct P {x: int, y} methods {m = @pm}\nfn @pm(%self: P) {\ne:\n  ret %self\n}\n" "fn @f(%a) {\ne:\n  %0 = check %a, P, @f\n  ret %0\n}\n"); /* context must be data */
 
     /* accepted: defined on both paths; loop-carried after definition; params */
     IrModule m;

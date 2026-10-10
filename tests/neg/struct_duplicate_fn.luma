@@ -1,0 +1,3 @@
+struct P {}
+impl P { fun f(self) {} }
+impl P { fun f(self) {} }

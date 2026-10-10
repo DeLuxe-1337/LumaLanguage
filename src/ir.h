@@ -23,14 +23,34 @@
 
 /* A static type: the set of runtime types a value may have. The bit values
  * match the runtime's luma_check_type masks. 0 means "no value" (the code
- * that would produce it always fails, or is unreachable). */
+ * that would produce it always fails, or is unreachable).
+ *
+ * Bits 0-4 are int, str, bool, nil and "struct instance". When the struct bit
+ * is set, bits 8 and up say WHICH struct: 0 = any struct, k = exactly struct
+ * k-1 of the module (IrModule.structs). So `Point` is TY_STRUCT | (sid+1) << 8
+ * and `any` is all five bits with no struct id. A set of two different
+ * structs is approximated by "any struct". Use the helpers below to combine
+ * types; plain & and | are only safe on the low bits. */
 typedef unsigned IrTy;
-enum { TY_INT = 1, TY_STR = 2, TY_BOOL = 4, TY_NIL = 8, TY_ANY = 15 };
+enum { TY_INT = 1, TY_STR = 2, TY_BOOL = 4, TY_NIL = 8, TY_STRUCT = 16, TY_ANY = 31 };
+#define TY_SID_SHIFT 8
 
-/* "int", "str?", "any", "int|str|bool" (and "never" for 0). */
-void ir_ty_name(IrTy t, char *buf, size_t n);
-/* Parses the forms ir_ty_name prints (except "never"). */
-bool ir_ty_parse(const char *s, IrTy *out);
+static inline IrTy ty_struct_of(int sid) { return TY_STRUCT | ((IrTy)(sid + 1) << TY_SID_SHIFT); }
+/* The struct a type names exactly, or -1 (no struct, or any struct). */
+static inline int ty_sid(IrTy t) { return (t & TY_STRUCT) ? (int)(t >> TY_SID_SHIFT) - 1 : -1; }
+IrTy ir_ty_union(IrTy a, IrTy b);
+IrTy ir_ty_inter(IrTy a, IrTy b);
+bool ir_ty_sub(IrTy a, IrTy b); /* a is a subset of b */
+
+struct IrModule;
+/* "int", "str?", "any", "int|str|bool", "Point", "Point?", "struct" (any
+ * struct) and "never" for 0. With sep = " or " (and m) it gives the wording
+ * of compile-time and runtime messages. */
+void ir_ty_name(const struct IrModule *m, IrTy t, char *buf, size_t n);
+void ir_ty_describe(const struct IrModule *m, IrTy t, const char *sep, char *buf, size_t n);
+/* Parses the forms ir_ty_name prints (except "never"); struct names are
+ * looked up in m. */
+bool ir_ty_parse(const struct IrModule *m, const char *s, IrTy *out);
 
 typedef enum {
     /* value-producing */
@@ -47,6 +67,11 @@ typedef enum {
     IR_LOAD,        /* dst = value of global variable (runtime error if never assigned) */
     IR_STORE,       /* global variable = a   (no dst) */
     IR_CHECK,       /* dst = a if a's runtime type is in `ty`; else runtime error naming `global` (data) */
+    IR_NEW,         /* dst = new instance of struct `sid` with fields args[0..nfields-1] (v0.5) */
+    IR_GETFIELD,    /* dst = a.field: static (sid >= 0: a is known to be that struct, `field` its index)
+                       or dynamic (sid < 0: looked up by `name` at run time) (v0.5) */
+    IR_SETFIELD,    /* a.field = b   (no dst; static or dynamic as for getfield) (v0.5) */
+    IR_CALLM,       /* [dst =] method `name` of a's struct, called with (a, args...) (v0.5) */
     IR_PHI,         /* dst = args[k] when entered from block phi_blocks[k] (SSA form; optimizer-internal) */
     IR_NOP,         /* deleted instruction (optimizer-internal; removed before output) */
     /* terminators */
@@ -67,6 +92,9 @@ typedef struct {
     int nargs;
     int *phi_blocks;/* IR_PHI: predecessor block of each argument (owned) */
     IrTy ty;        /* IR_CHECK: the allowed types */
+    int sid;        /* IR_NEW / static IR_GETFIELD / IR_SETFIELD: struct index; IR_NONE otherwise */
+    int field;      /* static IR_GETFIELD / IR_SETFIELD: field index */
+    char *name;     /* dynamic IR_GETFIELD / IR_SETFIELD, IR_CALLM: field or method name (owned) */
     int target[2];  /* IR_JMP / IR_BR: block indices */
     int line;       /* source line for diagnostics (0 if unknown) */
 } IrInstr;
@@ -117,12 +145,28 @@ typedef struct {
     int line;
 } IrFunc;
 
+/* A struct type (v0.5). Instances are heap objects: a header word (type id 2
+ * and the struct's index + 1 in bits 8-31), a pointer to the struct's
+ * descriptor, then one word per field in declaration order. */
 typedef struct {
+    char *name;
+    int nfields;
+    char **fields;    /* field names (owned) */
+    IrTy *ftys;       /* declared field types (owned) */
+    int nmethods;     /* methods callable on an instance whose type is not known statically */
+    char **mnames;    /* method names (owned) */
+    int *mglobals;    /* the IR function implementing each (params: self, then the arguments) */
+    int line;
+} IrStruct;
+
+typedef struct IrModule {
     char *source;     /* "module" string */
     IrGlobal *globals;
     int nglobals;
     IrFunc *funcs;
     int nfuncs;
+    IrStruct *structs; /* v0.5 */
+    int nstructs;
 } IrModule;
 
 /* ---- construction ---- */
@@ -138,6 +182,14 @@ int ir_add_cextern(IrModule *m, const char *name, int arity, const CType *params
  * first '.', so lowering's "var.count" is reported as "count". */
 const char *ir_var_display_name(const char *name);
 int ir_add_func(IrModule *m, const char *name, int nparams);  /* returns func index */
+/* A struct with no fields yet (fields are set with ir_struct_set_fields, so
+ * field types may name structs declared later). Returns its index (sid). */
+int ir_add_struct(IrModule *m, const char *name);
+void ir_struct_set_fields(IrModule *m, int sid, int nfields, const char *const *names, const IrTy *tys);
+void ir_struct_add_method(IrModule *m, int sid, const char *name, int global);
+int ir_find_struct(const IrModule *m, const char *name);
+int ir_struct_field(const IrStruct *s, const char *name);   /* index or -1 */
+int ir_struct_method(const IrStruct *s, const char *name);  /* index into mnames or -1 */
 int ir_func_vreg(IrFunc *f, const char *name);                /* find or create by name */
 int ir_func_new_vreg(IrFunc *f, const char *name);            /* create; caller guarantees uniqueness */
 /* Renumbers vregs into text order (params, then first appearance with the

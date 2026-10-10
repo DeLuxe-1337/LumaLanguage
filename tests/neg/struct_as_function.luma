@@ -1,0 +1,2 @@
+struct P { x }
+var p = P(1);

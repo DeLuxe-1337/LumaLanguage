@@ -1,0 +1,4 @@
+struct P {}
+impl P { fun f(self) {} }
+var p: P = P {};
+p.g();

@@ -1,0 +1,4 @@
+fun dyn(v) { return v; }
+var n = dyn(5);
+print("before");
+n.go();

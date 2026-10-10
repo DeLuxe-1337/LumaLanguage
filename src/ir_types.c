@@ -43,10 +43,16 @@ IrTy ir_types_result(const IrModule *m, const IrInstr *in, const IrTy *st) {
         return TY_ANY;
     }
     case IR_LOAD: return m->globals[in->global].ty;
-    case IR_CHECK: return a & in->ty;
+    case IR_CHECK: return ir_ty_inter(a, in->ty);
+    case IR_NEW: return ty_struct_of(in->sid);
+    case IR_GETFIELD:
+        if (in->sid >= 0 && in->sid < m->nstructs && in->field >= 0 && in->field < m->structs[in->sid].nfields)
+            return m->structs[in->sid].ftys[in->field];
+        return TY_ANY;
+    case IR_CALLM: return TY_ANY;
     case IR_PHI: {
         IrTy t = 0;
-        for (int i = 0; i < in->nargs; i++) t |= ty_of(st, in->args[i]);
+        for (int i = 0; i < in->nargs; i++) t = ir_ty_union(t, ty_of(st, in->args[i]));
         return t;
     }
     default: return 0;
@@ -70,7 +76,7 @@ void ir_types_refine(const IrInstr *in, IrTy *state) {
         if (in->a >= 0 && in->a != in->dst && (state[in->a] & TY_INT)) state[in->a] = TY_INT;
         break;
     case IR_CHECK:
-        if (in->a >= 0 && in->a != in->dst && (state[in->a] & in->ty)) state[in->a] &= in->ty;
+        if (in->a >= 0 && in->a != in->dst && ir_ty_inter(state[in->a], in->ty)) state[in->a] = ir_ty_inter(state[in->a], in->ty);
         break;
     default: break;
     }
@@ -112,7 +118,7 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
             const IrInstr *in = &blk->instrs[k];
             IrTy ty = 0;
             for (int i = 0; i < in->nargs; i++)
-                if (in->args[i] >= 0) ty |= t->out[(size_t)in->phi_blocks[i] * nv + in->args[i]];
+                if (in->args[i] >= 0) ty = ir_ty_union(ty, t->out[(size_t)in->phi_blocks[i] * nv + in->args[i]]);
             st[in->dst] = ty;
         }
         for (int k = 0; k < blk->n; k++)
@@ -133,7 +139,7 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
             IrTy *sin = &t->in[(size_t)succ * nv];
             bool grew = !seen[succ];
             for (int v = 0; v < nv; v++) {
-                IrTy u = sin[v] | st[v];
+                IrTy u = ir_ty_union(sin[v], st[v]);
                 if (u != sin[v]) {
                     sin[v] = u;
                     grew = true;

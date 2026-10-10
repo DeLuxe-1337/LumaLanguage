@@ -10,7 +10,7 @@
 #include "util.h"
 #include "value.h"
 
-static bool subty(IrTy t, IrTy of) { return (t & ~of) == 0; }
+static bool subty(IrTy t, IrTy of) { return ir_ty_sub(t, of); }
 
 /* ======================================================================== */
 /* SCCP: sparse conditional constant propagation (Wegman & Zadeck)          */
@@ -89,7 +89,7 @@ static bool const_equal(const IrModule *m, Lat a, Lat b) {
  * returns 1 (truthy), 0 (falsy) or -1 (unknown / not yet known). */
 static int known_truth(Lat c, IrTy t) {
     if (c.st == L_CONST) return const_truthy(c);
-    if (t && subty(t, TY_INT | TY_STR)) return 1;
+    if (t && subty(t, TY_INT | TY_STR | TY_STRUCT)) return 1; /* every struct instance is truthy */
     if (t && subty(t, TY_NIL)) return 0;
     return -1;
 }
@@ -104,7 +104,7 @@ static Lat sccp_eval(const IrModule *m, const IrInstr *in, const Lat *L, const I
     case IR_CONST_DATA: return lconst(IR_CONST_DATA, in->global);
     case IR_MOV: return a;
     case IR_CHECK:
-        if (a.st == L_CONST) return (const_ty(a) & in->ty) ? a : BOT;
+        if (a.st == L_CONST) return ir_ty_inter(const_ty(a), in->ty) ? a : BOT;
         return a.st == L_TOP ? TOP : BOT;
     case IR_NOT: {
         int t = known_truth(a, vty[in->a]);
@@ -125,7 +125,7 @@ static Lat sccp_eval(const IrModule *m, const IrInstr *in, const Lat *L, const I
     case IR_NE: {
         if (a.st == L_CONST && b.st == L_CONST) return lbool(const_equal(m, a, b) == (in->op == IR_EQ));
         IrTy ta = vty[in->a], tb = vty[in->b];
-        if (ta && tb && !(ta & tb)) return lbool(in->op == IR_NE); /* different types are never equal */
+        if (ta && tb && !ir_ty_inter(ta, tb)) return lbool(in->op == IR_NE); /* different types are never equal */
         if (a.st == L_TOP || b.st == L_TOP) return TOP;
         return BOT;
     }
@@ -438,7 +438,8 @@ bool opt_gvn(IrModule *m, IrFunc *f) {
                 known[in->global] = in->a;
                 continue;
             case IR_CALL:
-                if (m->globals[in->global].kind == IRG_FUNC) /* Luma functions may store to globals */
+            case IR_CALLM:
+                if (in->op == IR_CALLM || m->globals[in->global].kind == IRG_FUNC) /* Luma functions may store to globals */
                     for (int g = 0; g < m->nglobals; g++) known[g] = -1;
                 continue;
             default:
@@ -708,7 +709,7 @@ bool opt_licm(IrModule *m, IrFunc *f) {
             for (int k = 0; k < f->blocks[b].n; k++) {
                 const IrInstr *in = &f->blocks[b].instrs[k];
                 if (in->op == IR_STORE) stored[in->global] = true;
-                if (in->op == IR_CALL && m->globals[in->global].kind == IRG_FUNC) calls = true;
+                if ((in->op == IR_CALL && m->globals[in->global].kind == IRG_FUNC) || in->op == IR_CALLM) calls = true;
             }
         }
         int *ptrs_buf[16];
@@ -723,7 +724,9 @@ bool opt_licm(IrModule *m, IrFunc *f) {
                 IrInstr *in = &f->blocks[b].instrs[k];
                 if (in->op == IR_PHI || in->op == IR_NOP || ir_op_is_terminator(in->op)) continue;
                 bool effect = opt_has_effect(m, in, vty);
-                bool can = in->op != IR_CALL && in->op != IR_STORE && in->dst >= 0;
+                /* objects: a new one per iteration, and fields that the loop may change */
+                bool can = in->op != IR_CALL && in->op != IR_STORE && in->op != IR_NEW && in->op != IR_GETFIELD &&
+                           in->op != IR_SETFIELD && in->op != IR_CALLM && in->dst >= 0;
                 if (can) {
                     if (in->nargs + 2 > 16) {
                         heap = xrealloc(heap, (size_t)(in->nargs + 2) * sizeof *heap);

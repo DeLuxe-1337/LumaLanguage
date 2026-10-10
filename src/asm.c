@@ -28,6 +28,7 @@ typedef enum {
                  in the same section (even if global, as GNU as does); else
                  R_X86_64_PLT32 */
     FX_REL8,  /* 1-byte short-jump field; never a relocation */
+    FX_ABS64, /* 8-byte .quad SYMBOL: always R_X86_64_64 (an absolute address) */
 } FixKind;
 
 typedef struct {
@@ -440,12 +441,12 @@ static bool fits_i32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
  * bytes that follow the field in the same instruction, so that the result
  * is relative to the address of the next instruction, as the CPU computes. */
 static void add_fixup(Asm *a, const char *sym, int64_t addend, FixKind kind, size_t jump) {
-    int size = kind == FX_REL8 ? 1 : 4;
+    int size = kind == FX_REL8 ? 1 : kind == FX_ABS64 ? 8 : 4;
     Fixup f;
     f.section = a->cur;
     f.offset = code(a)->len;
     f.symbol = obj_intern_symbol(a->o, sym);
-    f.addend = addend - size;
+    f.addend = kind == FX_ABS64 ? addend : addend - size; /* absolute: no PC bias */
     f.kind = kind;
     f.jump = jump;
     f.line = a->line;
@@ -853,6 +854,11 @@ static void assemble_insn(Asm *a, const char *mn, Operand *ops, int n) {
     }
     if (strcmp(mn, "call") == 0) {
         if (!want(a, mn, n, 1)) return;
+        if (ops[0].kind == OP_REG && ops[0].size == 64) { /* FF /2 CALL r64 (indirect) */
+            uint8_t opc = 0xFF;
+            encode(a, 0, 2, false, &opc, 1, &ops[0], 0);
+            return;
+        }
         if (ops[0].kind != OP_SYM) { bad_operands(a, mn); return; }
         /* E8 cd CALL rel32. Always recorded as PLT32 so the linker may route
          * calls to shared-library functions through the PLT. */
@@ -997,6 +1003,24 @@ static void directive(Asm *a, char *name, char *args) {
         if (n <= 0) { asm_error(a, "'%s' expects 1 to 16 values per line", name); return; }
         for (int i = 0; i < n; i++) {
             int64_t v;
+            if (quad && !parse_int(ops[i], &v)) { /* .quad SYMBOL [+|- N]: an absolute address */
+                char sym[256];
+                int64_t add = 0;
+                size_t len = strcspn(ops[i], "+- \t");
+                if (len == 0 || len >= sizeof sym) { asm_error(a, "invalid quad value '%s'", ops[i]); return; }
+                memcpy(sym, ops[i], len);
+                sym[len] = '\0';
+                char *rest = trim(ops[i] + len);
+                if (*rest) {
+                    char sign = *rest;
+                    char *num = trim(rest + 1);
+                    if ((sign != '+' && sign != '-') || !parse_int(num, &add)) { asm_error(a, "invalid quad value '%s'", ops[i]); return; }
+                    if (sign == '-') add = -add;
+                }
+                if (!valid_symbol(sym)) { asm_error(a, "invalid quad value '%s'", ops[i]); return; }
+                add_fixup(a, sym, add, FX_ABS64, 0);
+                continue;
+            }
             if (!parse_int(ops[i], &v) || (!quad && (v < -128 || v > 255))) {
                 asm_error(a, "invalid %s value '%s'", quad ? "quad" : "byte", ops[i]);
                 return;
@@ -1122,6 +1146,18 @@ static void resolve_fixups(Asm *a) {
         a->line = f->line;
         if (s->section == OBJ_UNDEF && s->local_label) {
             asm_error(a, "undefined local label '%s'", s->name);
+            continue;
+        }
+        if (f->kind == FX_ABS64) { /* never resolved here: the address is only known at link time */
+            if (s->section == OBJ_UNDEF) {
+                s->global = true;
+                obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, OBJ_R_X86_64_64, f->symbol, -1, f->addend});
+            } else if (!s->global) {
+                obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, OBJ_R_X86_64_64, -1, s->section,
+                                               f->addend + (int64_t)s->value});
+            } else {
+                obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, OBJ_R_X86_64_64, f->symbol, -1, f->addend});
+            }
             continue;
         }
         bool local_same = s->section != OBJ_UNDEF && !s->global && s->section == f->section;

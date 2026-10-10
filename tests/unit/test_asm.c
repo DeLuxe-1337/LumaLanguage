@@ -66,6 +66,8 @@ static void test_encodings(void) {
     EXPECT("lea rdi, [rip + 16]", 0x48, 0x8d, 0x3d, 0x10, 0x00, 0x00, 0x00);
     EXPECT("lea r9, [rip - 4]", 0x4c, 0x8d, 0x0d, 0xfc, 0xff, 0xff, 0xff);
     EXPECT("RET", 0xc3); /* mnemonics are case-insensitive */
+    EXPECT("call r11", 0x41, 0xff, 0xd3);
+    EXPECT("call rax", 0xff, 0xd0);
 
     /* milestone 2: rbp-relative memory */
     EXPECT("mov rax, [rbp - 8]", 0x48, 0x8b, 0x45, 0xf8);
@@ -268,6 +270,27 @@ static void test_relocations(void) {
     CHECK_EQ_INT(t[20] | t[21] << 8 | t[22] << 16 | t[23] << 24, 6);
     int helper = obj_find_symbol(&o, "helper");
     CHECK(helper >= 0 && !o.symbols[helper].global && o.symbols[helper].value == 30);
+    obj_free(&o);
+
+    /* .quad SYMBOL: absolute addresses, always relocated (R_X86_64_64, no PC bias) */
+    CHECK(assemble_str(".section .rodata\n.Ls: .byte 1, 2\n.Lt: .byte 3\n.text\n.globl g\ng: ret\nl: ret\n"
+                       ".data\n.quad .Lt, g, l, ext + 8, 7\n", &o));
+    {
+        int data = obj_find_section(&o, ".data"), ro = obj_find_section(&o, ".rodata"), tx = obj_find_section(&o, ".text");
+        CHECK(data >= 0 && o.sections[data].data.len == 40);
+        CHECK_EQ_INT(o.nrelocs, 4);
+        for (int i = 0; i < 4 && i < o.nrelocs; i++) {
+            CHECK_EQ_INT(o.relocs[i].type, OBJ_R_X86_64_64);
+            CHECK_EQ_INT(o.relocs[i].offset, 8 * i);
+        }
+        if (o.nrelocs == 4) {
+            CHECK(o.relocs[0].symbol < 0 && o.relocs[0].target_section == ro && o.relocs[0].addend == 2);
+            CHECK(strcmp(o.symbols[o.relocs[1].symbol].name, "g") == 0 && o.relocs[1].addend == 0);
+            CHECK(o.relocs[2].symbol < 0 && o.relocs[2].target_section == tx && o.relocs[2].addend == 1);
+            CHECK(strcmp(o.symbols[o.relocs[3].symbol].name, "ext") == 0 && o.relocs[3].addend == 8);
+        }
+        CHECK_EQ_INT(o.sections[data].data.data[32], 7);
+    }
     obj_free(&o);
 
     /* backward local call: field = target - next_insn */

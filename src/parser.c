@@ -104,7 +104,7 @@ static void stmt_push(Stmt *block, Stmt *s) {
 
 static const char *unsupported_keyword(TokenKind k) {
     switch (k) {
-    case TOK_CLASS: return "'class' is not supported yet";
+    case TOK_CLASS: return "'class' is not supported (use 'struct' and 'impl')";
     case TOK_THIS: return "'this' is not supported yet";
     case TOK_SUPER: return "'super' is not supported yet";
     default: return NULL;
@@ -114,6 +114,9 @@ static const char *unsupported_keyword(TokenKind k) {
 /* ---- expressions ---- */
 
 static Expr *expression(Parser *p);
+static bool parse_args(Parser *p, Expr *c);
+static bool at_struct_literal(Parser *p);
+static Expr *struct_literal(Parser *p);
 
 static Expr *primary(Parser *p) {
     Token *t = cur(p);
@@ -134,7 +137,19 @@ static Expr *primary(Parser *p) {
         e->str_len = t->value_len;
         return e;
     case TOK_IDENTIFIER:
+        if (at_struct_literal(p)) return struct_literal(p);
         advance(p);
+        if (match(p, TOK_COLON_COLON)) { /* Type::function(args) */
+            Token *fname = cur(p);
+            if (!consume(p, TOK_IDENTIFIER, "a function name after '::'")) return NULL;
+            e = new_expr(EXPR_ASSOC, t);
+            e->name = xstrndup(t->lexeme, t->lexeme_len);
+            e->str = xstrndup(fname->lexeme, fname->lexeme_len);
+            e->str_len = fname->lexeme_len;
+            if (!consume(p, TOK_LEFT_PAREN, "'(' to call the associated function")) { expr_free(e); return NULL; }
+            if (!parse_args(p, e)) { expr_free(e); return NULL; }
+            return e;
+        }
         e = new_expr(EXPR_VAR, t);
         e->name = xstrndup(t->lexeme, t->lexeme_len);
         return e;
@@ -160,9 +175,36 @@ static Expr *primary(Parser *p) {
     }
 }
 
+static void push_arg(Expr *c, Expr *arg, size_t *cap) {
+    if (c->nargs == *cap) {
+        *cap = *cap ? *cap * 2 : 4;
+        c->args = xrealloc(c->args, *cap * sizeof *c->args);
+    }
+    c->args[c->nargs++] = arg;
+}
+
+/* Parses "arguments? )" (the '(' is already consumed) into c->args. */
+static bool parse_args(Parser *p, Expr *c) {
+    size_t cap = 0;
+    if (!check(p, TOK_RIGHT_PAREN)) {
+        do {
+            if (c->nargs == MAX_ARGS) {
+                error_at(p, cur(p), "too many arguments (maximum is 255)");
+                return false;
+            }
+            Expr *arg = expression(p);
+            if (!arg) return false;
+            push_arg(c, arg, &cap);
+        } while (match(p, TOK_COMMA));
+    }
+    return consume(p, TOK_RIGHT_PAREN, "')' after arguments");
+}
+
 static Expr *finish_call(Parser *p, Expr *callee, const Token *open) {
     if (callee->kind != EXPR_VAR) {
-        error_at(p, open, "only named functions can be called (functions are not first-class values yet)");
+        error_at(p, open, callee->kind == EXPR_GET || callee->kind == EXPR_METHOD || callee->kind == EXPR_ASSOC
+                              ? "calling the result of a call or a field is not supported yet (functions are not first-class values)"
+                              : "only named functions can be called (functions are not first-class values yet)");
         expr_free(callee);
         return NULL;
     }
@@ -172,41 +214,112 @@ static Expr *finish_call(Parser *p, Expr *callee, const Token *open) {
     c->name = callee->name;
     callee->name = NULL;
     expr_free(callee);
-    size_t cap = 0;
-    if (!check(p, TOK_RIGHT_PAREN)) {
-        do {
-            if (c->nargs == MAX_ARGS) {
-                error_at(p, cur(p), "too many arguments (maximum is 255)");
-                expr_free(c);
-                return NULL;
-            }
-            Expr *arg = expression(p);
-            if (!arg) { expr_free(c); return NULL; }
-            if (c->nargs == cap) {
-                cap = cap ? cap * 2 : 4;
-                c->args = xrealloc(c->args, cap * sizeof *c->args);
-            }
-            c->args[c->nargs++] = arg;
-        } while (match(p, TOK_COMMA));
-    }
-    if (!consume(p, TOK_RIGHT_PAREN, "')' after arguments")) {
+    if (!parse_args(p, c)) {
         expr_free(c);
         return NULL;
     }
     return c;
 }
 
+/* Is the token at offset k from the current one of this kind? */
+static bool peek_is(Parser *p, size_t k, TokenKind kind) {
+    return p->pos + k < p->toks->len && p->toks->items[p->pos + k].kind == kind;
+}
+
+/* NAME "{" starts a struct literal when followed by "}" or by a field
+ * initializer (IDENTIFIER then ":", "," or "}"). */
+static bool at_struct_literal(Parser *p) {
+    if (!check(p, TOK_IDENTIFIER) || !peek_is(p, 1, TOK_LEFT_BRACE)) return false;
+    if (peek_is(p, 2, TOK_RIGHT_BRACE)) return true;
+    return peek_is(p, 2, TOK_IDENTIFIER) &&
+           (peek_is(p, 3, TOK_COLON) || peek_is(p, 3, TOK_COMMA) || peek_is(p, 3, TOK_RIGHT_BRACE));
+}
+
+/* NAME { field: value, short, ... } */
+static Expr *struct_literal(Parser *p) {
+    Token *name = advance(p);
+    advance(p); /* '{' */
+    Expr *e = new_expr(EXPR_STRUCT, name);
+    e->name = xstrndup(name->lexeme, name->lexeme_len);
+    size_t cap = 0, fcap = 0;
+    while (!check(p, TOK_RIGHT_BRACE)) {
+        if (e->nargs == MAX_ARGS) {
+            error_at(p, cur(p), "too many fields (maximum is 255)");
+            expr_free(e);
+            return NULL;
+        }
+        Token *f = cur(p);
+        if (!consume(p, TOK_IDENTIFIER, "a field name in the struct literal")) { expr_free(e); return NULL; }
+        Expr *value;
+        if (match(p, TOK_COLON)) {
+            value = expression(p);
+            if (!value) { expr_free(e); return NULL; }
+        } else { /* shorthand: `x` means `x: x` */
+            value = new_expr(EXPR_VAR, f);
+            value->name = xstrndup(f->lexeme, f->lexeme_len);
+        }
+        if (e->nargs == fcap) {
+            fcap = fcap ? fcap * 2 : 4;
+            e->fields = xrealloc(e->fields, fcap * sizeof *e->fields);
+            e->field_line = xrealloc(e->field_line, fcap * sizeof *e->field_line);
+            e->field_col = xrealloc(e->field_col, fcap * sizeof *e->field_col);
+        }
+        e->fields[e->nargs] = xstrndup(f->lexeme, f->lexeme_len);
+        e->field_line[e->nargs] = f->line;
+        e->field_col[e->nargs] = f->col;
+        push_arg(e, value, &cap);
+        if (!match(p, TOK_COMMA)) break;
+    }
+    if (!consume(p, TOK_RIGHT_BRACE, "'}' after the struct literal's fields")) {
+        expr_free(e);
+        return NULL;
+    }
+    return e;
+}
+
 static Expr *call(Parser *p) {
     Expr *e = primary(p);
-    while (e && check(p, TOK_LEFT_PAREN)) {
+    int added = 0; /* each link of a chain a.b.c deepens the tree */
+    while (e && (check(p, TOK_LEFT_PAREN) || check(p, TOK_DOT))) {
+        added++;
+        if (!enter(p)) {
+            expr_free(e);
+            e = NULL;
+            break;
+        }
+        if (check(p, TOK_DOT)) {
+            advance(p);
+            Token *name = cur(p);
+            if (!consume(p, TOK_IDENTIFIER, "a field or method name after '.'")) {
+                expr_free(e);
+                e = NULL;
+                break;
+            }
+            bool is_call = check(p, TOK_LEFT_PAREN);
+            Expr *g = new_expr(is_call ? EXPR_METHOD : EXPR_GET, name);
+            g->left = e;
+            g->name = xstrndup(name->lexeme, name->lexeme_len);
+            e = g;
+            if (is_call) {
+                advance(p);
+                if (!parse_args(p, e)) {
+                    expr_free(e);
+                    e = NULL;
+                    break;
+                }
+            }
+            continue;
+        }
         Token *open = advance(p);
         if (e->kind == EXPR_CALL) {
             error_at(p, open, "calling the result of a call is not supported yet (functions are not first-class values)");
             expr_free(e);
-            return NULL;
+            e = NULL;
+            break;
         }
         e = finish_call(p, e, open);
     }
+    p->depth -= added;
     return e;
 }
 
@@ -291,7 +404,22 @@ static Expr *assignment(Parser *p) {
                       p->toks->items[p->pos + 1].kind == TOK_EQUAL;
     Expr *e = logic_or(p);
     if (e && check(p, TOK_EQUAL)) {
+        /* obj.field = value: the tokens right before '=' are "." IDENTIFIER */
+        bool field_target = e->kind == EXPR_GET && p->pos >= 2 && p->toks->items[p->pos - 1].kind == TOK_IDENTIFIER &&
+                            p->toks->items[p->pos - 2].kind == TOK_DOT;
         Token *eq = advance(p);
+        if (field_target) {
+            Expr *value = assignment(p);
+            if (!value) {
+                expr_free(e);
+                p->depth--;
+                return NULL;
+            }
+            e->kind = EXPR_SET;
+            e->right = value;
+            p->depth--;
+            return e;
+        }
         if (!bare_ident || e->kind != EXPR_VAR) {
             error_at(p, eq, "invalid assignment target");
             expr_free(e);
@@ -436,11 +564,18 @@ static Stmt *return_statement(Parser *p, const Token *kw) {
     return s;
 }
 
+static Stmt *function_rest(Parser *p, const Token *kw);
+
 static Stmt *fun_declaration(Parser *p, const Token *kw) {
     if (p->block_depth > 0 || p->in_function) {
         error_at(p, kw, "functions can only be declared at top level for now (closures are not supported yet)");
         return NULL;
     }
+    return function_rest(p, kw);
+}
+
+/* NAME "(" params ")" ( ":" type )? block */
+static Stmt *function_rest(Parser *p, const Token *kw) {
     Token *name = cur(p);
     if (!consume(p, TOK_IDENTIFIER, "function name after 'fun'")) return NULL;
     Stmt *s = new_stmt(STMT_FUN, kw);
@@ -586,7 +721,81 @@ static Stmt *extern_declaration(Parser *p, const Token *kw) {
     return s;
 }
 
+/* struct NAME { field (: type)?, ... } */
+static Stmt *struct_declaration(Parser *p, const Token *kw) {
+    if (p->block_depth > 0 || p->in_function) {
+        error_at(p, kw, "structs can only be declared at top level");
+        return NULL;
+    }
+    Token *name = cur(p);
+    if (!consume(p, TOK_IDENTIFIER, "struct name after 'struct'")) return NULL;
+    Stmt *s = new_stmt(STMT_STRUCT, kw);
+    s->name = xstrndup(name->lexeme, name->lexeme_len);
+    s->line = name->line;
+    s->col = name->col;
+    if (!consume(p, TOK_LEFT_BRACE, "'{' after the struct name")) { stmt_free(s); return NULL; }
+    size_t cap = 0;
+    while (!check(p, TOK_RIGHT_BRACE)) {
+        if (s->nparams == MAX_ARGS) {
+            error_at(p, cur(p), "too many fields (maximum is 255)");
+            stmt_free(s);
+            return NULL;
+        }
+        Token *f = cur(p);
+        if (!consume(p, TOK_IDENTIFIER, "a field name")) { stmt_free(s); return NULL; }
+        if (s->nparams == cap) {
+            cap = cap ? cap * 2 : 4;
+            s->params = xrealloc(s->params, cap * sizeof *s->params);
+            s->param_line = xrealloc(s->param_line, cap * sizeof *s->param_line);
+            s->param_col = xrealloc(s->param_col, cap * sizeof *s->param_col);
+            s->param_types = xrealloc(s->param_types, cap * sizeof *s->param_types);
+        }
+        size_t i = s->nparams++;
+        s->params[i] = xstrndup(f->lexeme, f->lexeme_len);
+        s->param_line[i] = f->line;
+        s->param_col[i] = f->col;
+        memset(&s->param_types[i], 0, sizeof s->param_types[i]);
+        if (match(p, TOK_COLON) && !parse_type(p, &s->param_types[i])) { stmt_free(s); return NULL; }
+        if (!match(p, TOK_COMMA)) break;
+    }
+    if (!consume(p, TOK_RIGHT_BRACE, "'}' after the struct's fields")) { stmt_free(s); return NULL; }
+    match(p, TOK_SEMICOLON); /* `struct P { ... };` is tolerated */
+    return s;
+}
+
+/* impl NAME { fun ... * } */
+static Stmt *impl_declaration(Parser *p, const Token *kw) {
+    if (p->block_depth > 0 || p->in_function) {
+        error_at(p, kw, "impl blocks can only appear at top level");
+        return NULL;
+    }
+    Token *name = cur(p);
+    if (!consume(p, TOK_IDENTIFIER, "struct name after 'impl'")) return NULL;
+    Stmt *s = new_stmt(STMT_IMPL, kw);
+    s->name = xstrndup(name->lexeme, name->lexeme_len);
+    s->line = name->line;
+    s->col = name->col;
+    if (!consume(p, TOK_LEFT_BRACE, "'{' after the impl's struct name")) { stmt_free(s); return NULL; }
+    while (!check(p, TOK_RIGHT_BRACE) && !check(p, TOK_EOF)) {
+        Token *fk = cur(p);
+        if (!consume(p, TOK_FUN, "'fun' (an impl block holds only functions)")) { stmt_free(s); return NULL; }
+        Stmt *f = function_rest(p, fk);
+        if (!f) { stmt_free(s); return NULL; }
+        stmt_push(s, f);
+    }
+    if (!consume(p, TOK_RIGHT_BRACE, "'}' after the impl block")) { stmt_free(s); return NULL; }
+    return s;
+}
+
 static Stmt *declaration(Parser *p) {
+    if (check(p, TOK_STRUCT)) {
+        Token *kw = advance(p);
+        return struct_declaration(p, kw);
+    }
+    if (check(p, TOK_IMPL)) {
+        Token *kw = advance(p);
+        return impl_declaration(p, kw);
+    }
     if (check(p, TOK_EXTERN)) {
         Token *kw = advance(p);
         return extern_declaration(p, kw);
@@ -632,8 +841,14 @@ void expr_free(Expr *e) {
     if (!e) return;
     expr_free(e->left);
     expr_free(e->right);
-    for (size_t i = 0; i < e->nargs; i++) expr_free(e->args[i]);
+    for (size_t i = 0; i < e->nargs; i++) {
+        expr_free(e->args[i]);
+        if (e->fields) free(e->fields[i]);
+    }
     free(e->args);
+    free(e->fields);
+    free(e->field_line);
+    free(e->field_col);
     free(e->str);
     free(e->name);
     free(e);
@@ -718,10 +933,31 @@ static void dump_expr(const Expr *e) {
         putchar(')');
         break;
     case EXPR_CALL:
-        printf("(call %s", e->name);
+    case EXPR_METHOD:
+    case EXPR_ASSOC:
+        if (e->kind == EXPR_CALL) printf("(call %s", e->name);
+        else if (e->kind == EXPR_ASSOC) printf("(call %s::%s", e->name, e->str);
+        else { printf("(callm "); dump_expr(e->left); printf(" %s", e->name); }
         for (size_t i = 0; i < e->nargs; i++) {
             putchar(' ');
             dump_expr(e->args[i]);
+        }
+        putchar(')');
+        break;
+    case EXPR_GET: printf("(get "); dump_expr(e->left); printf(" %s)", e->name); break;
+    case EXPR_SET:
+        printf("(set ");
+        dump_expr(e->left);
+        printf(" %s ", e->name);
+        dump_expr(e->right);
+        putchar(')');
+        break;
+    case EXPR_STRUCT:
+        printf("(new %s", e->name);
+        for (size_t i = 0; i < e->nargs; i++) {
+            printf(" (%s ", e->fields[i]);
+            dump_expr(e->args[i]);
+            putchar(')');
         }
         putchar(')');
         break;
@@ -784,6 +1020,16 @@ static void dump_stmt(const Stmt *s, int indent) {
         dump_params(s);
         dump_type(&s->type);
         printf(")\n");
+        break;
+    case STMT_STRUCT:
+        printf("(struct %s ", s->name);
+        dump_params(s);
+        printf(")\n");
+        break;
+    case STMT_IMPL:
+        printf("(impl %s\n", s->name);
+        for (size_t i = 0; i < s->n; i++) dump_stmt(s->stmts[i], indent + 1);
+        printf("%*s)\n", indent * 2, "");
         break;
     case STMT_RETURN:
         printf("(return");
