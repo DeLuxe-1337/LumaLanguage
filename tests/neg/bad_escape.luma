@@ -1,1 +1,1 @@
-print "bad \q escape";
+print("bad \q escape");

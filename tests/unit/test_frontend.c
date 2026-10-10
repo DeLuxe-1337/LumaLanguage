@@ -13,15 +13,17 @@ static bool lex_str(const char *src, TokenList *t) { return lex("t.luma", src, s
 
 static void test_lex_hello(void) {
     TokenList t;
-    CHECK(lex_str("print \"Hello, world!\";\n", &t));
-    CHECK_EQ_INT(t.len, 4);
-    CHECK_EQ_INT(t.items[0].kind, TOK_PRINT);
-    CHECK_EQ_INT(t.items[1].kind, TOK_STRING);
-    CHECK(strcmp(t.items[1].value, "Hello, world!") == 0);
-    CHECK_EQ_INT(t.items[1].col, 7);
-    CHECK_EQ_INT(t.items[2].kind, TOK_SEMICOLON);
-    CHECK_EQ_INT(t.items[3].kind, TOK_EOF);
-    CHECK_EQ_INT(t.items[3].line, 2);
+    CHECK(lex_str("print(\"Hello, world!\");\n", &t));
+    CHECK_EQ_INT(t.len, 6);
+    CHECK_EQ_INT(t.items[0].kind, TOK_IDENTIFIER); /* print is a builtin function, not a keyword */
+    CHECK_EQ_INT(t.items[1].kind, TOK_LEFT_PAREN);
+    CHECK_EQ_INT(t.items[2].kind, TOK_STRING);
+    CHECK(strcmp(t.items[2].value, "Hello, world!") == 0);
+    CHECK_EQ_INT(t.items[2].col, 7);
+    CHECK_EQ_INT(t.items[3].kind, TOK_RIGHT_PAREN);
+    CHECK_EQ_INT(t.items[4].kind, TOK_SEMICOLON);
+    CHECK_EQ_INT(t.items[5].kind, TOK_EOF);
+    CHECK_EQ_INT(t.items[5].line, 2);
     token_list_free(&t);
 }
 
@@ -35,7 +37,7 @@ static void test_lex_tokens(void) {
         TOK_PLUS, TOK_SEMICOLON, TOK_SLASH, TOK_STAR, TOK_BANG, TOK_BANG_EQUAL, TOK_EQUAL, TOK_EQUAL_EQUAL,
         TOK_GREATER, TOK_GREATER_EQUAL, TOK_LESS, TOK_LESS_EQUAL, TOK_IDENTIFIER, TOK_IDENTIFIER,
         TOK_IDENTIFIER, TOK_AND, TOK_CLASS, TOK_ELSE, TOK_FALSE, TOK_FOR, TOK_FUN, TOK_IF, TOK_NIL, TOK_OR,
-        TOK_PRINT, TOK_RETURN, TOK_SUPER, TOK_THIS, TOK_TRUE, TOK_VAR, TOK_WHILE, TOK_NUMBER, TOK_NUMBER,
+        TOK_IDENTIFIER, TOK_RETURN, TOK_SUPER, TOK_THIS, TOK_TRUE, TOK_VAR, TOK_WHILE, TOK_NUMBER, TOK_NUMBER,
         TOK_EOF,
     };
     CHECK_EQ_INT(t.len, sizeof want / sizeof *want);
@@ -57,9 +59,9 @@ static void test_lex_tokens(void) {
 
 static void test_lex_escapes(void) {
     TokenList t;
-    CHECK(lex_str("print \"a\\\"b\\\\c\\nd\\te\";", &t));
-    CHECK_EQ_INT(t.items[1].value_len, 9);
-    CHECK(memcmp(t.items[1].value, "a\"b\\c\nd\te", 9) == 0);
+    CHECK(lex_str("\"a\\\"b\\\\c\\nd\\te\";", &t));
+    CHECK_EQ_INT(t.items[0].value_len, 9);
+    CHECK(memcmp(t.items[0].value, "a\"b\\c\nd\te", 9) == 0);
     token_list_free(&t);
 }
 
@@ -88,7 +90,7 @@ static bool parse_str(const char *src, Program *p) {
 
 static void test_parse(void) {
     Program p;
-    CHECK(parse_str("print 1 + 2 * 3 - -4;", &p));
+    CHECK(parse_str("1 + 2 * 3 - -4;", &p));
     CHECK_EQ_INT(p.len, 1);
     Expr *e = p.stmts[0]->expr; /* (- (+ 1 (* 2 3)) (- 4)) */
     CHECK(e->kind == EXPR_BINARY && e->op == TOK_MINUS);
@@ -102,12 +104,12 @@ static void test_parse(void) {
     CHECK(e->kind == EXPR_ASSIGN && strcmp(e->name, "a") == 0 && e->right->kind == EXPR_ASSIGN);
     program_free(&p);
 
-    CHECK(parse_str("print a or b and c;", &p)); /* and binds tighter */
+    CHECK(parse_str("a or b and c;", &p)); /* and binds tighter */
     e = p.stmts[0]->expr;
     CHECK(e->kind == EXPR_LOGICAL && e->op == TOK_OR && e->right->op == TOK_AND);
     program_free(&p);
 
-    CHECK(parse_str("for (var i = 0; i < 3; i = i + 1) print i;", &p)); /* desugared */
+    CHECK(parse_str("for (var i = 0; i < 3; i = i + 1) print(i);", &p)); /* desugared */
     Stmt *s = p.stmts[0];
     CHECK(s->kind == STMT_BLOCK && s->n == 2 && s->stmts[0]->kind == STMT_VAR && s->stmts[1]->kind == STMT_WHILE);
     CHECK(s->stmts[1]->body->kind == STMT_BLOCK && s->stmts[1]->body->n == 2);
@@ -117,7 +119,7 @@ static void test_parse(void) {
     CHECK(p.stmts[0]->stmts[0]->kind == STMT_WHILE && p.stmts[0]->stmts[0]->expr->kind == EXPR_TRUE);
     program_free(&p);
 
-    CHECK(parse_str("if (a) if (b) print 1; else print 2;", &p)); /* dangling else binds inner */
+    CHECK(parse_str("if (a) if (b) print(1); else print(2);", &p)); /* dangling else binds inner */
     CHECK(p.stmts[0]->else_branch == NULL && p.stmts[0]->then_branch->else_branch != NULL);
     program_free(&p);
 
@@ -129,10 +131,43 @@ static void test_parse(void) {
     CHECK_EQ_INT(p.len, 3);
     program_free(&p);
 
+    CHECK(parse_str("print(1, \"a\", f(2, g()));", &p)); /* calls, nested */
+    e = p.stmts[0]->expr;
+    CHECK(e->kind == EXPR_CALL && strcmp(e->name, "print") == 0 && e->nargs == 3);
+    CHECK(e->args[2]->kind == EXPR_CALL && e->args[2]->nargs == 2 && e->args[2]->args[1]->nargs == 0);
+    program_free(&p);
+
+    CHECK(parse_str("fun add(a, b) { var c = a + b; return c; } fun none() { return; }", &p));
+    s = p.stmts[0];
+    CHECK(s->kind == STMT_FUN && strcmp(s->name, "add") == 0 && s->nparams == 2 && s->n == 2);
+    CHECK(strcmp(s->params[1], "b") == 0 && s->stmts[1]->kind == STMT_RETURN && s->stmts[1]->expr);
+    CHECK(p.stmts[1]->stmts[0]->kind == STMT_RETURN && p.stmts[1]->stmts[0]->expr == NULL);
+    program_free(&p);
+
+    CHECK(parse_str("print;", &p)); /* parses; rejected by lowering (print must be called) */
+    program_free(&p);
+    CHECK(parse_str("(f)(1);", &p)); /* a parenthesised name is still that name */
+    CHECK(p.stmts[0]->expr->kind == EXPR_CALL && strcmp(p.stmts[0]->expr->name, "f") == 0);
+    program_free(&p);
+
     fprintf(stderr, "[expected diagnostics follow]\n");
-    CHECK(!parse_str("print \"a\"", &p));     /* missing ; */
-    CHECK(!parse_str("print ;", &p));         /* missing expression */
+    CHECK(!parse_str("print(\"a\")", &p));   /* missing ; */
+    CHECK(!parse_str("print(;", &p));         /* missing expression */
     CHECK(!parse_str("print", &p));
+    CHECK(!parse_str("print \"old\";", &p));  /* old statement syntax */
+    CHECK(!parse_str("print 1;", &p));
+    CHECK(!parse_str("f(1,);", &p));
+    CHECK(!parse_str("f(1;", &p));
+    CHECK(!parse_str("f()();", &p));         /* not first-class yet */
+    CHECK(!parse_str("\"s\"();", &p));
+    CHECK(!parse_str("fun f(a,) {}", &p));
+    CHECK(!parse_str("fun (a) {}", &p));
+    CHECK(!parse_str("fun f(1) {}", &p));
+    CHECK(!parse_str("fun f() print(1);", &p));
+    CHECK(!parse_str("{ fun f() {} }", &p));  /* only at top level */
+    CHECK(!parse_str("fun f() { fun g() {} }", &p));
+    CHECK(!parse_str("{ return; }", &p));     /* return outside a function */
+    CHECK(!parse_str("fun f() { return 1 }", &p));
     CHECK(!parse_str("var = 1;", &p));
     CHECK(!parse_str("var x = ;", &p));
     CHECK(!parse_str("1 = 2;", &p));          /* invalid assignment target */
@@ -142,17 +177,16 @@ static void test_parse(void) {
     CHECK(!parse_str("while (true print 1;", &p));
     CHECK(!parse_str("{ print 1;", &p));      /* unterminated block */
     CHECK(!parse_str("}", &p));
-    CHECK(!parse_str("fun f() {}", &p));      /* not supported yet */
     CHECK(!parse_str("return 1;", &p));
     CHECK(!parse_str("class A {}", &p));
-    CHECK(!parse_str("print this;", &p));
-    CHECK(!parse_str("print a.b;", &p));
-    CHECK(!parse_str("for (var i = 0; i < 1) print i;", &p));
+    CHECK(!parse_str("this;", &p));
+    CHECK(!parse_str("a.b;", &p));
+    CHECK(!parse_str("for (var i = 0; i < 1) print(i);", &p));
 
     /* nesting is bounded rather than overflowing the stack */
     size_t n = 5000;
     char *deep = malloc(n * 2 + 32);
-    strcpy(deep, "print ");
+    strcpy(deep, "var x = ");
     for (size_t i = 0; i < n; i++) strcat(deep, "(");
     strcat(deep, "1");
     for (size_t i = 0; i < n; i++) strcat(deep, ")");
@@ -160,7 +194,7 @@ static void test_parse(void) {
     CHECK(!parse_str(deep, &p));
     free(deep);
     char *chain = malloc(n * 2 + 32);
-    strcpy(chain, "print 1");
+    strcpy(chain, "var x = 1");
     for (size_t i = 0; i < n; i++) strcat(chain, "+1");
     strcat(chain, ";");
     CHECK(!parse_str(chain, &p));
@@ -195,26 +229,60 @@ static void expect_ir_contains(const char *src, const char *needle) {
 }
 
 static void test_lower(void) {
-    expect_ir_contains("print \"hi\";", "data @s0 = str \"hi\"");
-    expect_ir_contains("print \"hi\";", "%0 = const @s0\n  call @luma_print(%0)");
-    expect_ir_contains("var x = 1; x = x + 1;", "%x = add %x, %");           /* hint: no extra mov */
-    expect_ir_contains("var x = 1; var x = x + 1; print x;", "%x.1 = add %x, %"); /* top-level redeclare */
-    expect_ir_contains("var x = 1; { var x = 2; print x; } print x;", "call @luma_print(%x.1)");
-    expect_ir_contains("var x = 1; x = x + (x = 5);", "= mov %x\n");         /* left snapshot */
-    expect_ir_contains("print 1 or 2;", "br %0, or.end.0, or.rhs.0");
-    expect_ir_contains("print 1 and 2;", "br %0, and.rhs.0, and.end.0");
-    expect_ir_contains("while (true) print 1;", "jmp while.cond.0");
-    expect_ir_contains("if (1) print 1; else print 2;", "br %0, if.then.0, if.else.0");
-    expect_ir_contains("print \"a\"; print \"a\";", "%1 = const @s0");         /* deduplicated data */
-    expect_ir_contains("print -1;", "%1 = neg %0");
-    expect_ir_contains("print !nil;", "%1 = not %0");
+    expect_ir_contains("print(\"hi\");", "data @s0 = str \"hi\"");
+    expect_ir_contains("print(\"hi\");", "%0 = const @s0\n  call @luma_write(%0)\n  call @luma_write_newline()\n");
+    expect_ir_contains("print(1, 2);", "call @luma_write(%0)\n  call @luma_write_space()\n  call @luma_write(%1)\n");
+    expect_ir_contains("print();", "entry:\n  call @luma_write_newline()\n");
+    expect_ir_contains("var v = print();", "%0 = const nil\n  store @var.v, %0"); /* print returns nil */
+    expect_ir_contains("{ var x = 1; x = x + 1; }", "%x = add %x, %");          /* hint: no extra mov */
+    expect_ir_contains("{ var x = 1; { var x = 2; print(x); } print(x); }", "call @luma_write(%x.1)");
+    expect_ir_contains("{ var x = 1; x = x + (x = 5); }", "= mov %x\n");        /* left snapshot */
+    expect_ir_contains("print(1 or 2);", "br %0, or.end.0, or.rhs.0");
+    expect_ir_contains("print(1 and 2);", "br %0, and.rhs.0, and.end.0");
+    expect_ir_contains("while (true) print(1);", "jmp while.cond.0");
+    expect_ir_contains("if (1) print(1); else print(2);", "br %0, if.then.0, if.else.0");
+    expect_ir_contains("print(\"a\"); print(\"a\");", "%1 = const @s0");         /* deduplicated data */
+    expect_ir_contains("print(-1);", "%1 = neg %0");
+    expect_ir_contains("print(!nil);", "%1 = not %0");
     /* blocks come out in source order: then before the outer else/end */
-    expect_ir_contains("if (1) { if (2) print 3; } else print 4;",
+    expect_ir_contains("if (1) { if (2) print(3); } else print(4);",
                        "if.then.0:\n  %1 = const 2\n  br %1, if.then.1, if.end.1\nif.then.1:");
+    /* top-level variables are module globals */
+    expect_ir_contains("var g = 1; print(g);", "global @var.g\n");
+    expect_ir_contains("var g = 1; print(g);", "%0 = const 1\n  store @var.g, %0\n  %1 = load @var.g\n");
+    expect_ir_contains("var g = 1; var g = g + 1;", "load @var.g"); /* redeclaration reuses the slot */
+    /* functions */
+    expect_ir_contains("fun id(a) { return a; }", "fn @fn.id(%a) {\nentry:\n  ret %a\n}");
+    expect_ir_contains("fun f() {}", "fn @fn.f() {\nentry:\n  %0 = const nil\n  ret %0\n}");
+    expect_ir_contains("fun f(a) { return a; } print(f(1));", "%1 = call @fn.f(%0)");
+    expect_ir_contains("fun f() {} f();", "  call @fn.f()\n");                      /* result discarded */
+    expect_ir_contains("print(g()); fun g() { return 7; }", "call @fn.g()");        /* hoisted */
+    expect_ir_contains("var n = 0; fun inc() { n = n + 1; }", "fn @fn.inc() {\nentry:\n  %0 = load @var.n");
+    expect_ir_contains("fun f(a) { var a2 = a; { var a = 1; return a; } }", "%a.1 = const 1");
 
     fprintf(stderr, "[expected diagnostics follow]\n");
     char *ir;
-    CHECK((ir = lower_str("print y;")) == NULL);                          /* undefined */
+    CHECK((ir = lower_str("print(y);")) == NULL);                         /* undefined */
+    CHECK((ir = lower_str("print;")) == NULL);                            /* builtin not called */
+    CHECK((ir = lower_str("fun f(a) {} f();")) == NULL);                  /* arity */
+    CHECK((ir = lower_str("fun f() {} var x = f;")) == NULL);             /* not first-class */
+    CHECK((ir = lower_str("var f = 1; f();")) == NULL);                   /* not a function */
+    CHECK((ir = lower_str("g();")) == NULL);                              /* undefined function */
+    CHECK((ir = lower_str("fun f() {} fun f() {}")) == NULL);
+    CHECK((ir = lower_str("fun print() {}")) == NULL);
+    CHECK((ir = lower_str("var print = 1;")) == NULL);
+    CHECK((ir = lower_str("fun f(a, a) {}")) == NULL);
+    CHECK((ir = lower_str("fun f(a) { var a = 1; }")) == NULL);           /* params share the body scope */
+    CHECK((ir = lower_str("fun f(a, b, c, d, e, g, h) {}")) == NULL);     /* > 6 params */
+    CHECK((ir = lower_str("fun f() {} var f;")) == NULL);
+    CHECK((ir = lower_str("fun f() {} f = 1;")) == NULL);
+    CHECK((ir = lower_str("print(later); var later = 1;")) == NULL);      /* top level: not yet declared */
+    ir = lower_str("fun f() { return later; } var later = 1;");           /* function bodies: fine */
+    CHECK(ir != NULL);
+    free(ir);
+    ir = lower_str("fun f() { return 1; print(2); }");                    /* dead code is pruned */
+    CHECK(ir != NULL && strstr(ir, "dead") == NULL && strstr(ir, "call @luma_write") == NULL);
+    free(ir);
     CHECK((ir = lower_str("{ var a = 1; var a = 2; }")) == NULL);         /* redeclare in block */
     CHECK((ir = lower_str("{ var a = a; }")) == NULL);                    /* own initializer */
     CHECK((ir = lower_str("var a = 1; { var a = a; }")) == NULL);         /* even when shadowing */

@@ -1,0 +1,26 @@
+; module globals: store/load, checked loads, functions sharing state
+module "globals.lir"
+
+extern fn @luma_print(1)
+global @var.count
+
+fn @luma_main() {
+entry:
+  %zero = const 0
+  store @var.count, %zero
+  call @bump()
+  call @bump()
+  %c = load @var.count
+  call @luma_print(%c)
+  %z = const nil
+  ret %z
+}
+
+fn @bump() {
+entry:
+  %c = load @var.count
+  %one = const 1
+  %c = add %c, %one
+  store @var.count, %c
+  ret %c
+}

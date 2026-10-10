@@ -1,13 +1,13 @@
 // operands evaluate left to right, even when the right operand assigns
 var x = 1;
-print x + (x = 10);
-print x;
+print(x + (x = 10));
+print(x);
 var y = 2;
-print (y = 3) + y;
+print((y = 3) + y);
 var z = 5;
 z = z * z;
-print z;
+print(z);
 var p = 1;
 var q = p = 2;
-print p;
-print q;
+print(p);
+print(q);

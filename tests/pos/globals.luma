@@ -1,0 +1,22 @@
+// top-level variables are globals shared with functions
+var counter = 0;
+fun bump() { counter = counter + 1; return counter; }
+bump();
+bump();
+print(counter, bump());
+fun read_later() { return late; }   // refers to a global declared below
+var late = "defined in time";
+print(read_later());
+var shadow = "global";
+fun shadowing(shadow) { return shadow; }   // parameter shadows the global
+print(shadowing("param"), shadow);
+fun local_shadow() { var shadow = "local"; return shadow; }
+print(local_shadow(), shadow);
+var total = 0;
+fun accumulate(n) { for (var i = 1; i <= n; i = i + 1) total = total + i; }
+accumulate(100);
+print(total);
+var redeclared = 1;
+var redeclared = redeclared + 1;    // top-level redeclaration reuses the slot
+fun get_redeclared() { return redeclared; }
+print(get_redeclared());

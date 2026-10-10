@@ -1,0 +1,4 @@
+fun f() { return later; }
+print("calling f");
+print(f());
+var later = 1;

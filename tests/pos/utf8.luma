@@ -1,2 +1,2 @@
-print "héllo ✓";
-print "";
+print("héllo ✓");
+print("");

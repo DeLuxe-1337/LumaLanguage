@@ -49,10 +49,10 @@ rm -f build/hello build/hello.lir build/hello.s build/hello.o
 check "luma compiles examples/hello.luma" "$LUMA" examples/hello.luma -o build/hello
 check "IR file build/hello.lir exists" test -s build/hello.lir
 check "IR generated from source (data + print call)" \
-    sh -c 'grep -q "data @s0 = str \"Hello, world!\"" build/hello.lir && grep -q "call @luma_print(%0)" build/hello.lir'
+    sh -c 'grep -q "data @s0 = str \"Hello, world!\"" build/hello.lir && grep -q "call @luma_write(%0)" build/hello.lir'
 check "assembly file build/hello.s exists" test -s build/hello.s
 check "assembly lowered from IR (string object + runtime call)" \
-    sh -c 'grep -q "\.ascii \"Hello, world!\"" build/hello.s && grep -q "call luma_print@PLT" build/hello.s'
+    sh -c 'grep -q "\.ascii \"Hello, world!\"" build/hello.s && grep -q "call luma_write@PLT" build/hello.s'
 check "object file build/hello.o exists" test -s build/hello.o
 
 ./build/hello >"$OUT/hello.out" 2>"$OUT/hello.err"
@@ -73,10 +73,10 @@ check "machine x86-64"         grep -q 'Machine:.*X86-64' "$OUT/eh.txt"
 check "readelf reports no warnings" sh -c '! readelf -a -W build/hello.o 2>&1 | grep -qi "warning\|error"'
 readelf -r -W build/hello.o >"$OUT/rel.txt"
 check "R_X86_64_PC32 against .rodata - 4"      grep -Eq 'R_X86_64_PC32 +0+ \.rodata - 4' "$OUT/rel.txt"
-check "R_X86_64_PLT32 against luma_print - 4"  grep -Eq 'R_X86_64_PLT32 +0+ luma_print - 4' "$OUT/rel.txt"
+check "R_X86_64_PLT32 against luma_write - 4"  grep -Eq 'R_X86_64_PLT32 +0+ luma_write - 4' "$OUT/rel.txt"
 readelf -s -W build/hello.o >"$OUT/sym.txt"
 check "luma_main is GLOBAL FUNC in .text"  grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ luma_main$' "$OUT/sym.txt"
-check "luma_print is GLOBAL UND"           grep -Eq 'NOTYPE +GLOBAL +DEFAULT +UND luma_print$' "$OUT/sym.txt"
+check "luma_write is GLOBAL UND"           grep -Eq 'NOTYPE +GLOBAL +DEFAULT +UND luma_write$' "$OUT/sym.txt"
 check "FILE symbol names the .luma source" grep -q 'FILE.*examples/hello.luma' "$OUT/sym.txt"
 check "no .comment section (not produced by GNU as)" sh -c '! readelf -S build/hello.o | grep -q "\.comment"'
 check "objdump -d -r accepts hello.o" objdump -d -r build/hello.o
@@ -85,7 +85,7 @@ check "objdump decodes the generated instructions" sh -c '
     for i in "push +rbp" "mov +rbp,rsp" "sub +rsp,0x10" "lea +rax,\[rip\+0x0\]" "mov +QWORD PTR \[rbp-0x8\],rax" \
              "mov +rdi,QWORD PTR \[rbp-0x8\]" "call" "mov +rsp,rbp" "pop +rbp" "ret"; do
         grep -Eq "$i" '"$OUT"'/dis.txt || { echo "missing: $i"; exit 1; }; done'
-check "objdump shows relocations inline" sh -c 'grep -q "R_X86_64_PC32" '"$OUT"'/dis.txt && grep -q "R_X86_64_PLT32.*luma_print" '"$OUT"'/dis.txt'
+check "objdump shows relocations inline" sh -c 'grep -q "R_X86_64_PC32" '"$OUT"'/dis.txt && grep -q "R_X86_64_PLT32.*luma_write" '"$OUT"'/dis.txt'
 check "final executable is native x86-64 ELF" sh -c 'readelf -h build/hello | grep -q "Machine:.*X86-64"'
 
 # The link step: cc receives only an object and an archive, so it must run
@@ -100,10 +100,10 @@ rm -f "$OUT"/s1*
 check "--emit-ir stops after IR" sh -c "$LUMA examples/hello.luma --emit-ir -o $OUT/s1 && test -s $OUT/s1.lir && test ! -e $OUT/s1.s"
 check "-S stops after assembly"  sh -c "$LUMA examples/hello.luma -S -o $OUT/s1 && test -s $OUT/s1.s && test ! -e $OUT/s1.o"
 check "-c stops after object"    sh -c "$LUMA examples/hello.luma -c -o $OUT/s1 && test -s $OUT/s1.o && test ! -e $OUT/s1"
-check "--dump-tokens lists PRINT STRING SEMICOLON EOF" sh -c \
-    "$LUMA examples/hello.luma -S -o $OUT/s2 --dump-tokens | awk '{print \$2}' | tr '\n' ' ' | grep -q 'PRINT STRING SEMICOLON EOF'"
-check "--dump-ast shows the print node" sh -c \
-    "$LUMA examples/hello.luma -S -o $OUT/s2 --dump-ast | grep -q '(print @1:1 \"Hello, world!\")'"
+check "--dump-tokens lists IDENTIFIER LEFT_PAREN STRING RIGHT_PAREN SEMICOLON EOF" sh -c \
+    "$LUMA examples/hello.luma -S -o $OUT/s2 --dump-tokens | awk '{print \$2}' | tr '\n' ' ' | grep -q 'IDENTIFIER LEFT_PAREN STRING RIGHT_PAREN SEMICOLON EOF'"
+check "--dump-ast shows the print call" sh -c \
+    "$LUMA examples/hello.luma -S -o $OUT/s2 --dump-ast | grep -q '(expr (call print \"Hello, world!\"))'"
 check "--dump-ir prints the module" sh -c "$LUMA examples/hello.luma -S -o $OUT/s2 --dump-ir | grep -q '^fn @luma_main() {'"
 check "lasm on build/hello.s gives the same .text as luma" sh -c \
     "$LASM build/hello.s -o $OUT/hello_lasm.o && objcopy -O binary -j .text build/hello.o $OUT/a.bin && objcopy -O binary -j .text $OUT/hello_lasm.o $OUT/b.bin && cmp $OUT/a.bin $OUT/b.bin"

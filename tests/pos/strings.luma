@@ -1,9 +1,9 @@
 // concatenation (runtime allocation) and content equality
 var s = "con" + "cat";
-print s;
-print s == "concat";
+print(s);
+print(s == "concat");
 var acc = "";
 for (var i = 0; i < 3; i = i + 1) acc = acc + "ab";
-print acc;
-print "" + "";
-print "tab:\t|" + "quote:\"|" + "backslash:\\";
+print(acc);
+print("" + "");
+print("tab:\t|" + "quote:\"|" + "backslash:\\");

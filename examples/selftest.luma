@@ -1,116 +1,121 @@
 // selftest.luma - a self-checking Luma program.
 //
-// Every check follows the same shape:
-//
-//     t = t + 1; if (!(CONDITION)) { f = f + 1; print "FAIL: description"; }
-//
-// (Luma has no functions or assert yet, so the pattern is written out.)
-// On success it prints a summary ending in "SELFTEST PASSED" and exits 0.
-// On any failure it prints each failing check, then "SELFTEST FAILED", and
-// deliberately triggers a runtime error so the process exits with status 1.
+// Each check is one call:  check(CONDITION, "description");
+// A check passes only if CONDITION is exactly true. Failing checks print
+// "FAIL: description". The program ends with a summary and
+// "SELFTEST PASSED" (exit 0), or "SELFTEST FAILED" and exit status 1.
 //
 //   ./build/luma examples/selftest.luma -o build/selftest && ./build/selftest
 
-var t = 0;   // checks run
-var f = 0;   // checks failed
+var passed = 0;
+var failed = 0;
+
+fun check(ok, what) {
+  if (ok == true) {
+    passed = passed + 1;
+  } else {
+    failed = failed + 1;
+    print("FAIL:", what);
+  }
+}
 
 // ---------------------------------------------------------------- arithmetic
-t = t + 1; if (!(1 + 2 * 3 == 7))   { f = f + 1; print "FAIL: * binds tighter than +"; }
-t = t + 1; if (!((1 + 2) * 3 == 9)) { f = f + 1; print "FAIL: parentheses group"; }
-t = t + 1; if (!(10 - 4 - 3 == 3))  { f = f + 1; print "FAIL: - is left associative"; }
-t = t + 1; if (!(100 / 10 / 5 == 2)) { f = f + 1; print "FAIL: / is left associative"; }
-t = t + 1; if (!(2 * -3 == -6))     { f = f + 1; print "FAIL: unary minus operand"; }
-t = t + 1; if (!(--5 == 5))         { f = f + 1; print "FAIL: double negation"; }
-t = t + 1; if (!(7 / 2 == 3))       { f = f + 1; print "FAIL: 7 / 2"; }
-t = t + 1; if (!(-7 / 2 == -4))     { f = f + 1; print "FAIL: -7 / 2 floors toward -infinity"; }
-t = t + 1; if (!(7 / -2 == -4))     { f = f + 1; print "FAIL: 7 / -2 floors toward -infinity"; }
-t = t + 1; if (!(-7 / -2 == 3))     { f = f + 1; print "FAIL: -7 / -2"; }
-t = t + 1; if (!(17 - 17 / 5 * 5 == 2))       { f = f + 1; print "FAIL: 17 mod 5 via floor division"; }
-t = t + 1; if (!(-17 - (-17 / 5) * 5 == 3))   { f = f + 1; print "FAIL: -17 mod 5 is 3 (floor)"; }
-t = t + 1; if (!(0 * 12345 == 0))   { f = f + 1; print "FAIL: multiply by zero"; }
-t = t + 1; if (!(2147483647 * 2147483647 == 4611686014132420609)) { f = f + 1; print "FAIL: large product"; }
-t = t + 1; if (!(4611686018427387903 - 1 + 1 == 4611686018427387903)) { f = f + 1; print "FAIL: max fixnum round trip"; }
-t = t + 1; if (!(-4611686018427387903 - 1 < 0)) { f = f + 1; print "FAIL: min fixnum is negative"; }
+check(1 + 2 * 3 == 7, "* binds tighter than +");
+check((1 + 2) * 3 == 9, "parentheses group");
+check(10 - 4 - 3 == 3, "- is left associative");
+check(100 / 10 / 5 == 2, "/ is left associative");
+check(2 * -3 == -6, "unary minus operand");
+check(--5 == 5, "double negation");
+check(7 / 2 == 3, "7 / 2");
+check(-7 / 2 == -4, "-7 / 2 floors toward -infinity");
+check(7 / -2 == -4, "7 / -2 floors toward -infinity");
+check(-7 / -2 == 3, "-7 / -2");
+check(17 - 17 / 5 * 5 == 2, "17 mod 5 via floor division");
+check(-17 - (-17 / 5) * 5 == 3, "-17 mod 5 is 3 (floor)");
+check(0 * 12345 == 0, "multiply by zero");
+check(2147483647 * 2147483647 == 4611686014132420609, "large product");
+check(4611686018427387903 - 1 + 1 == 4611686018427387903, "max fixnum round trip");
+check(-4611686018427387903 - 1 < 0, "min fixnum is negative");
 
 // ---------------------------------------------------------------- comparison
-t = t + 1; if (!(1 < 2))            { f = f + 1; print "FAIL: 1 < 2"; }
-t = t + 1; if (2 < 1)               { f = f + 1; print "FAIL: 2 < 1 is false"; }
-t = t + 1; if (!(2 <= 2))           { f = f + 1; print "FAIL: 2 <= 2"; }
-t = t + 1; if (!(3 > 2))            { f = f + 1; print "FAIL: 3 > 2"; }
-t = t + 1; if (!(3 >= 3))           { f = f + 1; print "FAIL: 3 >= 3"; }
-t = t + 1; if (!(-1 < 0))           { f = f + 1; print "FAIL: -1 < 0"; }
-t = t + 1; if (!(1 + 1 < 3 == true)) { f = f + 1; print "FAIL: comparison binds tighter than =="; }
+check(1 < 2, "1 < 2");
+check(!(2 < 1), "2 < 1 is false");
+check(2 <= 2, "2 <= 2");
+check(3 > 2, "3 > 2");
+check(3 >= 3, "3 >= 3");
+check(-1 < 0, "-1 < 0");
+check(1 + 1 < 3 == true, "comparison binds tighter than ==");
 
 // ---------------------------------------------------------------- equality and types
-t = t + 1; if (!(1 == 1))           { f = f + 1; print "FAIL: 1 == 1"; }
-t = t + 1; if (1 == 2)              { f = f + 1; print "FAIL: 1 == 2 is false"; }
-t = t + 1; if (1 == "1")            { f = f + 1; print "FAIL: number never equals string"; }
-t = t + 1; if (!(nil == nil))       { f = f + 1; print "FAIL: nil == nil"; }
-t = t + 1; if (nil == false)        { f = f + 1; print "FAIL: nil is not false"; }
-t = t + 1; if (true == 1)           { f = f + 1; print "FAIL: true is not 1"; }
-t = t + 1; if (0 == false)          { f = f + 1; print "FAIL: 0 is not false"; }
-t = t + 1; if (!(true != false))    { f = f + 1; print "FAIL: true != false"; }
-t = t + 1; if (!("ab" == "a" + "b")) { f = f + 1; print "FAIL: strings compare by content"; }
-t = t + 1; if (!("" == ""))         { f = f + 1; print "FAIL: empty strings equal"; }
-t = t + 1; if (!("a" != "b"))       { f = f + 1; print "FAIL: different strings"; }
+check(1 == 1, "1 == 1");
+check(!(1 == 2), "1 == 2 is false");
+check(!(1 == "1"), "number never equals string");
+check(nil == nil, "nil == nil");
+check(!(nil == false), "nil is not false");
+check(!(true == 1), "true is not 1");
+check(!(0 == false), "0 is not false");
+check(true != false, "true != false");
+check("ab" == "a" + "b", "strings compare by content");
+check("" == "", "empty strings equal");
+check("a" != "b", "different strings");
 
 // ---------------------------------------------------------------- truthiness
-t = t + 1; if (!(!nil))             { f = f + 1; print "FAIL: nil is falsy"; }
-t = t + 1; if (!(!false))           { f = f + 1; print "FAIL: false is falsy"; }
-t = t + 1; if (!0)                  { f = f + 1; print "FAIL: 0 is truthy"; }
-t = t + 1; if (!"")                 { f = f + 1; print "FAIL: empty string is truthy"; }
-t = t + 1; if (!(!!true == true))   { f = f + 1; print "FAIL: !! produces a boolean"; }
+check(!nil, "nil is falsy");
+check(!false, "false is falsy");
+check(!(!0), "0 is truthy");
+check(!(!""), "empty string is truthy");
+check(!!true == true, "!! produces a boolean");
 var reached = false;
 if (0) reached = true;
-t = t + 1; if (!reached)            { f = f + 1; print "FAIL: if (0) takes the then branch"; }
+check(!(!reached), "if (0) takes the then branch");
 
 // ---------------------------------------------------------------- and / or
-t = t + 1; if (!((nil or "d") == "d"))   { f = f + 1; print "FAIL: or returns right operand when left is falsy"; }
-t = t + 1; if (!(("x" or "y") == "x"))   { f = f + 1; print "FAIL: or returns left operand when truthy"; }
-t = t + 1; if (!((false and 1) == false)) { f = f + 1; print "FAIL: and returns falsy left operand"; }
-t = t + 1; if (!((1 and 2) == 2))        { f = f + 1; print "FAIL: and returns right operand"; }
-t = t + 1; if (!((nil and 1) == nil))    { f = f + 1; print "FAIL: and preserves nil"; }
-t = t + 1; if (!((false or nil or 3) == 3)) { f = f + 1; print "FAIL: or chains"; }
-t = t + 1; if (!((true or false and false) == true)) { f = f + 1; print "FAIL: and binds tighter than or"; }
+check((nil or "d") == "d", "or returns right operand when left is falsy");
+check(("x" or "y") == "x", "or returns left operand when truthy");
+check((false and 1) == false, "and returns falsy left operand");
+check((1 and 2) == 2, "and returns right operand");
+check((nil and 1) == nil, "and preserves nil");
+check((false or nil or 3) == 3, "or chains");
+check((true or false and false) == true, "and binds tighter than or");
 var hits = 0;
 false and (hits = hits + 1);
 true or (hits = hits + 1);
-t = t + 1; if (!(hits == 0))        { f = f + 1; print "FAIL: short-circuit skips the right operand"; }
+check(hits == 0, "short-circuit skips the right operand");
 true and (hits = hits + 1);
 false or (hits = hits + 10);
-t = t + 1; if (!(hits == 11))       { f = f + 1; print "FAIL: right operand runs when needed"; }
+check(hits == 11, "right operand runs when needed");
 
 // ---------------------------------------------------------------- strings
 var s = "";
 for (var i = 0; i < 3; i = i + 1) s = s + "ab";
-t = t + 1; if (!(s == "ababab"))    { f = f + 1; print "FAIL: concatenation in a loop"; }
-t = t + 1; if (!("" + "" == ""))    { f = f + 1; print "FAIL: empty concatenation"; }
-t = t + 1; if (!("a\"b" == "a" + "\"" + "b")) { f = f + 1; print "FAIL: escaped quote"; }
-t = t + 1; if ("\\" == "\\\\")      { f = f + 1; print "FAIL: escaped backslash"; }
-t = t + 1; if ("tab\there" == "tab here") { f = f + 1; print "FAIL: tab escape"; }
-t = t + 1; if (!("line\n" != "line")) { f = f + 1; print "FAIL: newline escape"; }
+check(s == "ababab", "concatenation in a loop");
+check("" + "" == "", "empty concatenation");
+check("a\"b" == "a" + "\"" + "b", "escaped quote");
+check(!("\\" == "\\\\"), "escaped backslash");
+check(!("tab\there" == "tab here"), "tab escape");
+check("line\n" != "line", "newline escape");
 
 // ---------------------------------------------------------------- scoping
 var sc = "global";
 {
   var sc = "block";
-  t = t + 1; if (!(sc == "block"))  { f = f + 1; print "FAIL: block shadows global"; }
+  check(sc == "block", "block shadows global");
   {
     var sc = "inner";
-    t = t + 1; if (!(sc == "inner")) { f = f + 1; print "FAIL: nested shadowing"; }
+    check(sc == "inner", "nested shadowing");
   }
-  t = t + 1; if (!(sc == "block"))  { f = f + 1; print "FAIL: inner scope ends"; }
+  check(sc == "block", "inner scope ends");
 }
-t = t + 1; if (!(sc == "global"))   { f = f + 1; print "FAIL: global restored after block"; }
+check(sc == "global", "global restored after block");
 {
   sc = "changed";
 }
-t = t + 1; if (!(sc == "changed"))  { f = f + 1; print "FAIL: block assigns to outer variable"; }
+check(sc == "changed", "block assigns to outer variable");
 var rd = 1;
 var rd = rd + 1;
-t = t + 1; if (!(rd == 2))          { f = f + 1; print "FAIL: top-level redeclaration sees previous value"; }
+check(rd == 2, "top-level redeclaration sees previous value");
 var u;
-t = t + 1; if (!(u == nil))         { f = f + 1; print "FAIL: uninitialized var is nil"; }
+check(u == nil, "uninitialized var is nil");
 
 // ---------------------------------------------------------------- loops
 var sum = 0;
@@ -119,22 +124,22 @@ while (n <= 100) {
   sum = sum + n;
   n = n + 1;
 }
-t = t + 1; if (!(sum == 5050))      { f = f + 1; print "FAIL: while sums 1..100"; }
+check(sum == 5050, "while sums 1..100");
 var fact = 1;
 for (var k = 1; k <= 10; k = k + 1) fact = fact * k;
-t = t + 1; if (!(fact == 3628800))  { f = f + 1; print "FAIL: for computes 10!"; }
+check(fact == 3628800, "for computes 10!");
 var cells = 0;
 for (var row = 0; row < 5; row = row + 1)
   for (var col = 0; col < 7; col = col + 1)
     cells = cells + 1;
-t = t + 1; if (!(cells == 35))      { f = f + 1; print "FAIL: nested for loops"; }
+check(cells == 35, "nested for loops");
 var c = 0;
 for (; c < 4;) c = c + 1;
-t = t + 1; if (!(c == 4))           { f = f + 1; print "FAIL: for with only a condition"; }
+check(c == 4, "for with only a condition");
 var never = 0;
 while (false) never = never + 1;
 for (var z = 0; z < 0; z = z + 1) never = never + 1;
-t = t + 1; if (!(never == 0))       { f = f + 1; print "FAIL: zero-iteration loops"; }
+check(never == 0, "zero-iteration loops");
 var fa = 0;
 var fb = 1;
 for (var step = 0; step < 89; step = step + 1) {
@@ -142,7 +147,7 @@ for (var step = 0; step < 89; step = step + 1) {
   fa = fb;
   fb = next;
 }
-t = t + 1; if (!(fb == 2880067194370816120)) { f = f + 1; print "FAIL: fib(90) near the fixnum limit"; }
+check(fb == 2880067194370816120, "fib(90) near the fixnum limit");
 var ga = 1071;
 var gb = 462;
 while (gb != 0) {
@@ -150,7 +155,7 @@ while (gb != 0) {
   gb = ga - ga / gb * gb;
   ga = tmp;
 }
-t = t + 1; if (!(ga == 21))         { f = f + 1; print "FAIL: gcd(1071, 462)"; }
+check(ga == 21, "gcd(1071, 462)");
 var primes = 0;
 for (var cand = 2; cand < 100; cand = cand + 1) {
   var isprime = true;
@@ -158,40 +163,75 @@ for (var cand = 2; cand < 100; cand = cand + 1) {
     if (cand - cand / d * d == 0) isprime = false;
   if (isprime) primes = primes + 1;
 }
-t = t + 1; if (!(primes == 25))     { f = f + 1; print "FAIL: 25 primes below 100"; }
+check(primes == 25, "25 primes below 100");
 
 // ---------------------------------------------------------------- evaluation order
 var x = 1;
-t = t + 1; if (!(x + (x = 10) == 11)) { f = f + 1; print "FAIL: left operand evaluated before right"; }
-t = t + 1; if (!(x == 10))          { f = f + 1; print "FAIL: assignment inside expression"; }
+check(x + (x = 10) == 11, "left operand evaluated before right");
+check(x == 10, "assignment inside expression");
 var y = 2;
-t = t + 1; if (!((y = 3) + y == 6)) { f = f + 1; print "FAIL: assignment visible to right operand"; }
+check((y = 3) + y == 6, "assignment visible to right operand");
 var p;
 var q = p = 5;
-t = t + 1; if (!(p == 5 and q == 5)) { f = f + 1; print "FAIL: chained assignment"; }
+check(p == 5 and q == 5, "chained assignment");
 var a1 = 0;
 var a2 = 0;
 var a3 = 0;
 a1 = a2 = a3 = 7;
-t = t + 1; if (!(a1 == 7 and a2 == 7 and a3 == 7)) { f = f + 1; print "FAIL: assignment is right associative"; }
+check(a1 == 7 and a2 == 7 and a3 == 7, "assignment is right associative");
 
 // ---------------------------------------------------------------- control flow
 var de = 0;
 if (true) if (false) de = 1; else de = 2;
-t = t + 1; if (!(de == 2))          { f = f + 1; print "FAIL: else binds to the nearest if"; }
+check(de == 2, "else binds to the nearest if");
 var chain = "";
 if (nil) chain = "a"; else if (false) chain = "b"; else chain = "c";
-t = t + 1; if (!(chain == "c"))     { f = f + 1; print "FAIL: else-if chain"; }
+check(chain == "c", "else-if chain");
+
+// ---------------------------------------------------------------- functions
+fun add(a, b) { return a + b; }
+fun nothing() {}
+fun early(n) { if (n > 0) return "positive"; return "not positive"; }
+fun factorial(n) { if (n <= 1) return 1; return n * factorial(n - 1); }
+fun rfib(n) { if (n < 2) return n; return rfib(n - 1) + rfib(n - 2); }
+fun is_even(n) { if (n == 0) return true; return is_odd(n - 1); }
+fun is_odd(n) { if (n == 0) return false; return is_even(n - 1); }
+fun six(a, b, c, d, e, g) { return a - b + c - d + e - g; }
+fun loop_return(limit) { for (var i = 0; ; i = i + 1) if (i * i > limit) return i; }
+fun hoisted_caller() { return hoisted_callee() + 1; }
+fun hoisted_callee() { return 41; }
+check(add(2, 3) == 5, "call with arguments");
+check(add("a", "b") == "ab", "dynamic typing through parameters");
+check(nothing() == nil, "implicit return value is nil");
+check(early(1) == "positive" and early(0) == "not positive", "early return");
+check(factorial(20) == 2432902008176640000, "recursive factorial");
+check(rfib(20) == 6765, "doubly recursive fibonacci");
+check(is_even(50) and is_odd(51) and !is_odd(50), "mutual recursion");
+check(six(1, 2, 3, 4, 5, 6) == -3, "six parameters arrive in order");
+check(loop_return(1000) == 32, "return from inside a loop");
+check(hoisted_caller() == 42, "functions are hoisted");
+var g_count = 0;
+fun g_bump() { g_count = g_count + 1; return g_count; }
+g_bump();
+g_bump();
+check(g_count == 2 and g_bump() == 3, "functions update globals");
+var g_shadow = "global";
+fun g_param(g_shadow) { return g_shadow; }
+check(g_param("param") == "param" and g_shadow == "global", "parameter shadows a global");
+var trace = "";
+fun mark(s) { trace = trace + s; return s; }
+var joined = mark("a") + mark("b") + mark("c");
+check(trace == "abc" and joined == "abc", "operands and calls evaluate left to right");
+trace = "";
+add(mark("x"), mark("y"));
+check(trace == "xy", "arguments evaluate left to right");
 
 // ---------------------------------------------------------------- summary
-print "selftest checks run:";
-print t;
-print "selftest checks failed:";
-print f;
-if (f == 0) {
-  print "SELFTEST PASSED";
+print("selftest:", passed, "passed,", failed, "failed");
+if (failed == 0) {
+  print("SELFTEST PASSED");
 } else {
-  print "SELFTEST FAILED";
+  print("SELFTEST FAILED");
   // Luma has no exit() yet: a deliberate runtime error makes the process exit with status 1.
   nil - 1;
 }

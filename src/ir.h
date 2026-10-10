@@ -100,7 +100,8 @@ int ir_func_vreg(IrFunc *f, const char *name);                /* find or create 
 int ir_func_new_vreg(IrFunc *f, const char *name);            /* create; caller guarantees uniqueness */
 /* Renumbers vregs into text order (params, then first appearance with the
  * destination before operands), which is the order ir_parse() creates them
- * in. Lowered and re-parsed modules therefore get identical stack slots. */
+ * in. Lowered and re-parsed modules therefore get identical stack slots.
+ * Vregs that no instruction references (other than parameters) are removed. */
 void ir_func_canonicalize(IrFunc *f);
 int ir_func_find_vreg(const IrFunc *f, const char *name);
 int ir_func_block(IrFunc *f, const char *label);              /* append a block */

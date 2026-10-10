@@ -112,11 +112,15 @@ void ir_func_canonicalize(IrFunc *f) {
             for (int j = 0; j < in->nargs; j++) canon_visit(map, &next, in->args[j]);
         }
     }
-    for (int i = 0; i < n; i++)
-        if (map[i] < 0) map[i] = next++; /* unused vregs keep relative order at the end */
+    /* Unreferenced vregs (e.g. left behind by pruned dead code) are dropped:
+     * they would only waste stack slots, and the text form cannot express them. */
     char **names = xmalloc((size_t)n * sizeof *names);
-    for (int i = 0; i < n; i++) names[map[i]] = f->vregs[i];
-    memcpy(f->vregs, names, (size_t)n * sizeof *names);
+    for (int i = 0; i < n; i++) {
+        if (map[i] >= 0) names[map[i]] = f->vregs[i];
+        else free(f->vregs[i]);
+    }
+    memcpy(f->vregs, names, (size_t)next * sizeof *names);
+    f->nvregs = next;
     free(names);
     for (int b = 0; b < f->nblocks; b++) {
         for (int k = 0; k < f->blocks[b].n; k++) {

@@ -67,8 +67,10 @@ def show(v):
 # ---------------------------------------------------------------- AST + render
 # expressions: ('int', n) ('str', s) ('nil',) ('bool', b) ('var', name)
 #              ('assign', name, e) ('un', op, e) ('bin', op, l, r) ('log', op, l, r)
-# statements:  ('print', e) ('expr', e) ('var', name, e) ('block', [stmts])
-#              ('if', c, then, else|None) ('loop', counter, n, [stmts])
+#              ('call', fname, [args])
+# statements:  ('print', [exprs]) ('expr', e) ('var', name, e) ('block', [stmts])
+#              ('if', c, then, else|None) ('loop', counter, n, [stmts]) ('return', e)
+# functions:   ('fun', name, [params], [stmts])   -- rendered first (they are hoisted)
 
 
 def esc(s):
@@ -91,6 +93,8 @@ def render_e(e):
         return "(%s = %s)" % (e[1], render_e(e[2]))
     if k == "un":
         return "(%s%s)" % (e[1], render_e(e[2]))
+    if k == "call":
+        return "%s(%s)" % (e[1], ", ".join(render_e(a) for a in e[2]))
     return "(%s %s %s)" % (render_e(e[2]), e[1], render_e(e[3]))
 
 
@@ -98,7 +102,12 @@ def render_s(s, ind=0):
     p = "  " * ind
     k = s[0]
     if k == "print":
-        return p + "print %s;\n" % render_e(s[1])
+        return p + "print(%s);\n" % ", ".join(render_e(a) for a in s[1])
+    if k == "return":
+        return p + "return %s;\n" % render_e(s[1])
+    if k == "fun":
+        return (p + "fun %s(%s) {\n" % (s[1], ", ".join(s[2])) + "".join(render_s(x, ind + 1) for x in s[3])
+                + p + "}\n")
     if k == "expr":
         return p + "%s;\n" % render_e(s[1])
     if k == "var":
@@ -119,10 +128,17 @@ def render_s(s, ind=0):
 
 
 # ---------------------------------------------------------------- interpreter
+class Return(Exception):
+    def __init__(self, value):
+        self.value = value
+
+
 class Interp:
-    def __init__(self):
+    def __init__(self, funs=()):
         self.out = []
-        self.scopes = [{}]
+        self.scopes = [{}]          # scopes[0] holds the globals
+        self.funs = {f[1]: f for f in funs}
+        self.depth = 0
 
     def lookup(self, name):
         for sc in reversed(self.scopes):
@@ -153,6 +169,23 @@ class Interp:
             if not is_int(v):
                 raise LumaError("Operand must be a number.")
             return check(-v)
+        if k == "call":
+            fn = self.funs[e[1]]
+            args = [self.ev(a) for a in e[2]]      # all arguments, left to right
+            saved = self.scopes
+            self.scopes = [saved[0], dict(zip(fn[2], args))]   # params share the body scope
+            self.depth += 1
+            if self.depth > 200:
+                raise AssertionError("generator bug: runaway recursion")
+            try:
+                self.run(fn[3])
+                result = None                       # implicit return nil
+            except Return as r:
+                result = r.value
+            finally:
+                self.scopes = saved
+                self.depth -= 1
+            return result
         if k == "log":
             left = self.ev(e[2])
             if e[1] == "or":
@@ -190,7 +223,10 @@ class Interp:
     def ex(self, s):
         k = s[0]
         if k == "print":
-            self.out.append(show(self.ev(s[1])))
+            vals = [self.ev(a) for a in s[1]]       # evaluated before anything is written
+            self.out.append(" ".join(show(v) for v in vals))
+        elif k == "return":
+            raise Return(self.ev(s[1]))
         elif k == "expr":
             self.ev(s[1])
         elif k == "var":
@@ -225,7 +261,7 @@ class Interp:
 # deliberately ill typed (or a divisor may be zero) to exercise error paths.
 # Each variable keeps one static type for its lifetime; assignments preserve it.
 TYPES = ("int", "str", "bool", "nil")
-ERR_RATE = 0.01
+ERR_RATE = 0.003  # per expression; programs are large, so most still contain none
 
 
 class Gen:
@@ -233,6 +269,9 @@ class Gen:
         self.r = rng
         self.n = 0
         self.scopes = [{}]   # per scope: name -> static type (assignable variables)
+        self.funs = []       # (name, [param types], return type), in definition order
+        self.callable = 0    # calls may target funs[:callable] (no recursion: always terminates)
+        self.ret_type = None # inside a function body: its return type
 
     def fresh(self, prefix):
         self.n += 1
@@ -269,6 +308,10 @@ class Gen:
         c = r.random()
         if c < 0.08 and names:
             return ("assign", r.choice(names), self.expr(t, depth - 1, exclude))
+        cands = [f for f in self.funs[:self.callable] if f[2] == t]
+        if cands and r.random() < 0.15:
+            name, ptypes, _ = r.choice(cands)
+            return ("call", name, [self.expr(pt, depth - 1, exclude) for pt in ptypes])
         if c < 0.2:   # same-typed short-circuit: result has the operands' type
             return ("log", r.choice(["and", "or"]), self.expr(t, depth - 1, exclude), self.expr(t, depth - 1, exclude))
         if t == "int":
@@ -309,8 +352,10 @@ class Gen:
         r = self.r
         c = r.random()
         vis = self.visible()
+        if self.ret_type and c < 0.05:
+            return ("return", self.expr(self.ret_type, 2))   # early return
         if c < 0.3:
-            return ("print", self.expr(self.any_type(), 3))
+            return ("print", [self.expr(self.any_type(), 3) for _ in range(r.choice((1, 1, 1, 2, 3, 0)))])
         if c < 0.45:
             top = len(self.scopes) == 1
             if top and vis and r.random() < 0.3:
@@ -319,7 +364,7 @@ class Gen:
                 name = r.choice([v for v in vis if v not in self.scopes[-1]] or [self.fresh("v")])  # shadowing
             else:
                 name = self.fresh("v")
-            t = self.any_type()
+            t = vis[name] if (top and name in vis) else self.any_type()   # redeclaration keeps the type
             init = self.expr(t, 3, exclude=() if top else (name,))
             self.scopes[-1][name] = t
             return ("var", name, init)
@@ -328,8 +373,11 @@ class Gen:
             return ("expr", ("assign", name, self.expr(vis[name], 3)))
         if c < 0.67:
             return ("expr", self.expr(self.any_type(), 2))
+        if c < 0.71 and self.funs[:self.callable]:
+            name, ptypes, _ = r.choice(self.funs[:self.callable])   # call as a statement
+            return ("expr", ("call", name, [self.expr(pt, 2) for pt in ptypes]))
         if depth <= 0:
-            return ("print", self.expr(self.any_type(), 2))
+            return ("print", [self.expr(self.any_type(), 2)])
         if c < 0.77:
             return ("block", self.scoped(r.randint(1, 4), depth - 1))
         if c < 0.88:
@@ -340,13 +388,41 @@ class Gen:
         counter = self.fresh("c")   # never added to the assignable names
         return ("loop", counter, r.randint(0, 4), self.scoped(r.randint(1, 3), depth - 1))
 
+    def function(self):
+        """A top-level function. It sees the globals declared so far and may call
+        functions defined before it (so the call graph is acyclic)."""
+        r = self.r
+        name = self.fresh("f")
+        ptypes = [self.any_type() for _ in range(r.randint(0, 3))]
+        params = [self.fresh("p") for _ in ptypes]
+        ret = self.any_type()
+        saved = (self.scopes, self.callable, self.ret_type)
+        self.scopes = [dict(self.scopes[0]), dict(zip(params, ptypes))]
+        self.callable = len(self.funs)
+        self.ret_type = ret
+        body = self.stmts(r.randint(1, 4), 2) + [("return", self.expr(ret, 2))]
+        self.scopes, self.callable, self.ret_type = saved
+        self.funs.append((name, ptypes, ret))
+        return ("fun", name, params, body)
 
-def one(seed, workdir):
+
+def generate(seed):
+    """Returns (functions, main statements). Globals are declared first so the
+    functions (generated next, rendered first because they are hoisted) can use them."""
     rng = random.Random(seed)
     g = Gen(rng)
-    prog = g.stmts(rng.randint(3, 14), 3)
-    src = "".join(render_s(s) for s in prog)
-    it = Interp()
+    globals_ = [g.stmt(0) for _ in range(rng.randint(0, 3))]
+    globals_ = [s for s in globals_ if s[0] == "var"]
+    funs = [g.function() for _ in range(rng.randint(0, 4))]
+    g.callable = len(g.funs)
+    prog = globals_ + g.stmts(rng.randint(3, 14), 3)
+    return funs, prog
+
+
+def one(seed, workdir):
+    funs, prog = generate(seed)
+    src = "".join(render_s(f) for f in funs) + "".join(render_s(s) for s in prog)
+    it = Interp(funs)
     err = None
     try:
         it.run(prog)

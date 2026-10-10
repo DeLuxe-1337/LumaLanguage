@@ -1,0 +1,8 @@
+
+one
+a b c
+1 nil true false s
+x = 42
+print returns:
+nil
+1 2 12
