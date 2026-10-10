@@ -163,8 +163,8 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         store(out, in->dst, "rax");
         break;
     case IR_PHI:
-        buf_printf(out, "    # (phi: never reaches the backend)\n");
-        break;
+    case IR_NOP:
+        break; /* never reach the backend (the verifier rejects them) */
     case IR_STORE:
         load(out, "rax", in->a);
         buf_printf(out, "    mov [rip + .Lvar.%s], rax\n", m->globals[in->global].name);

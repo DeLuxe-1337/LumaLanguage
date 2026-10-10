@@ -48,6 +48,7 @@ typedef enum {
     IR_STORE,       /* global variable = a   (no dst) */
     IR_CHECK,       /* dst = a if a's runtime type is in `ty`; else runtime error naming `global` (data) */
     IR_PHI,         /* dst = args[k] when entered from block phi_blocks[k] (SSA form; optimizer-internal) */
+    IR_NOP,         /* deleted instruction (optimizer-internal; removed before output) */
     /* terminators */
     IR_JMP,         /* target[0] */
     IR_BR,          /* a truthy ? target[0] : target[1] */
@@ -158,6 +159,16 @@ IrTy ir_param_ty(const IrGlobal *g, int i);
 IrTy ir_ctype_ty(CType c);
 /* Frees the owned parts of one instruction (args, phi_blocks). */
 void ir_instr_free(IrInstr *in);
+/* Deep copy of an instruction (args and phi_blocks are duplicated). */
+IrInstr ir_instr_clone(const IrInstr *in);
+/* Pointers to every vreg the instruction reads (so passes can rewrite them).
+ * Returns the count; `ptrs` must have room for in->nargs + 2 entries. */
+int ir_instr_uses(IrInstr *in, int **ptrs);
+/* Deep copy / destruction of a function's body (not its IrGlobal). */
+void ir_func_clone(const IrFunc *src, IrFunc *dst);
+void ir_func_free_body(IrFunc *f);
+/* Removes IR_NOP instructions from every block. */
+void ir_func_compact(IrFunc *f);
 const char *ir_op_name(IrOp op);
 /* Name of the runtime function implementing a generic op ("luma_add", ...). */
 const char *ir_op_runtime(IrOp op);

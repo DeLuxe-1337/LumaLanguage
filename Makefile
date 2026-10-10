@@ -18,6 +18,7 @@ RT_CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 BUILD   ?= build
 
 CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_types.c src/ir_parse.c src/ir_verify.c \
+             src/cfg.c src/opt.c src/opt_util.c src/opt_cfg.c src/opt_ssa.c src/opt_passes.c \
              src/x86_isel.c src/obj.c src/asm.c src/elf_writer.c
 CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
 HEADERS   := $(wildcard src/*.h)

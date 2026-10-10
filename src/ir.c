@@ -67,6 +67,84 @@ IrTy ir_ctype_ty(CType c) {
     }
 }
 
+IrInstr ir_instr_clone(const IrInstr *in) {
+    IrInstr c = *in;
+    if (in->nargs > 0) {
+        c.args = xmalloc((size_t)in->nargs * sizeof *c.args);
+        memcpy(c.args, in->args, (size_t)in->nargs * sizeof *c.args);
+        if (in->phi_blocks) {
+            c.phi_blocks = xmalloc((size_t)in->nargs * sizeof *c.phi_blocks);
+            memcpy(c.phi_blocks, in->phi_blocks, (size_t)in->nargs * sizeof *c.phi_blocks);
+        }
+    } else {
+        c.args = NULL;
+        c.phi_blocks = NULL;
+    }
+    return c;
+}
+
+int ir_instr_uses(IrInstr *in, int **ptrs) {
+    int n = 0;
+    switch (in->op) {
+    case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
+        ptrs[n++] = &in->a;
+        break;
+    case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+    case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE:
+        ptrs[n++] = &in->a;
+        ptrs[n++] = &in->b;
+        break;
+    case IR_CALL:
+    case IR_PHI:
+        for (int i = 0; i < in->nargs; i++) ptrs[n++] = &in->args[i];
+        break;
+    default: break;
+    }
+    return n;
+}
+
+void ir_func_clone(const IrFunc *src, IrFunc *dst) {
+    *dst = *src;
+    dst->vregs = xmalloc((size_t)(src->cap_vregs ? src->cap_vregs : 1) * sizeof *dst->vregs);
+    for (int i = 0; i < src->nvregs; i++) dst->vregs[i] = xstrdup(src->vregs[i]);
+    dst->blocks = xmalloc((size_t)(src->cap_blocks ? src->cap_blocks : 1) * sizeof *dst->blocks);
+    for (int b = 0; b < src->nblocks; b++) {
+        const IrBlock *sb = &src->blocks[b];
+        IrBlock *db = &dst->blocks[b];
+        db->label = xstrdup(sb->label);
+        db->n = sb->n;
+        db->cap = sb->n ? sb->n : 1;
+        db->instrs = xmalloc((size_t)db->cap * sizeof *db->instrs);
+        for (int k = 0; k < sb->n; k++) db->instrs[k] = ir_instr_clone(&sb->instrs[k]);
+    }
+}
+
+void ir_func_free_body(IrFunc *f) {
+    for (int b = 0; b < f->nblocks; b++) {
+        for (int k = 0; k < f->blocks[b].n; k++) ir_instr_free(&f->blocks[b].instrs[k]);
+        free(f->blocks[b].instrs);
+        free(f->blocks[b].label);
+    }
+    for (int v = 0; v < f->nvregs; v++) free(f->vregs[v]);
+    free(f->vregs);
+    free(f->blocks);
+    f->vregs = NULL;
+    f->blocks = NULL;
+    f->nvregs = f->cap_vregs = f->nblocks = f->cap_blocks = 0;
+}
+
+void ir_func_compact(IrFunc *f) {
+    for (int b = 0; b < f->nblocks; b++) {
+        IrBlock *bl = &f->blocks[b];
+        int k = 0;
+        for (int i = 0; i < bl->n; i++) {
+            if (bl->instrs[i].op == IR_NOP) ir_instr_free(&bl->instrs[i]);
+            else bl->instrs[k++] = bl->instrs[i];
+        }
+        bl->n = k;
+    }
+}
+
 void ir_instr_free(IrInstr *in) {
     free(in->args);
     free(in->phi_blocks);
@@ -317,6 +395,7 @@ const char *ir_op_name(IrOp op) {
     case IR_STORE: return "store";
     case IR_CHECK: return "check";
     case IR_PHI: return "phi";
+    case IR_NOP: return "nop";
     case IR_JMP: return "jmp";
     case IR_BR: return "br";
     case IR_RET: return "ret";
@@ -390,6 +469,7 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
         buf_printf(out, "check %%%s, %s, @%s", vname(f, in->a), tn, gname(m, in->global));
         break;
     }
+    case IR_NOP: buf_printf(out, "nop"); break;
     case IR_PHI:
         buf_printf(out, "phi");
         for (int i = 0; i < in->nargs; i++)

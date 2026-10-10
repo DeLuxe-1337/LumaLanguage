@@ -32,6 +32,7 @@
 #include "ir.h"
 #include "lexer.h"
 #include "lower.h"
+#include "opt.h"
 #include "parser.h"
 #include "util.h"
 #include "x86_isel.h"
@@ -49,6 +50,8 @@ static void usage(FILE *f) {
             "  --dump-tokens   print the token stream\n"
             "  --dump-ast      print the AST\n"
             "  --dump-ir       print the LIR module\n"
+            "  --dump-opt-ir   print the optimized LIR module\n"
+            "  -O0, -O1, -O2   optimization level (default -O2; see docs/DESIGN.md)\n"
             "  -v              print each stage and the link command\n"
             "  -l LIB, -L DIR  link with libLIB / search DIR (for extern fun)\n"
             "  EXTRA.o/.a/.so  additional objects or libraries passed to the linker\n"
@@ -151,7 +154,8 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
 int main(int argc, char **argv) {
     const char *input = NULL, *out = "a.out";
     bool stop_ir = false, stop_s = false, stop_c = false;
-    bool dump_tokens = false, dump_ast = false, dump_ir = false, verbose = false;
+    bool dump_tokens = false, dump_ast = false, dump_ir = false, dump_opt_ir = false, verbose = false;
+    int opt_level = 2;
     StrList extra = {0}, libs = {0};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -178,6 +182,8 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--dump-tokens") == 0) dump_tokens = true;
         else if (strcmp(a, "--dump-ast") == 0) dump_ast = true;
         else if (strcmp(a, "--dump-ir") == 0) dump_ir = true;
+        else if (strcmp(a, "--dump-opt-ir") == 0) dump_opt_ir = true;
+        else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '2' && !a[3]) opt_level = a[2] - '0';
         else if (strcmp(a, "-v") == 0) verbose = true;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(stdout); return 0; }
         else if (a[0] == '-' && a[1]) { fprintf(stderr, "luma: error: unknown option '%s'\n", a); usage(stderr); return 2; }
@@ -190,6 +196,8 @@ int main(int argc, char **argv) {
 
     int rc = 1;
     char *ir_path = with_ext(out, ".lir");
+    char *opt_path = with_ext(out, ".opt.lir");
+    Buf opt_buf = {0};
     char *asm_path = with_ext(out, ".s");
     char *obj_path = with_ext(out, ".o");
     size_t src_len = 0, asm_len = 0;
@@ -228,6 +236,20 @@ int main(int argc, char **argv) {
     /* 3. verify (always, including IR we produced ourselves) */
     /* (line numbers refer to INPUT: .lir lines, or .luma lines for lowered IR) */
     if (!ir_verify(&ir, input)) goto done;
+
+    /* 3b. optimize (-O2): the result is written to OUT.opt.lir and must verify */
+    if (opt_level >= 2) {
+        opt_module(&ir, opt_level);
+        ir_print_module(&ir, &opt_buf);
+        if (dump_opt_ir) fwrite(opt_buf.data, 1, opt_buf.len, stdout);
+        if (!write_file(opt_path, opt_buf.data, opt_buf.len)) goto done;
+        if (verbose) fprintf(stderr, "luma: wrote optimized IR %s\n", opt_path);
+        if (!ir_verify(&ir, opt_path)) {
+            fprintf(stderr, "luma: internal error: the optimizer produced invalid IR (%s); "
+                            "-O1 or -O0 avoids the optimizer\n", opt_path);
+            goto done;
+        }
+    }
     if (stop_ir) {
         if (from_ir) { fprintf(stderr, "luma: error: --emit-ir needs a .luma input\n"); goto done; }
         rc = 0;
@@ -265,6 +287,8 @@ done:
     buf_free(&asm_buf);
     obj_free(&obj);
     free(ir_path);
+    free(opt_path);
+    buf_free(&opt_buf);
     free(asm_path);
     free(obj_path);
     strlist_free(&extra);

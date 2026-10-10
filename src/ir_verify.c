@@ -91,7 +91,8 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
         if (in->ty == 0 || (in->ty & ~(IrTy)TY_ANY)) verr(v, f, b, in, "'check' has an invalid type");
         break;
     case IR_PHI:
-        verr(v, f, b, in, "phi instructions only exist inside the optimizer");
+    case IR_NOP:
+        verr(v, f, b, in, "'%s' instructions only exist inside the optimizer", ir_op_name(in->op));
         break;
     case IR_LOAD: case IR_STORE:
         if (in->global < 0 || in->global >= m->nglobals) verr(v, f, b, in, "'%s' references an undefined global", ir_op_name(in->op));
