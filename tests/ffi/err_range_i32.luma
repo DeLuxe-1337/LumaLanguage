@@ -1,0 +1,2 @@
+extern fun abs(n: i32): i32;
+print(abs(5000000000));

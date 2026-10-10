@@ -185,6 +185,41 @@ for src in tests/rt/*.luma; do
     fi
 done
 
+# ---------------------------------------------------------- C FFI
+printf '== C FFI (extern fun) ==\n'
+FFILIB="$OUT/ffilib"
+mkdir -p "$FFILIB"
+check "build C helper library (test-only, system cc)" sh -c \
+    "cc -c -O2 -o $FFILIB/ffi_helper.o tests/ffi/ffi_helper.c && ar rcs $FFILIB/libffihelper.a $FFILIB/ffi_helper.o"
+for src in tests/ffi/*.luma; do
+    name=$(basename "$src" .luma)
+    exe="$OUT/ffi_$name"
+    if ! "$LUMA" "$src" -o "$exe" -L "$FFILIB" -l ffihelper >"$OUT/last.log" 2>&1; then
+        bad "ffi/$name compiles + links"; sed 's/^/      /' "$OUT/last.log"; continue
+    fi
+    "$exe" >"$exe.stdout" 2>"$exe.stderr"
+    st=$?
+    if [ -f "tests/ffi/$name.err" ]; then
+        if [ $st -eq 1 ] && cmp -s "$exe.stdout" "tests/ffi/$name.out" && cmp -s "$exe.stderr" "tests/ffi/$name.err"; then
+            ok "ffi/$name: exit 1, $(sed 's/^luma: runtime error: //' "$exe.stderr")"
+        else bad "ffi/$name (exit $st)"; cat "$exe.stdout" "$exe.stderr" | sed 's/^/      /'; fi
+    else
+        if [ $st -eq 0 ] && cmp -s "$exe.stdout" "tests/ffi/$name.out" && [ ! -s "$exe.stderr" ]; then ok "ffi/$name output + exit 0"
+        else bad "ffi/$name (exit $st)"; diff "tests/ffi/$name.out" "$exe.stdout" | sed 's/^/      /'; cat "$exe.stderr"; fi
+        check "ffi/$name: object identical to GNU as" same_as_gas "$name" "$exe.s" "$exe.o"
+    fi
+done
+check "ffi: link a C object file given on the command line" sh -c \
+    "$LUMA tests/ffi/types.luma -o $OUT/ffi_obj $FFILIB/ffi_helper.o && $OUT/ffi_obj | cmp -s - tests/ffi/types.out"
+check "ffi: -lNAME / -LDIR attached forms" sh -c \
+    "$LUMA tests/ffi/types.luma -o $OUT/ffi_attached -L$FFILIB -lffihelper && $OUT/ffi_attached | cmp -s - tests/ffi/types.out"
+check "ffi: libc functions need no flags (examples/ffi.luma)" sh -c \
+    "$LUMA examples/ffi.luma -o $OUT/ffi_example && $OUT/ffi_example > $OUT/ffi_example.out && grep -q 'luma via C' $OUT/ffi_example.out"
+check "ffi: an unresolved C symbol is a link error" sh -c \
+    "printf 'extern fun no_such_function_xyz(): void;\nno_such_function_xyz();\n' > $OUT/unres.luma && ! $LUMA $OUT/unres.luma -o $OUT/unres 2>$OUT/e && grep -q 'no_such_function_xyz' $OUT/e && grep -q 'linker' $OUT/e"
+check "ffi: the call zeroes eax (variadic-safe) and converts via the runtime" sh -c \
+    "grep -q 'xor eax, eax' $OUT/ffi_types.s && grep -q 'call luma_ffi_arg_i8@PLT' $OUT/ffi_types.s && grep -q 'call luma_ffi_ret_u64@PLT' $OUT/ffi_types.s"
+
 # ---------------------------------------------------------- hand-written IR
 printf '== hand-written LIR ==\n'
 for src in tests/ir/*.lir; do

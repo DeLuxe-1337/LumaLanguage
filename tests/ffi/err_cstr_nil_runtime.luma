@@ -1,0 +1,3 @@
+extern fun strlen(s: cstr): u64;
+var n = nil;
+print(strlen(n));

@@ -1,0 +1,2 @@
+extern fun too_big_u64(): u64;
+print(too_big_u64());

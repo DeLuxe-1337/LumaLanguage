@@ -1,0 +1,3 @@
+extern fun negate(b: bool): bool;
+var one = 1;
+print(negate(one));

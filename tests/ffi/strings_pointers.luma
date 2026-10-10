@@ -1,0 +1,29 @@
+// cstr / cstr? / void / ptr, plus libc functions declared directly
+extern fun greeting(): cstr;
+extern fun maybe_name(give: bool): cstr?;
+extern fun is_null(s: cstr?): bool;
+extern fun length_or_minus_one(s: cstr?): i64;
+extern fun counter_add(n: i32): void;
+extern fun counter_get(): i32;
+extern fun buf_new(n: i32): ptr;
+extern fun buf_set(p: ptr, i: i32, v: i32): void;
+extern fun buf_get(p: ptr, i: i32): i32;
+extern fun buf_free(p: ptr): void;
+extern fun strlen(s: cstr): u64;          // from libc
+extern fun atoi(s: cstr): i32;
+extern fun abs(n: i32): i32;
+
+var g: str = greeting();
+print(g, strlen(g));
+print(maybe_name(true), maybe_name(false));
+print(is_null(nil), is_null("x"), length_or_minus_one(nil), length_or_minus_one("four"));
+var nothing = counter_add(5);
+counter_add(37);
+print(nothing, counter_get());
+var p = buf_new(4);
+for (var i = 0; i < 4; i = i + 1) buf_set(p, i, i * i);
+print(buf_get(p, 0), buf_get(p, 1), buf_get(p, 2), buf_get(p, 3), p > 0);
+buf_free(p);
+print(atoi("-12345") + abs(-5));
+fun shout(s: str): str { return s + "!"; }
+print(shout(greeting()));
