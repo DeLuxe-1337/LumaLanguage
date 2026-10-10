@@ -9,6 +9,7 @@ The syntax started from Lox and has grown its own features:
 
 - `print` is a builtin function
 - types are optional and gradual
+- structs with `impl` blocks (methods and associated functions, Rust-style)
 - C functions are called directly through `extern fun`
 
 Nothing is final before Luma bootstraps.
@@ -27,6 +28,17 @@ fun shout(x) { return x + "!"; }          // untyped: fully dynamic
 var name: str = "luma";
 print(shout(name), strlen(name), fib(20));
 print("HOME is", getenv("HOME") or "unset");
+
+struct Point { x: int, y: int }
+
+impl Point {
+  fun new(x: int, y: int): Point { return Point { x, y }; }   // associated function
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+}
+
+var p = Point::new(3, 4);
+p.x = p.x + 1;
+print(p, p.len2());                       // Point { x: 4, y: 4 } 32
 ```
 
 ## Quick start
@@ -96,16 +108,18 @@ Its input language, encodings and relocation rules are specified in
 
 | | |
 |---|---|
-| Values | 63-bit integers, strings, `true`, `false`, `nil` |
+| Values | 63-bit integers, strings, `true`, `false`, `nil`, struct instances |
+| Structs | `struct P { x: int, y }` declares fields (typed or untyped). `P { x: 1, y }` builds one (every field, any order, `y` is shorthand for `y: y`). Instances are references: assignment shares, `==` is identity, and they are always truthy. `print` shows `P { x: 1, y: "s" }`. |
+| `impl` | `impl P { fun m(self, a) { … } fun new(…) { … } }` adds methods (first parameter `self`, untyped) and associated functions (no `self`). Call them as `p.m(1)`, `P::new(…)` or `P::m(p, 1)`. Several `impl` blocks per struct are allowed. When the object's static type is exactly `P`, field access and method calls are compiled statically; otherwise they are looked up by name at runtime, with the same error messages. |
 | Functions | `fun name(a, b) { … return v; }` at top level, called as `name(x, y)`. Recursion and mutual recursion work, and functions can be called before their definition. Up to 6 parameters. Arity is checked at compile time. A missing `return` returns `nil`. |
 | Builtins | `print(a, b, …)` writes its arguments separated by spaces, then a newline, and returns `nil`. All arguments are evaluated before anything is written. |
-| Types | Optional annotations: `var n: int`, `fun f(a: str, b): bool?`. The types are `int str bool nil any` and `T?` (T or nil). Mismatches the compiler can prove are compile errors; values whose type is only known at runtime are checked by a guard at the annotated boundary. Unannotated code stays fully dynamic. |
+| Types | Optional annotations: `var n: int`, `fun f(a: str, b): bool?`. The types are `int str bool nil any`, struct names, and `T?` (T or nil). Mismatches the compiler can prove are compile errors; values whose type is only known at runtime are checked by a guard at the annotated boundary. Unannotated code stays fully dynamic. |
 | C FFI | `extern fun name(p: ctype, …): ctype;` with `i8`…`i64`, `u8`…`u64`, `bool`, `cstr`, `cstr?`, `ptr` and `void`. Values are converted and range-checked at the call. Link libraries with `-l NAME -L DIR`, or pass `.o`/`.a`/`.so` files. |
 | Statements | `var`, expression statements, `{ }` blocks, `if`/`else`, `while`, `for`, `return` |
 | Operators | `= or and == != < <= > >= + - * / ! -` (unary), and `+` on two strings concatenates them |
 | Variables | Top-level variables are globals that functions can read and write. Variables in blocks and functions are local, with lexical scoping checked at compile time. |
 | Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Integer overflow, type errors, reading a global before it is assigned, and stack overflow are runtime errors (exit status 1). `/` is floor division. |
-| Not yet | first-class functions and closures, classes, floats (including C `f32`/`f64`), C structs and callbacks, `break`, a GC (runtime strings are never freed) |
+| Not yet | first-class functions and closures, traits/interfaces, floats (including C `f32`/`f64`), C structs and callbacks, `break`, a GC (strings and struct instances are never freed; every allocation already goes through one `luma_alloc` entry point) |
 
 ## Inspecting the intermediate files
 
@@ -138,6 +152,7 @@ machine (`make bench`, wall time):
 | loop_sum (100M iterations) | 1.02 s | 0.12 s | 8.8× |
 | primes (to 2M) | 1.97 s | 0.61 s | 3.2× |
 | strings (3M concatenations) | 0.15 s | 0.007 s | 20.6×* |
+| structs (20M method calls, list walks) | 2.07 s | 0.18 s | 11.5× |
 
 \* The loop's `"x" + "y"` is loop-invariant, so `-O2` computes it once.
 Strings are immutable and compared by content, so this is not observable.
@@ -175,7 +190,7 @@ check(-7 / 2 == -4, "-7 / 2 floors toward -infinity");
 | `tests/ir/` | Hand-written LIR programs: loops, six-argument calls and recursion. |
 | `tests/ffi/` | C FFI: `ffi_helper.c` plus Luma programs that round-trip every C type, and runtime FFI errors. |
 | `tests/asm/` | lasm on its own: a C program linked against an object built by `lasm`, and a coverage file compared byte for byte against GNU `as`. |
-| `tests/difftest.py` | Random programs compiled natively at every optimization level and compared with an independent Python interpreter. |
+| `tests/difftest.py` | Random programs (including structs, methods and dynamic field access) compiled natively at every optimization level and compared with an independent Python interpreter. |
 | `bench/` | Benchmark programs and `run.py`. |
 
 ## Layout

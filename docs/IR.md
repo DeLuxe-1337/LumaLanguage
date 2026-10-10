@@ -1,8 +1,9 @@
-# LIR: the Luma intermediate representation (spec v0.4)
+# LIR: the Luma intermediate representation (spec v0.5)
 
 **Status:** implemented in milestone 2 and extended since: section 15 (v0.2,
-milestone 3), section 16 (v0.3, milestone 4) and section 17 (v0.4, milestone
-5: types, `check`, the optimizer and the optimizing backend). The decisions
+milestone 3), section 16 (v0.3, milestone 4), section 17 (v0.4, milestone
+5: types, `check`, the optimizer and the optimizing backend) and section 18
+(v0.5, milestone 6: structs, field access and method calls). The decisions
 in section 13 are resolved, and the places where the implementation refined
 the original draft are listed in section 14.
 **Scope:** this spec covers:
@@ -90,6 +91,7 @@ offset 8   …            type-specific
 | Type id | Type   | Payload |
 |---|---|---|
 | 1 | string | `u64 len; u8 bytes[len]; u8 0` (the NUL is for C interop and is not counted in `len`) |
+| 2 | struct instance (v0.5) | header bits 8–31: struct index + 1; `u64 descriptor; u64 fields[n]` (section 18) |
 
 - **String literals** are emitted as static objects in `.rodata`, so they have no
   allocation cost and are immutable.
@@ -641,3 +643,155 @@ fn.fib:    # 9 vregs: 6 in registers, 0 spilled; framed, saves rbx r12
 
 Section 8's naive templates remain the reference semantics for every
 instruction.
+
+## 18. v0.5 additions (milestone 6)
+
+v0.5 adds user-defined **structs**: a declaration per struct, struct types,
+and four instructions. `tests/ir/structs.lir` is a complete hand-written
+example.
+
+### Struct declarations
+
+```
+struct Pair {left: int, right} methods {sum = @pair_sum}
+struct Node {value: int, next: Node?}
+struct Empty {}
+```
+
+A declaration gives the struct's **fields** in order, each optionally typed
+(untyped means `any`), and an optional **method table** mapping names to
+functions. Declarations are module-level and may appear anywhere in the file;
+the parser registers every struct name before reading anything else, so
+fields, signatures and other structs may refer to structs declared later.
+The printer emits all structs first, in index order. The struct with index
+*k* is `m->structs[k]` (`IrStruct`: name, fields, field types, method names,
+method globals).
+
+Lowering names a struct's methods and associated functions `@m.S.name`. A
+method table entry must accept a dynamic call (see the verifier rules below),
+so for a method with typed parameters lowering also emits
+`@m.S.name.dyn`, which `check`s its arguments and calls `@m.S.name`, and the
+table points at that.
+
+### Struct types
+
+Each struct is a type. `IrTy` gains bit 16 (`TY_STRUCT`, "an object of some
+struct"); bits 8 and up hold which one: 0 means *any struct*, *k* means
+struct index *k*−1. So a type is either one specific struct or all structs,
+plus any of the scalar bits:
+
+| Written | Meaning |
+|---|---|
+| `Pair` | an instance of `Pair` |
+| `Node?` | `Node` or `nil` (printed `nil\|Node`) |
+| `struct` | an instance of any struct |
+| `any` | everything (now includes `struct`) |
+
+Union and intersection are computed per component: `Pair ∪ Node` is
+`struct`, `Pair ∩ Node` has no struct part, and `Pair ⊆ struct`
+(`ir_ty_union`, `ir_ty_inter`, `ir_ty_sub`). Types print in a canonical
+order: scalars first, then the struct, e.g. `int|nil|Node`.
+
+### Instructions
+
+| Instruction | Meaning |
+|---|---|
+| `%d = new S(%a, %b, …)` | allocate an instance of `S`, initialized with one value per field, in declaration order |
+| `%d = getfield %o, S.f` | static read: `%o` must be proven to be an `S`; a load at a fixed offset |
+| `%d = getfield %o, .f` | dynamic read by name: a runtime error unless `%o` is an instance whose struct has a field `f` |
+| `setfield %o, S.f, %v` | static write: `%o` proven `S` and `%v` proven to fit the field's type |
+| `setfield %o, .f, %v` | dynamic write: the runtime finds the field and checks `%v` against its type |
+| `[%d =] callm %o, .m(%a, …)` | dynamic method call: `%o`'s struct must have a method `m` taking that many arguments after `self`; it is called with `(%o, %a, …)` |
+
+There is no static form of `callm`: a method of a known struct is just a
+`call @m.S.m(%o, …)`. `setfield` has no result. Static field references are
+stored as (struct index, field index); dynamic ones keep the name (the
+instruction owns it).
+
+**Results for type inference:** `new S` is `S`; a static `getfield` is the
+field's declared type; a dynamic `getfield` and `callm` are `any`.
+
+**Effects:** all four may allocate, read or write memory that other code can
+see (and the dynamic ones may fail), so the optimizer treats them as effects:
+never hoisted, merged or deleted, except by the object pass below. `callm`
+can run any method, so it is also treated as a call.
+
+### Verifier rules (additions to section 6)
+
+- Struct declarations: field types are valid types; field and method names
+  are unique within a struct.
+- Method tables: each entry is a Luma function whose first parameter accepts
+  the struct, and whose **other parameters are untyped**, because `callm`
+  passes values whose types are unknown.
+- `new S`: `S` exists, exactly one value per field, and each value is
+  **proven** to fit its field's type.
+- Static `getfield`/`setfield`: the struct and field exist, `%o` is proven
+  to be an `S`, and for `setfield` `%v` is proven to fit the field.
+- Dynamic forms need a non-empty name.
+
+"Proven" uses the flow-sensitive inference of section 17, including the edge
+refinement below. Lowering only emits a static access where it can prove
+these, and inserts a `check` otherwise, so a static access needs no runtime
+test.
+
+### Edge refinement in type inference
+
+The types flowing along each edge out of `br %c, T, F` are refined:
+
+- On `T`, `%c` is not `nil`; on `F`, `%c` is `nil` or `bool`.
+- If `%c` was defined in the same block by `eq`/`ne` of a value with an
+  exactly-`nil` operand, and neither operand is reassigned before the `br`,
+  that value is narrowed to `nil` or to its non-nil part on each edge.
+- `not` flips the sense and is followed (up to four steps).
+
+A refinement never narrows a type to empty. This lets
+`while (n != nil) { … n.next … }`, where `n: Node?`, see `n` as `Node` in
+the loop body, so its field accesses are static.
+
+### Object pass (`opt_objects.c`)
+
+Runs last at `-O2`, on non-SSA IR, using the same inference the verifier
+uses, so everything it produces verifies:
+
+1. **Devirtualization.** A dynamic `getfield`/`setfield` on a value proven to
+   be exactly `S` becomes static when `S` has the field (and, for
+   `setfield`, the value is proven to fit; otherwise the runtime check must
+   stay). A `callm` becomes `call @<S's table entry>(%o, …)` when `S` has the
+   method with the right arity. Otherwise the dynamic form stays, so the
+   runtime error is unchanged.
+2. **Field load forwarding** (block-local). A static `getfield %o, S.f` after
+   an earlier static read or write of `%o`'s `S.f` becomes a `mov` of the
+   known value. Knowledge is dropped by a static write to `S.f` of any object
+   (it may be the same one), any dynamic `setfield`, any `callm` or call to a
+   Luma function, and any reassignment of `%o` or of the value's vreg.
+3. A `check` that the sharper types now prove becomes a `mov`.
+
+### Data emitted for structs (both backends)
+
+For each struct *K* the backend emits a descriptor `.Lstruct.K` in `.data`,
+after the global table `luma_structs` (always present, count 0 when there are
+no structs):
+
+```
+luma_structs:  .quad <count>, .Lstruct.0, .Lstruct.1, …
+.Lstruct.K:    .quad K+1, .Lsname.K, <nfields>, .Lsfields.K, .Lsftys.K, <nmethods>, .Lsmeth.K
+.Lsfields.K:   .quad .Lsfname.K.0, .Lsfname.K.1, …        ; field names
+.Lsftys.K:     .quad <type mask of field 0>, …             ; IrTy bits, as the runtime checks them
+.Lsmeth.K:     .quad .Lsmname.K.0, m.S.name, <arity incl. self>, …
+```
+
+A struct with no fields or methods has 0 in place of the pointer. The names
+(`.Lsname`, `.Lsfname`, `.Lsmname`) are NUL-terminated strings in `.rodata`,
+and so are the `.Lname.X` strings that dynamic accesses pass to the runtime.
+Every `.quad SYMBOL` is an `R_X86_64_64` relocation (LASM.md section 9).
+
+### Lowering to x86-64
+
+| Instruction | `-O0` (`x86_isel.c`) | `-O1`/`-O2` (`x86_gen.c`) |
+|---|---|---|
+| `new S(…)` | `lea rdi, [rip + .Lstruct.K]; call luma_new_struct@PLT`, then `mov [rax + 16 + 8i], rcx` per field | same; the arguments live across the call |
+| static `getfield`/`setfield` | `mov rax, [rax + 16 + 8·i]` / `mov [rax + 16 + 8·i], rcx` | one `mov` |
+| dynamic `getfield`/`setfield` | `luma_getfield(o, name)` / `luma_setfield(o, name, v)` | same calls |
+| `callm %o, .m(args)` | `luma_method(o, name, nargs)` returns the code; the arguments are loaded and the call is `call r11` | arguments parallel-moved, pushed around the `luma_method` call, popped, then `call r11` |
+| `check %v, S` | `luma_check_type` | inline: not a fixnum or immediate (`test r, 7`) and header word equals S's, else the slow path |
+

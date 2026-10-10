@@ -1154,7 +1154,7 @@ static bool finish_blocks(L *l, int track) {
             nbk[next++] = f->blocks[i];
         } else {
             map[i] = -1;
-            for (int k = 0; k < f->blocks[i].n; k++) free(f->blocks[i].instrs[k].args);
+            for (int k = 0; k < f->blocks[i].n; k++) ir_instr_free(&f->blocks[i].instrs[k]);
             free(f->blocks[i].instrs);
             free(f->blocks[i].label);
         }

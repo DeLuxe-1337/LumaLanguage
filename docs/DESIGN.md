@@ -1,10 +1,10 @@
-# Luma bootstrap compiler: design notes (milestone 5)
+# Luma bootstrap compiler: design notes (milestone 6)
 
 This document describes how the Luma toolchain is built. Its sections cover:
 
 - the pipeline and its modules
 - the language subset accepted today
-- optional types and the C FFI
+- optional types, structs and `impl` blocks, and the C FFI
 - the C runtime
 - the optimizer and the two code generators
 - the x86-64 assembler (encodings, relaxation, relocations)
@@ -77,7 +77,7 @@ statically.
   `for (init; cond; incr) …` with every clause optional, and `return expr;` or
   `return;` (inside functions only).
 - **Expressions**, from lowest to highest precedence:
-  1. assignment (right-associative, target must be a bare identifier)
+  1. assignment (right-associative; the target is an identifier or a field `e.name`)
   2. `or`
   3. `and`
   4. `==` and `!=`
@@ -85,9 +85,10 @@ statically.
   6. `+` and `-`
   7. `*` and `/`
   8. unary `!` and `-`
-  9. calls `name(args…)`
-  10. literals, variables and parentheses
-- **Values:** integers, strings, `true`, `false` and `nil`. Truthiness, equality
+  9. calls `name(args…)`, field access `e.name`, method calls `e.name(args…)`
+  10. literals, variables, parentheses, struct literals `P { x: 1, y }` and
+      associated calls `P::name(args…)`
+- **Values:** integers, strings, `true`, `false`, `nil` and struct instances. Truthiness, equality
   and the values returned by `and`/`or` follow Lox.
 - **Functions:**
   - They are hoisted: any function can call any other, before or after its definition.
@@ -128,7 +129,8 @@ Differences from reference Lox:
 | C interop | none | `extern fun` with C types (see below) |
 | Undefined names | runtime errors | compile errors; a global read before its declaration executes is a runtime error |
 | Strings | multi-line, no escapes | single line; `\"` `\\` `\n` `\t` |
-| `class`, `this`, `super`, float literals | yes | rejected ("not supported yet") |
+| Objects | `class`, `this`, `super`, inheritance | `struct` + `impl` (see below); `class` is rejected with a hint to use them; no inheritance |
+| Float literals | yes | rejected ("not supported yet") |
 
 Compile errors have the form `path:line:col: error: message`, and compilation
 stops at the first one. When it does, no `.lir`, `.s`, `.o` or executable is
@@ -152,6 +154,7 @@ fun greet(name: str?): str { … }
 | `bool` | `true` and `false` |
 | `nil` | `nil` |
 | `any` | anything; also the meaning of no annotation |
+| `P` (a struct name) | instances of struct `P` |
 | `T?` | `T` or `nil` |
 
 The compiler gives every expression a **static type**: the set of runtime
@@ -193,6 +196,83 @@ faster: the optimizer deletes `check`s that inference proves redundant, and
 the backend skips tag checks on values known to be `int` (for example,
 `fun fib(n: int): int` compiles to plain machine arithmetic plus overflow
 checks).
+
+## Structs and `impl` blocks (milestone 6)
+
+```js
+struct Node { value: int, next: Node? }   // fields, optionally typed
+
+impl Node {
+  fun new(v: int): Node { return Node { value: v, next: nil }; }  // associated function
+  fun sum(self): int {                                             // method
+    var total = 0;
+    var n: Node? = self;
+    while (n != nil) { total = total + n.value; n = n.next; }
+    return total;
+  }
+}
+
+var list = Node::new(1);
+list.next = Node { value: 2, next: nil };
+print(list.sum(), list);   // 3 Node { value: 1, next: Node { value: 2, next: nil } }
+```
+
+**Declarations.** `struct` and `impl` are top-level only. Struct names share
+the namespace of functions, globals and builtins, and all structs are hoisted
+like functions, so they may refer to each other in any order (`next: Node?`).
+A struct may have several `impl` blocks; a method name must be unique across
+them. In an `impl`, a function whose first parameter is `self` is a
+**method**; one without is an **associated function**. `self` must come first
+and cannot be annotated (it is always the struct). `impl` for an unknown
+struct, `self` elsewhere, and duplicate fields or methods are compile errors.
+
+**Literals.** `P { x: 1, y }` must initialize every field exactly once, in any
+order; `y` alone means `y: y`. Initializers are evaluated left to right as
+written, then the object is allocated and filled, so a runtime error in an
+initializer leaves no half-built object. Each initializer flows into its
+field's type like any typed boundary (compile error, nothing, or a guard).
+
+**Semantics.**
+
+- Instances are references. Assignment and argument passing share the object,
+  `==` is identity, and every instance is truthy.
+- `print` shows `P { x: 1, s: "q" }`: strings inside a struct are quoted, and
+  an object already being printed (a cycle) shows as `P { ... }`.
+- `P::f(args)` calls an associated function or a method with `self` passed
+  explicitly. `p.m(args)` calls a method; calling an associated function this
+  way is a compile error with a hint.
+
+**Static and dynamic access (gradual).** What an access compiles to depends
+on the object's static type:
+
+| Static type of `e` | `e.x`, `e.x = v` | `e.m(args)` |
+|---|---|---|
+| exactly `P` | a load/store at a fixed offset; unknown field is a compile error; `v` is checked against the field type at compile time or by a guard | a direct call to `P`'s method; arity checked at compile time |
+| can't be a struct (`int`, `str?`, …) | compile error: `only struct instances have fields, got int` | compile error |
+| anything else (`any`, `P?`, `P or int`) | `luma_getfield` / `luma_setfield` by name at runtime | `luma_method` finds the code by name, checks the arity, and the call goes through the returned pointer |
+
+The dynamic paths give the same results and the same error messages as the
+static ones, just at run time: `Struct 'P' has no field 'y'.`,
+`field 'x' of 'P' expects int, got str.`, `'P::m' expects 1 argument, got 2.`
+A dynamic call cannot see the method's parameter types, so a method with
+typed parameters (besides `self`) gets a second entry, `@m.P.name.dyn`, with
+untyped parameters, that checks the arguments and calls the real method; the
+method table points at that entry. Methods without typed parameters need no
+wrapper.
+
+The optimizer often turns dynamic accesses into static ones: after
+`n != nil` is tested, a `Node?` is known to be a `Node` on that edge (see
+"Optimizer" below).
+
+**Naming.** Methods and associated functions are LIR functions named
+`@m.P.name` (shown as `P::name` in messages). Struct descriptors are emitted
+as `.Lstruct.K`, field and method names as `.Lname.NAME`.
+
+**Memory.** Instances are allocated by `luma_alloc` and never freed, like
+runtime strings; there is no GC yet. Every heap allocation in the runtime goes
+through that one function, and every object begins with a header word that
+identifies its layout, so a collector can be added without changing the
+object format (the memory-management plan is a separate document).
 
 ## C FFI (`extern fun`)
 
@@ -251,14 +331,36 @@ which calls `luma_main()`, flushes stdout, and exits with status 0.
 | `luma_check_type(v, mask, context)` | the runtime guard at typed boundaries (returns `v`) |
 | `luma_int_overflow()`, `luma_div_zero()` | noreturn error exits of the inline fast paths |
 | `luma_ffi_arg_<ctype>`, `luma_ffi_ret_<ctype>` | FFI converters, with range and type checks |
+| `luma_new_struct(desc)` | allocates an instance with every field `nil`; the compiled code then stores the initializers |
+| `luma_getfield(o, name)`, `luma_setfield(o, name, v)` | dynamic field access; `setfield` checks `v` against the field's declared type |
+| `luma_method(o, name, nargs)` | returns the code of `o`'s method `name` after checking the arity (`LumaFn`, called with the real arguments) |
+
+**Struct instances** (`src/value.h`):
+
+```
++0   header   LUMA_TYPE_STRUCT (2) | (struct index + 1) << 8   (bits 32+ reserved for a GC)
++8   descriptor pointer
++16  field 0, field 1, …   (8 bytes each, declaration order)
+```
+
+The compiler emits one **descriptor** per struct into `.data`
+(`{id, name, nfields, field names, field type masks, nmethods, methods}`,
+where each method is `{name, code, arity including self}`), plus a global
+table `luma_structs = [count, desc…]` that the runtime uses to name struct
+types in error messages (`expects Point, got int`). Every program defines
+`luma_structs`, with count 0 if it declares no structs. The descriptors hold
+absolute addresses, so they use `R_X86_64_64` relocations (`.quad SYMBOL`),
+which the linker turns into `R_X86_64_RELATIVE` dynamic relocations in the
+PIE.
 
 The generic operations behave as follows:
 
 - Arithmetic on fixnums is checked for overflow.
 - `/` and `mod` floor their results.
 - `+` concatenates two strings.
-- Strings created at run time are allocated with `malloc` and never freed,
-  because v0.1 has no GC.
+- Strings and struct instances created at run time are allocated by
+  `luma_alloc` (8-aligned, out-of-memory is a runtime error) and never freed,
+  because there is no GC yet.
 
 A runtime error flushes stdout, prints `luma: runtime error: <Lox-style
 message>` to stderr, and exits with status 1.
@@ -317,6 +419,27 @@ section 17. Implementation notes:
   entered.
 - **DCE** deletes unused instructions that cannot fail and have no effect.
   A `sub` whose result is unused stays if it might overflow or fail on a type.
+- **Struct operations.** `new`, `getfield`, `setfield` and `callm` count as
+  effects: they are never hoisted, merged or deleted, since a field may change
+  between two reads and a dynamic access may fail. `callm` (which can run any
+  method) also clears GVN's knowledge of globals, like a call.
+- **Edge refinement** (`ir_types.c`). On the two edges out of `br %c`, `%c` is
+  known truthy or falsy; when `%c` came from `ne %v, nil` / `eq %v, nil` (or
+  `not` of one) in the same block, `%v` is known non-nil or nil on each edge.
+  This is what makes `while (n != nil) { … n.value … }` see `n` as a `Node`.
+- **Objects** (`opt_objects.c`, last, on non-SSA IR). Three rewrites, each of
+  which the verifier re-checks:
+  - *Devirtualization:* a dynamic `getfield`/`setfield`/`callm` whose object
+    is proven to be exactly struct `P` becomes the static form (or a direct
+    `call` of `P`'s method entry). It is kept dynamic when `P` has no such
+    field or method, the arity is wrong, or a written value might not fit the
+    field, so runtime errors are unchanged.
+  - *Field load forwarding:* within a block, a static read of `%o.P.f` after
+    an earlier read or write of the same `%o.P.f` reuses the known value,
+    unless in between there is a write to field `P.f` of any object (it may
+    alias), a dynamic write, a Luma call or `callm`, or a reassignment of
+    `%o` or of the value's vreg.
+  - A `check` that the sharper types now prove becomes a `mov`.
 
 ## Code generation: optimizing backend (`src/x86_gen.c`, `-O1`/`-O2`)
 
@@ -390,6 +513,11 @@ pass, so the slow path always sees the original operands.
 | `check` | Inline tests for its int/nil/bool members: `test r8, 1`, `cmp r, 6`, `and r10, -9; cmp r10, 2`. Strings and failures go to a slow path calling `luma_check_type`, which returns the value or raises the error. |
 | `load` | `mov t, [rip + .Lvar.g]; test t, t; je <undefined-variable stub>` |
 | `store` | `mov [rip + .Lvar.g], imm32 / reg` |
+| `new P(…)` | `lea rdi, [rip + .Lstruct.K]; call luma_new_struct`, then one `mov [rax + 16 + 8i], arg` per field. The arguments are live across the call, so they sit in callee-saved registers or slots. |
+| `getfield %o, P.x` / `setfield` | one `mov` at offset 16 + 8·index; the verifier has proven `%o` is a `P` |
+| dynamic `getfield` / `setfield` | `lea rsi, [rip + .Lname.x]; call luma_getfield` (or `luma_setfield`) |
+| `callm %o, .m(args)` | the arguments are parallel-moved into their final registers (self in `rdi`) and pushed; `luma_method(o, "m", n)` returns the code pointer in `rax`; the arguments are popped back, and the call is `mov r11, rax; call r11` |
+| `check` with a struct type | `test r, 7; jnz slow; cmp qword ptr [r], HEADER; je ok` (an object with the right header word), else the slow path |
 | `br` | Uses the operand's type: a `bool` compares with `false`, a value that can't be `bool` compares with `nil`, and an `int`/`str` is always truthy. |
 
 **Branch fusion.** When a `br` tests the result of a comparison earlier in
@@ -464,10 +592,13 @@ relocations, and the diagnostics. In short:
   operands (`[base + index*scale + disp]`, `[rip + sym]`).
 - **Instructions:** `mov`, `movzx`, `lea`, the ALU group, `test`, `imul`,
   `neg`/`not`/`idiv`, shifts, `setcc`, `cmovcc`, `cqo`, `push`/`pop`, `call`,
-  `jmp`/`jcc` (relaxed in passes, as GNU `as` does), `ret` and `nop`.
+  `jmp`/`jcc` (relaxed in passes, as GNU `as` does), indirect `call r64`,
+  `ret` and `nop`.
 - **Relocations:** `R_X86_64_PC32` for RIP-relative operands and local
-  targets, and `R_X86_64_PLT32` for calls and jumps to global or undefined
-  symbols. `.L` labels never reach the symbol table.
+  targets, `R_X86_64_PLT32` for calls and jumps to global or undefined
+  symbols, and `R_X86_64_64` for `.quad SYMBOL[±N]` data (struct
+  descriptors). `.L` labels never reach the symbol table; a relocation against
+  one uses its section's symbol plus the label's offset.
 
 ## ELF64 writer (`src/elf_writer.c`)
 
@@ -517,8 +648,10 @@ no shell involved. `<libdir>` is the directory containing the `luma` binary.
   replaces the archive path.
 - **No assembler runs:** `cc` receives only an object file and an archive, so
   it runs nothing but the linker. The e2e suite checks this with `cc -v`.
-- **Output:** the result is a default PIE. Both relocation types are valid in a
-  PIE: PC32 points at our own `.rodata`, and PLT32 resolves the runtime functions.
+- **Output:** the result is a default PIE. All three relocation types are
+  valid in a PIE: PC32 points at our own sections, PLT32 resolves the runtime
+  functions, and the linker turns each R_X86_64_64 in `.data` into a dynamic
+  `R_X86_64_RELATIVE` that the loader applies at startup.
 
 External dependencies:
 
@@ -534,14 +667,24 @@ tests.
 |---|---|
 | `make unit` | lexer, parser, lowering, IR parse/print/verify, assembler encodings and relaxation, ELF layout (built by hand) |
 | `make e2e` (`tests/run_e2e.sh`) | hello world pipeline and object inspection (at `-O2` and `-O0`); for every `tests/pos` program: exact output at `-O0`, `-O1` and `-O2`, GNU `as` byte equivalence, `.lir` recompilation identity and IR round trip; properties of the optimized code (no runtime calls in typed `fib`, frameless leaf loops, shifts for division by 4, tail calls as jumps); compile errors with locations; runtime errors and FFI programs at every level (exact stdout, stderr and exit status); hand-written `.lir` programs; lasm on its own |
-| `make difftest` (`tests/difftest.py`) | random programs with functions, globals, multi-argument `print` and random **type annotations**. Wrong-typed values are hidden behind an untyped `dyn()` so they reach runtime errors and the **runtime guards**, which the reference interpreter models with exact messages. Each program is compiled natively at `-O0`, `-O1` and `-O2` (`DIFFTEST_LEVELS`) and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
+| `make difftest` (`tests/difftest.py`) | random programs with functions, globals, multi-argument `print`, random **type annotations**, and random **structs** with `impl` methods, literals, field reads and writes and method calls (typed and through `dyn()`), compared including printed structs and runtime errors. Wrong-typed values are hidden behind an untyped `dyn()` so they reach runtime errors and the **runtime guards**, which the reference interpreter models with exact messages. Each program is compiled natively at `-O0`, `-O1` and `-O2` (`DIFFTEST_LEVELS`) and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
 | `make selftest` | `examples/selftest.luma`: 91 checks written in Luma itself, built on a `check()` function. It exits through `extern fun exit` |
 | e2e FFI section | `tests/ffi`: the C helper library `ffi_helper.c` (built with the system cc, test-only), round trips for every C type and boundary value, 9 runtime-error cases, and the link modes |
-| `make bench` (`bench/run.py`) | wall time of six programs (recursion, loops, division, strings) at `-O0` and `-O2`, with their output |
+| `make bench` (`bench/run.py`) | wall time of seven programs (recursion, loops, division, strings, structs) at `-O0` and `-O2`, with their output |
 
 The optimizer and backend were also checked with ASan/UBSan builds of the
 compiler (`make BUILD=build-asan CFLAGS="-fsanitize=address,undefined …"`,
 then the suites with `LUMA=build-asan/luma`), and by planting bugs in the
 backend (a dropped `jo`, a wrong swapped condition, no register saving
 around slow paths, a missing floor fix-up, ignoring calls in allocation):
-`make difftest` catches each of them.
+`make difftest` catches each of them. Field load forwarding was checked the
+same way: forgetting to invalidate on an aliased write, a dynamic write, a
+call, or a reassignment of the object each makes `tests/pos/struct_aliasing`
+fail.
+
+Structs are covered by `tests/pos/structs.luma` and `struct_aliasing.luma`
+(exact output at every level), 20 `tests/neg/struct_*` compile errors, 10
+`tests/rt/struct_*` runtime errors (missing fields and methods, arity, field
+type guards on dynamic writes and on refined values), `tests/ir/structs.lir`
+(hand-written v0.5 IR), and unit tests for parsing, lowering, IR round trip and
+the verifier's struct rules.

@@ -139,7 +139,7 @@ directive, the current section is `.text`, as in GNU `as`.
 | `.size SYM, .-SYM` | Size = current offset − SYM's offset. SYM must be defined in the current section. |
 | `.size SYM, N` | Size = N (a non-negative integer). |
 | `.byte V, …` | 1 to 16 values, each from −128 to 255. |
-| `.quad V, …` | 1 to 16 64-bit values, little-endian. |
+| `.quad V, …` | 1 to 16 64-bit values, little-endian. Each value is an integer or a symbol with an optional constant offset (`SYM`, `SYM+N`, `SYM-N`), which becomes an `R_X86_64_64` relocation (section 9). |
 | `.ascii "s"` | The string's bytes. |
 | `.asciz "s"`, `.string "s"` | The string's bytes plus a NUL. |
 | `.p2align N` | Pad with zero bytes to a multiple of 2^N (0 ≤ N ≤ 12), and raise the section's alignment to at least 2^N. Data sections only. |
@@ -149,7 +149,7 @@ multi-byte NOP sequences. Copying them would be needed to stay
 byte-identical, and nothing needs code alignment yet.
 
 Expressions are not supported. A value is a single integer, except for the
-`.-SYM` form of `.size`.
+`.-SYM` form of `.size` and the `SYM±N` form of `.quad`.
 
 ## 5. Operands
 
@@ -211,8 +211,9 @@ supported.
 The operand is a symbol name, optionally written `name@PLT`. `@PLT` is
 accepted for compatibility and changes nothing, because lasm always emits
 `R_X86_64_PLT32` for calls and jumps that need a relocation (section 9).
-Every other `@` modifier is an error. Indirect jumps and calls through a
-register or memory are not supported.
+Every other `@` modifier is an error. `call` also accepts a 64-bit register
+(`call r11`, an indirect call; section 6.4). Indirect jumps, and calls
+through memory, are not supported.
 
 ## 6. Instruction reference
 
@@ -288,6 +289,7 @@ Condition codes, with all the aliases GNU `as` accepts:
 |---|---|---|
 | `jmp sym` | `EB cb` or `E9 cd` | relaxed (section 8) |
 | `call sym` | `E8 cd` | always rel32 |
+| `call r64` | `[REX.B] FF /2` (ModRM mod=11) | indirect call through a register, e.g. `call r11` = `41 FF D3` |
 | `ret` | `C3` | |
 | `nop` | `90` | |
 
@@ -298,7 +300,7 @@ Condition codes, with all the aliases GNU `as` accepts:
 - `mul`, `div`, `inc`, `dec`, `xchg`, `movsx`/`movsxd`;
 - string instructions;
 - SSE/AVX;
-- indirect `jmp`/`call`;
+- indirect `jmp`, and `call` through memory (`call r64` is supported);
 - shifts by `cl`;
 - segment and `lock`/`rep` prefixes.
 
@@ -398,11 +400,27 @@ Notes:
   Example: `jmp ext_a; call ext_b` gives the relocation for `ext_b` first.
   `tests/asm/coverage.s` pins this ordering case and the PC32 rule above.
 
-Relocation types emitted: `R_X86_64_PC32` (2) and `R_X86_64_PLT32` (4).
-`R_X86_64_PLT32` is used only for calls and jumps to global or undefined
-symbols. The
-object model and ELF writer also support `R_X86_64_64` (1), but lasm has no
-syntax that produces it yet (`.quad sym` is not supported).
+**Absolute data** (`.quad SYM±N`) is never patched by lasm, since the address
+is only known at link time. It is always an `R_X86_64_64` relocation:
+
+| Target symbol | Relocation |
+|---|---|
+| Local (including `.L` labels), any section | against the target section's `STT_SECTION` symbol, addend = N + the label's offset |
+| Global, defined or undefined | against the symbol, addend = N |
+
+This matches GNU `as`. The code generators use it for struct descriptors
+(tables of name and function addresses). In a PIE the linker turns each one
+into an `R_X86_64_RELATIVE` dynamic relocation.
+
+Relocation types emitted: `R_X86_64_64` (1, `.quad SYM` only),
+`R_X86_64_PC32` (2) and `R_X86_64_PLT32` (4). `R_X86_64_PLT32` is used only
+for calls and jumps to global or undefined symbols.
+
+When an object has relocations in several sections, each `.rela.X` lists its
+own section's relocations in the order above. lasm creates sections in order
+of first use, while GNU `as` always creates `.text`, `.data` and `.bss` first,
+so the *order of the `.rela` sections* may differ; the conformance tests
+compare relocations grouped by section.
 
 ## 10. Object output
 
@@ -508,7 +526,7 @@ Representative messages:
 | Test | What it checks |
 |---|---|
 | `tests/unit/test_asm.c` | Encodings of individual instructions against expected bytes. It also covers relaxation: the ±127/128 boundaries both ways, jcc, cascades, external targets and same-section globals. Plus data directives, relocations and error messages. |
-| `tests/asm/coverage.s` | Every directive and instruction family, assembled by lasm and by GNU `as`. Section bytes and relocations must be identical. |
+| `tests/asm/coverage.s` | Every directive and instruction family (including `call r64` and a `.quad` table of local, global and undefined symbols with offsets), assembled by lasm and by GNU `as`. Section bytes and relocations must be identical. |
 | `tests/asm/gen_forms.py` | About 5,700 generated forms, compared the same way:<br>• every base register with every displacement class;<br>• base + index × scale, index-only;<br>• RIP-relative with trailing immediates;<br>• byte registers;<br>• the setcc, movzx, test, imul, shift, neg, idiv and memory-immediate forms. |
 | `tests/asm/answer.s` | A lasm object linked into a C program and run. |
 | every compiled program | `tests/run_e2e.sh` and `tests/difftest.py` assemble each generated `.s` with GNU `as` too and require identical bytes (validation only). |
