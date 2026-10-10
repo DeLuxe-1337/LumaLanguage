@@ -61,6 +61,13 @@ int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len) {
     return g;
 }
 
+int ir_add_var(IrModule *m, const char *name) { return add_global(m, IRG_VAR, name); }
+
+const char *ir_var_display_name(const char *name) {
+    const char *dot = strchr(name, '.');
+    return dot && dot[1] ? dot + 1 : name;
+}
+
 int ir_add_func(IrModule *m, const char *name, int nparams) {
     int g = add_global(m, IRG_FUNC, name);
     m->funcs = xrealloc(m->funcs, (size_t)(m->nfuncs + 1) * sizeof *m->funcs);
@@ -190,6 +197,8 @@ const char *ir_op_name(IrOp op) {
     case IR_NEG: return "neg";
     case IR_NOT: return "not";
     case IR_CALL: return "call";
+    case IR_LOAD: return "load";
+    case IR_STORE: return "store";
     case IR_JMP: return "jmp";
     case IR_BR: return "br";
     case IR_RET: return "ret";
@@ -255,6 +264,8 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
         for (int i = 0; i < in->nargs; i++) buf_printf(out, "%s%%%s", i ? ", " : "", vname(f, in->args[i]));
         buf_printf(out, ")");
         break;
+    case IR_LOAD: buf_printf(out, "load @%s", gname(m, in->global)); break;
+    case IR_STORE: buf_printf(out, "store @%s, %%%s", gname(m, in->global), vname(f, in->a)); break;
     case IR_JMP: buf_printf(out, "jmp %s", bname(f, in->target[0])); break;
     case IR_BR:
         buf_printf(out, "br %%%s, %s, %s", vname(f, in->a), bname(f, in->target[0]), bname(f, in->target[1]));
@@ -291,6 +302,8 @@ void ir_print_module(const IrModule *m, Buf *out) {
         first = false;
         if (g->kind == IRG_EXTERN) {
             buf_printf(out, "extern fn @%s(%d)\n", g->name, g->arity);
+        } else if (g->kind == IRG_VAR) {
+            buf_printf(out, "global @%s\n", g->name);
         } else {
             buf_printf(out, "data @%s = str ", g->name);
             print_string(out, g->data, g->data_len);

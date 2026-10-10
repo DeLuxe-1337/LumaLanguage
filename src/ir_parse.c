@@ -351,6 +351,12 @@ static bool parse_instr(P *p, int fi, int bi) {
             in->line = line;
             return parse_call_tail(p, fi, bi);
         }
+        if (strcmp(op, "load") == 0) {
+            IrInstr *in = ir_emit(f, bi, IR_LOAD);
+            in->dst = dst;
+            in->line = line;
+            return take_global_ref(p, fi, bi, f->blocks[bi].n - 1);
+        }
         perr(p, line, "unknown operation '%s'", op);
         return false;
     }
@@ -359,6 +365,17 @@ static bool parse_instr(P *p, int fi, int bi) {
         IrInstr *in = ir_emit(f, bi, IR_CALL);
         in->line = line;
         return parse_call_tail(p, fi, bi);
+    }
+    if (is_ident(p, "store")) {
+        next(p);
+        IrInstr *in = ir_emit(f, bi, IR_STORE);
+        in->line = line;
+        int ii = f->blocks[bi].n - 1;
+        if (!take_global_ref(p, fi, bi, ii) || !expect_punct(p, ',')) return false;
+        int v;
+        if (!take_vreg(p, f, &v)) return false;
+        p->m->funcs[fi].blocks[bi].instrs[ii].a = v;
+        return true;
     }
     if (is_ident(p, "jmp")) {
         next(p);
@@ -539,10 +556,18 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
             out->globals[g].line = line;
             next(&p);
             if (!expect_nl(&p)) goto fail;
+        } else if (is_ident(&p, "global")) {
+            next(&p);
+            if (p.tok.kind != T_GLOBAL) { perr(&p, p.tok.line, "expected global name"); goto fail; }
+            if (ir_find_global(out, p.tok.text) >= 0) { perr(&p, p.tok.line, "duplicate global '@%s'", p.tok.text); goto fail; }
+            int g = ir_add_var(out, p.tok.text);
+            out->globals[g].line = line;
+            next(&p);
+            if (!expect_nl(&p)) goto fail;
         } else if (is_ident(&p, "fn")) {
             if (!parse_function(&p)) goto fail;
         } else {
-            perr(&p, line, "expected 'extern', 'data' or 'fn', found %s", tok_desc(&p.tok));
+            perr(&p, line, "expected 'extern', 'data', 'global' or 'fn', found %s", tok_desc(&p.tok));
             goto fail;
         }
     }

@@ -27,6 +27,8 @@ typedef enum {
     IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE,
     IR_NEG, IR_NOT, /* dst = op a */
     IR_CALL,        /* [dst =] global(args...) */
+    IR_LOAD,        /* dst = value of global variable (runtime error if never assigned) */
+    IR_STORE,       /* global variable = a   (no dst) */
     /* terminators */
     IR_JMP,         /* target[0] */
     IR_BR,          /* a truthy ? target[0] : target[1] */
@@ -40,7 +42,7 @@ typedef struct {
     int dst;        /* vreg or IR_NONE */
     int a, b;       /* operand vregs or IR_NONE */
     int64_t imm;    /* IR_CONST_INT */
-    int global;     /* IR_CONST_DATA / IR_CALL: index into module globals */
+    int global;     /* IR_CONST_DATA / IR_CALL / IR_LOAD / IR_STORE: index into module globals */
     int *args;      /* IR_CALL: vregs (owned) */
     int nargs;
     int target[2];  /* IR_JMP / IR_BR: block indices */
@@ -53,7 +55,7 @@ typedef struct {
     int n, cap;
 } IrBlock;
 
-typedef enum { IRG_FUNC, IRG_EXTERN, IRG_DATA } IrGlobalKind;
+typedef enum { IRG_FUNC, IRG_EXTERN, IRG_DATA, IRG_VAR } IrGlobalKind;
 
 typedef struct {
     IrGlobalKind kind;
@@ -89,6 +91,10 @@ void ir_module_free(IrModule *m);
 int ir_find_global(const IrModule *m, const char *name);
 int ir_add_extern(IrModule *m, const char *name, int arity);  /* returns global index */
 int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len);
+int ir_add_var(IrModule *m, const char *name);                /* module-level variable slot */
+/* Name used in runtime messages for a global variable: the part after the
+ * first '.', so lowering's "var.count" is reported as "count". */
+const char *ir_var_display_name(const char *name);
 int ir_add_func(IrModule *m, const char *name, int nparams);  /* returns func index */
 int ir_func_vreg(IrFunc *f, const char *name);                /* find or create by name */
 int ir_func_new_vreg(IrFunc *f, const char *name);            /* create; caller guarantees uniqueness */

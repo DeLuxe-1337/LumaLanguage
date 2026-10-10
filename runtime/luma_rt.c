@@ -11,11 +11,14 @@
  *
  * Memory: strings created at runtime (concatenation) are allocated with
  * malloc and never freed. There is no GC in v0.1. */
+#define _XOPEN_SOURCE 700 /* sigaction, sigaltstack, SA_ONSTACK (XSI) */
 #include <inttypes.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../src/value.h"
 
@@ -61,20 +64,44 @@ static void need_numbers(LumaValue a, LumaValue b) {
     if (!is_fixnum(a) || !is_fixnum(b)) luma_panic("Operands must be numbers.");
 }
 
-/* ---- printing ---------------------------------------------------------- */
+/* ---- printing ----------------------------------------------------------
+ * The builtin print(a, b, ...) lowers to
+ *     luma_write(a); luma_write_space(); luma_write(b); ...; luma_write_newline();
+ * luma_print(v) (= write + newline) is kept for hand-written LIR. */
 
-LumaValue luma_print(LumaValue v) {
+LumaValue luma_write(LumaValue v) {
     check_valid(v);
-    if (is_fixnum(v)) printf("%" PRId64 "\n", fixnum_val(v));
-    else if (v == LUMA_NIL) puts("nil");
-    else if (v == LUMA_TRUE) puts("true");
-    else if (v == LUMA_FALSE) puts("false");
+    if (is_fixnum(v)) printf("%" PRId64, fixnum_val(v));
+    else if (v == LUMA_NIL) fputs("nil", stdout);
+    else if (v == LUMA_TRUE) fputs("true", stdout);
+    else if (v == LUMA_FALSE) fputs("false", stdout);
     else if (is_string(v)) {
         const LumaString *s = as_string(v);
         fwrite(s->bytes, 1, s->len, stdout);
-        putchar('\n');
     } else luma_panic("cannot print value of unknown type");
     return LUMA_NIL;
+}
+
+LumaValue luma_write_space(void) {
+    putchar(' ');
+    return LUMA_NIL;
+}
+
+LumaValue luma_write_newline(void) {
+    putchar('\n');
+    return LUMA_NIL;
+}
+
+LumaValue luma_print(LumaValue v) {
+    luma_write(v);
+    return luma_write_newline();
+}
+
+/* Called by a checked `load` of a global slot that was never assigned. */
+_Noreturn void luma_undefined_variable(const char *name) {
+    fflush(stdout);
+    fprintf(stderr, "luma: runtime error: Undefined variable '%s'.\n", name);
+    exit(1);
 }
 
 /* ---- arithmetic -------------------------------------------------------- */
@@ -171,7 +198,38 @@ LumaValue luma_ge(LumaValue a, LumaValue b) { need_numbers(a, b); return make_bo
 
 /* ---- process entry ----------------------------------------------------- */
 
+/* Unbounded recursion overflows the native stack. The fault is caught on an
+ * alternate signal stack and reported as a Luma runtime error instead of a
+ * bare "Segmentation fault". Any SIGSEGV in a Luma program is reported this
+ * way; generated code never dereferences memory other than its own frame,
+ * globals and runtime objects, so the stack is by far the likely cause. */
+static char alt_stack[64 * 1024];
+
+static void on_segv(int sig) {
+    (void)sig;
+    static const char msg[] = "luma: runtime error: Stack overflow.\n";
+    fflush(stdout); /* best effort: keep output printed before the overflow */
+    ssize_t r = write(2, msg, sizeof msg - 1);
+    (void)r;
+    _exit(1);
+}
+
+static void install_stack_guard(void) {
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = alt_stack;
+    ss.ss_size = sizeof alt_stack;
+    if (sigaltstack(&ss, NULL) != 0) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_segv;
+    sa.sa_flags = SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+}
+
 int main(void) {
+    install_stack_guard();
     luma_main();
     if (fflush(stdout) != 0) return 1; /* e.g. writing to a closed pipe/full disk */
     return 0;

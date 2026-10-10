@@ -39,7 +39,7 @@ static bool vreg_ok(const IrFunc *f, int r) { return r >= 0 && r < f->nvregs; }
 /* Calls fn(ctx, vreg) for every vreg the instruction reads. */
 static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) {
     switch (in->op) {
-    case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET:
+    case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE:
         fn(ctx, in->a);
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
@@ -54,7 +54,7 @@ static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) 
     }
 }
 
-static bool op_has_dst(IrOp op) { return !ir_op_is_terminator(op) && op != IR_CALL; }
+static bool op_has_dst(IrOp op) { return !ir_op_is_terminator(op) && op != IR_CALL && op != IR_STORE; }
 
 /* ---- structural checks for one instruction ---- */
 typedef struct { V *v; const IrFunc *f; int b; const IrInstr *in; } UseCtx;
@@ -70,8 +70,8 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
         verr(v, f, b, in, "'%s' needs a destination register", ir_op_name(in->op));
     if (in->op == IR_CALL && in->dst != IR_NONE && !vreg_ok(f, in->dst))
         verr(v, f, b, in, "call has an invalid destination register");
-    if (ir_op_is_terminator(in->op) && in->dst != IR_NONE)
-        verr(v, f, b, in, "terminator '%s' cannot have a destination", ir_op_name(in->op));
+    if ((ir_op_is_terminator(in->op) || in->op == IR_STORE) && in->dst != IR_NONE)
+        verr(v, f, b, in, "'%s' cannot have a destination", ir_op_name(in->op));
     UseCtx c = {v, f, b, in};
     for_each_use(in, check_use_index, &c);
     switch (in->op) {
@@ -84,13 +84,18 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
         else if (m->globals[in->global].kind != IRG_DATA)
             verr(v, f, b, in, "'const @%s' must reference a data global", m->globals[in->global].name);
         break;
+    case IR_LOAD: case IR_STORE:
+        if (in->global < 0 || in->global >= m->nglobals) verr(v, f, b, in, "'%s' references an undefined global", ir_op_name(in->op));
+        else if (m->globals[in->global].kind != IRG_VAR)
+            verr(v, f, b, in, "'%s @%s' must reference a 'global' variable", ir_op_name(in->op), m->globals[in->global].name);
+        break;
     case IR_CALL: {
         if (in->global < 0 || in->global >= m->nglobals) {
             verr(v, f, b, in, "call to an undefined global");
             break;
         }
         const IrGlobal *g = &m->globals[in->global];
-        if (g->kind == IRG_DATA) verr(v, f, b, in, "cannot call data global '@%s'", g->name);
+        if (g->kind == IRG_DATA || g->kind == IRG_VAR) verr(v, f, b, in, "cannot call non-function global '@%s'", g->name);
         else if (in->nargs != g->arity)
             verr(v, f, b, in, "call to '@%s' passes %d argument%s, expected %d", g->name, in->nargs,
                  in->nargs == 1 ? "" : "s", g->arity);

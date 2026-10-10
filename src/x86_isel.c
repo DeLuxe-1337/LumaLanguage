@@ -32,6 +32,8 @@ static void emit_preview(Buf *out, const char *s, size_t n) {
     if (n > 48) buf_printf(out, "...");
 }
 
+static int load_labels; /* unique suffix for the labels of checked loads */
+
 static int64_t slot(int v) { return -8 * ((int64_t)v + 1); }
 
 static void load(Buf *out, const char *reg, int v) { buf_printf(out, "    mov %s, [rbp - %" PRId64 "]\n", reg, -slot(v)); }
@@ -92,6 +94,24 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         if (in->dst != IR_NONE) store(out, in->dst, "rax");
         break;
     }
+    case IR_LOAD: {
+        /* A slot still holding 0 (never a valid value) was never assigned:
+         * e.g. a function read a top-level variable before its declaration ran. */
+        const char *g = m->globals[in->global].name;
+        int n = load_labels++;
+        buf_printf(out, "    mov rax, [rip + .Lvar.%s]\n", g);
+        buf_printf(out, "    test rax, rax\n");
+        buf_printf(out, "    jne .Lload_ok.%d\n", n);
+        buf_printf(out, "    lea rdi, [rip + .Lvarname.%s]\n", g);
+        buf_printf(out, "    call luma_undefined_variable@PLT\n");
+        buf_printf(out, ".Lload_ok.%d:\n", n);
+        store(out, in->dst, "rax");
+        break;
+    }
+    case IR_STORE:
+        load(out, "rax", in->a);
+        buf_printf(out, "    mov [rip + .Lvar.%s], rax\n", m->globals[in->global].name);
+        break;
     case IR_JMP:
         if (in->target[0] != b + 1) jump(out, "jmp", m, f, in->target[0]);
         break;
@@ -157,6 +177,28 @@ void x86_emit_module(const IrModule *m, Buf *out) {
         if (g->data_len) emit_ascii(out, g->data, g->data_len);
         buf_printf(out, "    .byte 0\n");
     }
+    /* Global variables: an 8-byte slot in .data, zero (= "unassigned") until
+     * first stored, plus the display name used in "Undefined variable" errors. */
+    bool any_var = false;
+    for (int i = 0; i < m->nglobals; i++) {
+        const IrGlobal *g = &m->globals[i];
+        if (g->kind != IRG_VAR) continue;
+        if (!any_var) buf_printf(out, "\n    .data\n    .p2align 3\n");
+        any_var = true;
+        buf_printf(out, ".Lvar.%s:\n    .quad 0\n", g->name);
+    }
+    if (any_var) {
+        buf_printf(out, "\n    .section .rodata\n");
+        for (int i = 0; i < m->nglobals; i++) {
+            const IrGlobal *g = &m->globals[i];
+            if (g->kind != IRG_VAR) continue;
+            const char *dn = ir_var_display_name(g->name);
+            buf_printf(out, ".Lvarname.%s:\n", g->name);
+            emit_ascii(out, dn, strlen(dn));
+            buf_printf(out, "    .byte 0\n");
+        }
+    }
+    load_labels = 0;
     for (int i = 0; i < m->nglobals; i++)
         if (m->globals[i].kind == IRG_FUNC) emit_func(m, &m->funcs[m->globals[i].func], out);
     buf_printf(out, "\n    .section .note.GNU-stack\n");
