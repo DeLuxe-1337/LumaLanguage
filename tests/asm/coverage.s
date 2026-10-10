@@ -963,4 +963,19 @@ m2:
 .Lfar:
     ret
 
+# Relocation order and type: GNU as emits the relocations of relaxed jumps
+# after all others, and uses PC32 (not PLT32) for calls and jumps to a local
+# label in another section.
+    jmp external_a
+    call external_b
+    je external_c
+    lea rax, [rip + external_d]
+    jmp .Lin_rodata
+    call .Lin_rodata
+    ret
+
+    .section .rodata
+.Lin_rodata:
+    .byte 0
+
     .section .note.GNU-stack

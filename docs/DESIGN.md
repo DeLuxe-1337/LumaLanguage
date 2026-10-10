@@ -12,7 +12,7 @@ This document describes how the Luma toolchain is built. Its sections cover:
 - linking
 
 The intermediate representation (LIR) has its own specification in
-[IR.md](IR.md).
+[IR.md](IR.md), and the assembler in [LASM.md](LASM.md).
 
 ## Pipeline and modules
 
@@ -452,125 +452,22 @@ external assembler.
 
 ## Assembler (`src/asm.c`)
 
-### Syntax accepted
+The assembler (lasm) has its own specification, [LASM.md](LASM.md). It
+covers the accepted syntax, sections and directives, the operand forms, every
+instruction with its encoding, branch relaxation, symbol resolution and
+relocations, and the diagnostics. In short:
 
-- `label:` (several per line allowed), then `mnemonic op, op` or `.directive args`.
-- `#` starts a comment. A `#` inside a string literal does not.
-- Registers: the 64-bit GPRs `rax`…`r15` and the 32-bit GPRs `eax`…`r15d`.
-- Immediates: decimal, `0x` hex, leading-`0` octal, and negative numbers.
-- Memory operands come in two forms:
-  - `[rip + sym ± n]` or `[rip ± n]`
-  - `[rbp ± n]`
-
-  Any other base register, and any index register, is rejected. This keeps
-  SIB encoding out, because `rsp` as a base would need it.
-- Branch and call targets: `sym` or `sym@PLT`.
-
-### Instructions and encodings
-
-| Form | Encoding | Notes |
-|---|---|---|
-| `ret` / `nop` | `C3` / `90` | |
-| `push r64` / `pop r64` | `[41] 50+r` / `[41] 58+r` | REX.B for r8–r15 |
-| `mov r, r` (32/64) | `[REX] 89 /r` | ModRM mod=11, reg=src, rm=dst (same choice as GAS) |
-| `mov r64, [mem]` / `mov [mem], r64` | `REX.W 8B /r` / `REX.W 89 /r` | |
-| `lea r64, [mem]` | `REX.W 8D /r` | |
-| `mov r32, imm32` | `[41] B8+r id` | zero-extends |
-| `mov r64, imm` | `REX.W C7 /0 id` when the value fits a sign-extended imm32; otherwise `REX.W B8+r io` | the same choices GAS makes |
-| `add/or/and/sub/xor/cmp r, r` | `[REX] 01/09/21/29/31/39 /r` | |
-| `add/or/and/sub/xor/cmp r, imm` | `83 /n ib` if the value fits imm8; else `05/0D/25/2D/35/3D id` when the register is `rax`/`eax` (accumulator forms, as GAS chooses); else `81 /n id` | |
-| `test r, r` | `[REX] 85 /r` | |
-| `test r, imm32` | `A9 id` (rax/eax) or `F7 /0 id` | no imm8 form exists |
-| `call sym` | `E8 cd` | |
-| `jmp sym` | `EB cb` or `E9 cd` | relaxed, see below |
-| `jcc sym` (all 30 aliases: `je jz jne jnz jl jge jo …`) | `7x cb` or `0F 8x cd` | relaxed |
-
-**Memory ModRM.** The memory forms use rm=101 in every case:
-
-| Operand | ModRM | Displacement |
-|---|---|---|
-| `[rip+disp32]` | mod=00 | 32-bit |
-| `[rbp+disp8]` | mod=01 | 8-bit |
-| `[rbp+disp32]` | mod=10 | 32-bit |
-
-`[rbp]` must be encoded with a zero disp8, because mod=00 with rm=101 means RIP-relative.
-
-### Directives
-
-`.intel_syntax noprefix`, `.text`, `.data`, `.section NAME`, `.globl`/`.global`,
-`.extern`, `.type sym, @function|@object`, `.size sym, .-sym | N`,
-`.byte`/`.quad` (up to 16 values per line), `.ascii`, `.asciz`/`.string`,
-`.p2align N`.
-
-`.p2align` is accepted only in data sections, where it pads with zeros. GNU
-`as` pads code with specific multi-byte NOP sequences, so supporting `.p2align`
-in code would mean copying GNU's NOP table.
-
-String escapes in directives: `\n \t \r \" \\` and 1–3 digit octal.
-
-### Sections
-
-| Name | sh_type | Flags | Align |
-|---|---|---|---|
-| `.text` | PROGBITS | AX | 16 |
-| `.rodata` | PROGBITS | A | 1, raised by `.p2align` |
-| `.data` | PROGBITS | WA | 1, raised by `.p2align` |
-| `.note.GNU-stack` | PROGBITS | none | 1 |
-
-The empty `.note.GNU-stack` section marks the object as not needing an
-executable stack. Code placed before any section directive goes into `.text`.
-An instruction in a section without the execute flag is an error.
-
-### Branch relaxation
-
-GNU `as` emits a short `rel8` jump whenever its target is within range. To stay
-byte-identical, lasm does the same by assembling the source in full passes:
-
-1. **First pass:** every jump to a label is emitted in its 2-byte short form.
-2. **Resolve:** a short jump is marked long for the next pass when its target is
-   any of the following:
-   - out of rel8 range
-   - in another section
-   - global
-   - undefined
-3. **Repeat:** the source is assembled again until a pass marks nothing new.
-
-Jumps only ever grow, so the loop reaches a fixed point within (number of
-jumps + 1) passes. Unit tests cover:
-
-- the ±127/128 boundaries in both directions
-- jcc forms
-- external targets
-- a cascade, where growing one jump pushes another out of range
-
-`tests/asm/coverage.s` includes the same cases and is compared byte for byte
-against GNU `as`.
-
-### Symbols and fixup resolution
-
-(Since milestone 5, a `jmp`/`jcc` to a **global** symbol defined in the same
-section is resolved locally and relaxed like a local label, as GNU `as`
-does; tail calls rely on this. Calls to such symbols keep their `PLT32`
-relocation.)
-
-Every PC-relative field (rel8 or rel32) is the last field of its instruction,
-so `P + size` is the address of the next instruction. The stored addend is
-therefore `(operand constant) − size`. Each fixup is resolved as follows:
-
-| Target | Result |
-|---|---|
-| Local (not `.globl`), same section | Patched in place with `S + A − P`, with no relocation. Short jumps must also fit in rel8. |
-| Local, different section | Relocation against that section's `STT_SECTION` symbol, with `addend += symbol offset`. This is how `.L` labels, which never appear in `.symtab`, are referenced across sections. |
-| Global and defined | Relocation against the symbol itself, which keeps it preemptible (as GAS does). |
-| Undefined | Marked global (external) and relocated against the symbol. |
-| An undefined `.L` label | An error. |
-
-Relocation types:
-
-- `R_X86_64_PC32` for `[rip + sym]` memory operands.
-- `R_X86_64_PLT32` for `call` and long `jmp`/`jcc` to symbols that aren't resolved locally.
-
-The ELF writer can also emit `R_X86_64_64`, but the assembler doesn't produce it yet.
+- **Dialect:** a strict subset of GNU `as` Intel syntax. lasm must produce the
+  same bytes and relocations as GNU `as` for every input it accepts, and the
+  tests check this for every compiled program and about 5,700 generated forms.
+- **Operands:** registers of 8, 32 and 64 bits, and full ModRM/SIB memory
+  operands (`[base + index*scale + disp]`, `[rip + sym]`).
+- **Instructions:** `mov`, `movzx`, `lea`, the ALU group, `test`, `imul`,
+  `neg`/`not`/`idiv`, shifts, `setcc`, `cmovcc`, `cqo`, `push`/`pop`, `call`,
+  `jmp`/`jcc` (relaxed in passes, as GNU `as` does), `ret` and `nop`.
+- **Relocations:** `R_X86_64_PC32` for RIP-relative operands and local
+  targets, and `R_X86_64_PLT32` for calls and jumps to global or undefined
+  symbols. `.L` labels never reach the symbol table.
 
 ## ELF64 writer (`src/elf_writer.c`)
 

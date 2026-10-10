@@ -1101,9 +1101,9 @@ static void mark_long(Asm *a, size_t jump) {
 
 /* Resolves every recorded fixup after all labels are known.
  *  - Local symbol in the same section: patched now (S + A - P); no relocation.
- *  - Local symbol in another section: relocation against that section's
- *    section symbol with addend += symbol offset (".L" names never reach the
- *    symbol table).
+ *  - Local symbol in another section: R_X86_64_PC32 (also for calls and
+ *    jumps) against that section's section symbol with addend += symbol
+ *    offset (".L" names never reach the symbol table).
  *  - Global or undefined symbol: relocation against the symbol itself, so the
  *    linker (or dynamic linker) can interpose/resolve it.
  *  - Jumps (rel8 and rel32) to a symbol defined in their own section are
@@ -1111,7 +1111,12 @@ static void mark_long(Asm *a, size_t jump) {
  *    their relocation). Short jumps must also be in range; otherwise they are
  *    marked long for the next pass. */
 static void resolve_fixups(Asm *a) {
-    for (size_t i = 0; i < a->nfixups; i++) {
+    /* GNU as creates the relocations of long (relaxed) jumps only when it
+     * finishes relaxation, after all others; lasm emits them in the same
+     * order so that the relocation tables are identical. */
+    for (size_t k = 0; k < 2 * a->nfixups; k++) {
+        size_t i = k % a->nfixups;
+        if ((k < a->nfixups) == (a->fixups[i].kind == FX_JMP32)) continue;
         Fixup *f = &a->fixups[i];
         ObjSymbol *s = &a->o->symbols[f->symbol];
         a->line = f->line;
@@ -1139,7 +1144,8 @@ static void resolve_fixups(Asm *a) {
             }
             buf_patch_u32(&a->o->sections[f->section].data, f->offset, (uint32_t)v);
         } else if (!s->global) {
-            obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, rtype, -1, s->section,
+            /* a local target needs no PLT: calls and jumps to it use PC32 too */
+            obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, OBJ_R_X86_64_PC32, -1, s->section,
                                            f->addend + (int64_t)s->value});
         } else {
             obj_add_reloc(a->o, (ObjReloc){f->section, f->offset, rtype, f->symbol, -1, f->addend});

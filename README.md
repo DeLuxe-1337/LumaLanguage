@@ -89,6 +89,9 @@ The standalone assembler takes assembly directly:
 ./build/lasm file.s -o file.o
 ```
 
+Its input language, encodings and relocation rules are specified in
+[docs/LASM.md](docs/LASM.md).
+
 ## The language today
 
 | | |
@@ -187,4 +190,5 @@ tests/      unit/, pos/, neg/, rt/, ir/, ffi/, asm/, run_e2e.sh, difftest.py
 bench/      benchmark programs and run.py
 docs/       DESIGN.md: pipeline, language, runtime, optimizer, backends, assembler, ELF, linking
             IR.md:     LIR specification
+            LASM.md:   assembler specification (syntax, encodings, relocations)
 ```
