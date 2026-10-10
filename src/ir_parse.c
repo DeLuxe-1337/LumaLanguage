@@ -161,7 +161,7 @@ static void next(P *p) {
         t->kind = T_STRING;
         return;
     }
-    if (strchr("(){},=:", c)) {
+    if (strchr("(){},=:?", c)) {
         p->pos++;
         t->kind = T_PUNCT;
         t->text[0] = (char)c;
@@ -530,6 +530,53 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
         int line = p.tok.line;
         if (is_ident(&p, "extern")) {
             next(&p);
+            if (is_ident(&p, "c")) { /* extern c fn @name(p: ctype, ...): ctype */
+                next(&p);
+                if (!expect_ident(&p, "fn")) goto fail;
+                if (p.tok.kind != T_GLOBAL) { perr(&p, p.tok.line, "expected global name"); goto fail; }
+                if (ir_find_global(out, p.tok.text) >= 0) { perr(&p, p.tok.line, "duplicate global '@%s'", p.tok.text); goto fail; }
+                char name[256];
+                snprintf(name, sizeof name, "%s", p.tok.text);
+                next(&p);
+                if (!expect_punct(&p, '(')) goto fail;
+                CType types[64];
+                char pnames[64][256];
+                const char *pn[64];
+                int np = 0;
+                while (!is_punct(&p, ')')) {
+                    if (np > 0 && !expect_punct(&p, ',')) goto fail;
+                    if (np == 64) { perr(&p, p.tok.line, "too many parameters"); goto fail; }
+                    if (p.tok.kind != T_IDENT) { perr(&p, p.tok.line, "expected parameter name"); goto fail; }
+                    snprintf(pnames[np], 256, "%s", p.tok.text);
+                    pn[np] = pnames[np];
+                    next(&p);
+                    if (!expect_punct(&p, ':')) goto fail;
+                    if (p.tok.kind != T_IDENT) { perr(&p, p.tok.line, "expected a C type"); goto fail; }
+                    char tn[256];
+                    snprintf(tn, sizeof tn, "%s", p.tok.text);
+                    int tline = p.tok.line;
+                    next(&p);
+                    bool opt = is_punct(&p, '?');
+                    if (opt) next(&p);
+                    if (!ctype_from_name(tn, opt, &types[np])) { perr(&p, tline, "unknown C type '%s%s'", tn, opt ? "?" : ""); goto fail; }
+                    np++;
+                }
+                next(&p);
+                if (!expect_punct(&p, ':')) goto fail;
+                if (p.tok.kind != T_IDENT) { perr(&p, p.tok.line, "expected a C return type"); goto fail; }
+                char rn[256];
+                snprintf(rn, sizeof rn, "%s", p.tok.text);
+                int rline = p.tok.line;
+                next(&p);
+                bool ropt = is_punct(&p, '?');
+                if (ropt) next(&p);
+                CType ret;
+                if (!ctype_from_name(rn, ropt, &ret)) { perr(&p, rline, "unknown C type '%s%s'", rn, ropt ? "?" : ""); goto fail; }
+                if (!expect_nl(&p)) goto fail;
+                int g = ir_add_cextern(out, name, np, types, pn, ret);
+                out->globals[g].line = line;
+                continue;
+            }
             if (!expect_ident(&p, "fn")) goto fail;
             if (p.tok.kind != T_GLOBAL) { perr(&p, p.tok.line, "expected global name"); goto fail; }
             if (ir_find_global(out, p.tok.text) >= 0) { perr(&p, p.tok.line, "duplicate global '@%s'", p.tok.text); goto fail; }

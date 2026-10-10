@@ -55,7 +55,20 @@ typedef struct {
     int n, cap;
 } IrBlock;
 
-typedef enum { IRG_FUNC, IRG_EXTERN, IRG_DATA, IRG_VAR } IrGlobalKind;
+typedef enum { IRG_FUNC, IRG_EXTERN, IRG_DATA, IRG_VAR, IRG_CEXTERN } IrGlobalKind;
+
+/* C types for `extern c fn` declarations (the FFI). Calls to such a global
+ * take and return ordinary Luma values; the backend converts at the call site
+ * (docs/IR.md section 16). */
+typedef enum {
+    CT_I8, CT_I16, CT_I32, CT_I64, CT_U8, CT_U16, CT_U32, CT_U64,
+    CT_BOOL, CT_CSTR, CT_CSTR_OPT, CT_PTR, CT_VOID,
+    CT_COUNT
+} CType;
+
+/* "i32", "cstr?", ... ; and the reverse (returns false if unknown). */
+const char *ctype_name(CType t);
+bool ctype_from_name(const char *name, bool nullable, CType *out);
 
 typedef struct {
     IrGlobalKind kind;
@@ -64,6 +77,9 @@ typedef struct {
     int func;         /* IRG_FUNC: index into IrModule.funcs */
     char *data;       /* IRG_DATA: string bytes (owned, NUL-terminated) */
     size_t data_len;
+    CType *cparams;   /* IRG_CEXTERN: parameter C types (arity entries, owned) */
+    char **cnames;    /* IRG_CEXTERN: parameter names, for runtime messages (owned) */
+    CType cret;       /* IRG_CEXTERN: return C type */
     int line;
 } IrGlobal;
 
@@ -92,6 +108,8 @@ int ir_find_global(const IrModule *m, const char *name);
 int ir_add_extern(IrModule *m, const char *name, int arity);  /* returns global index */
 int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len);
 int ir_add_var(IrModule *m, const char *name);                /* module-level variable slot */
+/* A C function: params/names have `arity` entries (copied). */
+int ir_add_cextern(IrModule *m, const char *name, int arity, const CType *params, const char *const *names, CType ret);
 /* Name used in runtime messages for a global variable: the part after the
  * first '.', so lowering's "var.count" is reported as "count". */
 const char *ir_var_display_name(const char *name);

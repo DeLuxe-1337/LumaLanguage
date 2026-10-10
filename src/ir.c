@@ -23,8 +23,13 @@ void ir_module_free(IrModule *m) {
         free(f->blocks);
     }
     for (int i = 0; i < m->nglobals; i++) {
-        free(m->globals[i].name);
-        free(m->globals[i].data);
+        IrGlobal *g = &m->globals[i];
+        if (g->kind == IRG_CEXTERN)
+            for (int k = 0; k < g->arity; k++) free(g->cnames[k]);
+        free(g->cnames);
+        free(g->cparams);
+        free(g->name);
+        free(g->data);
     }
     free(m->funcs);
     free(m->globals);
@@ -62,6 +67,42 @@ int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len) {
 }
 
 int ir_add_var(IrModule *m, const char *name) { return add_global(m, IRG_VAR, name); }
+
+static const char *const CTYPE_NAMES[CT_COUNT] = {
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "bool", "cstr", "cstr?", "ptr", "void",
+};
+
+const char *ctype_name(CType t) { return (unsigned)t < CT_COUNT ? CTYPE_NAMES[t] : "?"; }
+
+bool ctype_from_name(const char *name, bool nullable, CType *out) {
+    if (nullable) {
+        if (strcmp(name, "cstr") != 0) return false; /* only cstr? has a nullable form */
+        *out = CT_CSTR_OPT;
+        return true;
+    }
+    for (int i = 0; i < CT_COUNT; i++) {
+        if (i == CT_CSTR_OPT) continue;
+        if (strcmp(name, CTYPE_NAMES[i]) == 0) {
+            *out = (CType)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+int ir_add_cextern(IrModule *m, const char *name, int arity, const CType *params, const char *const *names, CType ret) {
+    int g = add_global(m, IRG_CEXTERN, name);
+    IrGlobal *gl = &m->globals[g];
+    gl->arity = arity;
+    gl->cret = ret;
+    gl->cparams = xmalloc((size_t)(arity ? arity : 1) * sizeof *gl->cparams);
+    gl->cnames = xmalloc((size_t)(arity ? arity : 1) * sizeof *gl->cnames);
+    for (int i = 0; i < arity; i++) {
+        gl->cparams[i] = params[i];
+        gl->cnames[i] = xstrdup(names[i]);
+    }
+    return g;
+}
 
 const char *ir_var_display_name(const char *name) {
     const char *dot = strchr(name, '.');
@@ -308,6 +349,11 @@ void ir_print_module(const IrModule *m, Buf *out) {
             buf_printf(out, "extern fn @%s(%d)\n", g->name, g->arity);
         } else if (g->kind == IRG_VAR) {
             buf_printf(out, "global @%s\n", g->name);
+        } else if (g->kind == IRG_CEXTERN) {
+            buf_printf(out, "extern c fn @%s(", g->name);
+            for (int k = 0; k < g->arity; k++)
+                buf_printf(out, "%s%s: %s", k ? ", " : "", g->cnames[k], ctype_name(g->cparams[k]));
+            buf_printf(out, "): %s\n", ctype_name(g->cret));
         } else {
             buf_printf(out, "data @%s = str ", g->name);
             print_string(out, g->data, g->data_len);

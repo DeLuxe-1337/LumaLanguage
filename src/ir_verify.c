@@ -181,6 +181,14 @@ bool ir_verify(const IrModule *m, const char *path) {
         for (int j = i + 1; j < m->nglobals; j++)
             if (strcmp(m->globals[i].name, m->globals[j].name) == 0)
                 verr(&v, NULL, -1, NULL, "duplicate global '@%s'", m->globals[i].name);
+    for (int i = 0; i < m->nglobals; i++) {
+        const IrGlobal *g = &m->globals[i];
+        if (g->kind != IRG_CEXTERN) continue;
+        if (g->arity > MAX_ARGS)
+            verr(&v, NULL, -1, NULL, "C function '@%s' has more than %d parameters (not supported yet)", g->name, MAX_ARGS);
+        for (int k = 0; k < g->arity; k++)
+            if (g->cparams[k] == CT_VOID) verr(&v, NULL, -1, NULL, "C function '@%s': parameter '%s' cannot be void", g->name, g->cnames[k]);
+    }
     for (int fi = 0; fi < m->nfuncs; fi++) {
         const IrFunc *f = &m->funcs[fi];
         if (f->nblocks == 0) {

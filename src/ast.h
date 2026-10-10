@@ -1,10 +1,14 @@
-/* ast.h - Luma abstract syntax tree (milestone 3).
+/* ast.h - Luma abstract syntax tree (milestone 4).
  *
  *   program     → declaration* EOF
- *   declaration → funDecl | varDecl | statement
- *   funDecl     → "fun" IDENTIFIER "(" parameters? ")" block      (top level only, for now)
- *   parameters  → IDENTIFIER ( "," IDENTIFIER )*
- *   varDecl     → "var" IDENTIFIER ( "=" expression )? ";"
+ *   declaration → funDecl | externDecl | varDecl | statement
+ *   funDecl     → "fun" IDENTIFIER "(" parameters? ")" ( ":" type )? block   (top level only, for now)
+ *   parameters  → param ( "," param )*
+ *   param       → IDENTIFIER ( ":" type )?
+ *   externDecl  → "extern" "fun" IDENTIFIER "(" cparams? ")" ":" type ";"     (top level; C function)
+ *   cparams     → IDENTIFIER ":" type ( "," IDENTIFIER ":" type )*
+ *   type        → ( IDENTIFIER | "nil" ) "?"?
+ *   varDecl     → "var" IDENTIFIER ( ":" type )? ( "=" expression )? ";"
  *   statement   → exprStmt | forStmt | ifStmt | returnStmt | whileStmt | block
  *   returnStmt  → "return" expression? ";"                          (inside functions only)
  *   forStmt     → "for" "(" ( varDecl | exprStmt | ";" ) expression? ";" expression? ")" statement
@@ -24,6 +28,10 @@
  *   call        → primary ( "(" arguments? ")" )*
  *   arguments   → expression ( "," expression )*
  *   primary     → "true" | "false" | "nil" | NUMBER | STRING | "(" expression ")" | IDENTIFIER
+ *
+ * Types are optional and gradual (see docs/DESIGN.md): Luma types are int, str,
+ * bool, nil and any; `T?` means T or nil. Extern declarations use C types
+ * (i8..i64, u8..u64, bool, cstr, cstr?, ptr; void as a return type).
  *
  * Functions are not first-class values yet: a call's callee must be the name
  * of a function (or the builtin `print`), and a function name may only appear
@@ -66,6 +74,13 @@ struct Expr {
     size_t nargs;
 };
 
+/* A type annotation as written. name == NULL means "no annotation". */
+typedef struct {
+    char *name;
+    bool nullable; /* written with a trailing '?' */
+    int line, col;
+} TypeRef;
+
 typedef enum {
     STMT_EXPR,  /* expr */
     STMT_VAR,   /* name, expr (initializer, may be NULL) */
@@ -74,6 +89,7 @@ typedef enum {
     STMT_WHILE, /* expr, body */
     STMT_FUN,   /* name, params, stmts (the body) */
     STMT_RETURN,/* expr (may be NULL: returns nil) */
+    STMT_EXTERN,/* name, params, param_types, type (the C return type) */
 } StmtKind;
 
 typedef struct Stmt Stmt;
@@ -85,9 +101,11 @@ struct Stmt {
     Stmt **stmts;
     size_t n, cap;
     Stmt *then_branch, *else_branch, *body;
-    char **params;  /* STMT_FUN (owned) */
+    char **params;  /* STMT_FUN / STMT_EXTERN (owned) */
     int *param_line, *param_col;
+    TypeRef *param_types; /* STMT_FUN / STMT_EXTERN: one per param */
     size_t nparams;
+    TypeRef type;   /* STMT_VAR: declared type; STMT_FUN / STMT_EXTERN: return type */
 };
 
 typedef struct {
