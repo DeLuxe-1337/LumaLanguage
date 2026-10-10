@@ -1,4 +1,4 @@
-# Luma bootstrap compiler: design notes (milestone 4)
+# Luma bootstrap compiler: design notes (milestone 5)
 
 This document describes how the Luma toolchain is built. Its sections cover:
 
@@ -6,6 +6,7 @@ This document describes how the Luma toolchain is built. Its sections cover:
 - the language subset accepted today
 - optional types and the C FFI
 - the C runtime
+- the optimizer and the two code generators
 - the x86-64 assembler (encodings, relaxation, relocations)
 - the ELF64 object writer
 - linking
@@ -22,9 +23,13 @@ INPUT.luma
    ▼
    │  src/lower.c        AST → LIR: static scoping, short-circuit logic   ──► OUT.lir
    ▼           (INPUT.lir enters here: src/ir_parse.c)
-   │  src/ir_verify.c    structural + definite-assignment checks
+   │  src/ir_verify.c    structural, definite-assignment and type checks
+   ▼           (src/ir_types.c: type inference, shared with the stages below)
+   │  src/opt*.c         -O2: SSA optimizer (src/cfg.c analyses)          ──► OUT.opt.lir
+   │  src/ir_verify.c    the optimized IR must verify too
    ▼
-   │  src/x86_isel.c     LIR → x86-64 assembly text                       ──► OUT.s
+   │  src/x86_gen.c      -O1/-O2: LIR → x86-64, register allocated        ──► OUT.s
+   │  src/x86_isel.c     -O0: LIR → x86-64, one stack slot per vreg
    ▼
    │  src/asm.c          assembly text → ObjFile (src/obj.h)    (reads OUT.s back from disk)
    │  src/elf_writer.c   ObjFile → ELF64 ET_REL bytes                     ──► OUT.o
@@ -49,6 +54,7 @@ Every stage can be inspected or tested on its own:
 |---|---|
 | lexer, parser | `--dump-tokens` / `--dump-ast` |
 | lowering | the `.lir` file |
+| optimizer | `OUT.opt.lir` (`--dump-opt-ir`); `-O1` skips it, `-O0` also uses the naive backend |
 | backend | `.lir` files are accepted as input |
 | assembler | the `lasm` command and `tests/unit/test_asm.c` |
 | ELF writer | `tests/unit/test_elf.c`, which builds an `ObjFile` by hand |
@@ -181,8 +187,12 @@ Further rules:
   otherwise be `nil`.
 - **Global redeclarations** must keep their annotation.
 
-Types don't change code generation yet. A planned optimization will keep
-values whose static type is exactly `int` unboxed in registers.
+Lowering turns the runtime guards into LIR `check` instructions and records
+the declared types in the IR (IR.md section 17). From there, types make code
+faster: the optimizer deletes `check`s that inference proves redundant, and
+the backend skips tag checks on values known to be `int` (for example,
+`fun fib(n: int): int` compiles to plain machine arithmetic plus overflow
+checks).
 
 ## C FFI (`extern fun`)
 
@@ -238,7 +248,8 @@ which calls `luma_main()`, flushes stdout, and exits with status 0.
 | `luma_print` | writes a value and a newline (kept for hand-written LIR) |
 | `luma_add/sub/mul/div/mod/neg/not/eq/ne/lt/le/gt/ge` | generic operations |
 | `luma_undefined_variable(name)` | called by a checked global `load` that finds an unassigned slot |
-| `luma_check_type(v, mask, context)` | the runtime guard at typed boundaries |
+| `luma_check_type(v, mask, context)` | the runtime guard at typed boundaries (returns `v`) |
+| `luma_int_overflow()`, `luma_div_zero()` | noreturn error exits of the inline fast paths |
 | `luma_ffi_arg_<ctype>`, `luma_ffi_ret_<ctype>` | FFI converters, with range and type checks |
 
 The generic operations behave as follows:
@@ -259,14 +270,153 @@ Generated code only touches its own frame, the globals and runtime objects, so
 a fault is almost always the stack. Any other memory fault would be reported
 the same way.
 
-Frames are large for now, because every virtual register has its own stack
-slot. A small recursive function uses about 100 bytes per call, so with the
-default 8 MB stack recursion overflows somewhere between 80,000 and 100,000
-calls deep. The runtime is compiled with
+At `-O0` every virtual register has its own stack slot, so a small recursive
+function uses about 100 bytes per call and overflows the default 8 MB stack
+between 80,000 and 100,000 calls deep. The optimizing backend keeps values in
+registers (a call to `fib` above takes 32 bytes) and turns tail calls into
+jumps, which use no stack at all. The runtime is compiled with
 `RT_CFLAGS`, separate from the compiler's `CFLAGS`, so a sanitizer build of
 the compiler doesn't leak instrumentation into user programs.
 
-## Code generation (`src/x86_isel.c`)
+## Optimizer (`src/opt*.c`, `src/cfg.c`)
+
+`opt_module` (`-O2`) optimizes each function on a copy and keeps the original
+if a pass gives up, so the optimizer can only make code faster, never break
+compilation. The order of passes and what each one does is in IR.md
+section 17. Implementation notes:
+
+- **Analyses** (`cfg.c`): successors and predecessors, reverse postorder,
+  dominators (Cooper–Harvey–Kennedy), dominance frontiers, phi-aware
+  liveness as bitsets, and natural loops (innermost first). The backend
+  reuses the CFG and liveness.
+- **CFG simplification** (`opt_cfg.c`): merges straight-line blocks, threads
+  jumps through empty blocks, removes unreachable code, and duplicates small
+  loop headers into the loop's entry and latch ("loop rotation"), so a
+  `while` loop tests its condition once per iteration at the bottom.
+- **SSA** (`opt_ssa.c`): phis are placed only where the variable is live
+  (pruned SSA) and renamed by a walk over the dominator tree. Leaving SSA uses
+  a fresh temporary per phi, so the lost-copy and swap problems cannot occur.
+  Copy coalescing (Chaitin-style, on the interference of the non-SSA result)
+  then removes most of the copies again.
+- **SCCP** propagates constants and types through phis and prunes branches whose
+  condition is known, including from types alone (a `str` is always truthy).
+  It folds arithmetic only when the runtime would not fail: overflow, division
+  by zero and type errors are left in place to happen at run time.
+- **GVN** numbers expressions within the dominator tree. It merges:
+  - equal expressions;
+  - a `check` that the value's type already proves, or that repeats a
+    dominating check of the same value and type;
+  - within a block, a `load` of a global that was already loaded or stored,
+    with no call to a Luma function in between.
+
+  `add` is treated as commutative only when both operands are `int`
+  (`"a" + "b"` isn't `"b" + "a"`).
+- **LICM** creates loop preheaders. It hoists pure instructions freely, and
+  instructions that may fail only from the loop header before any other
+  effect, so a hoisted error still happens first and only if the loop is
+  entered.
+- **DCE** deletes unused instructions that cannot fail and have no effect.
+  A `sub` whose result is unused stays if it might overflow or fail on a type.
+
+## Code generation: optimizing backend (`src/x86_gen.c`, `-O1`/`-O2`)
+
+The backend runs per function:
+
+1. **Numbering.** Instructions are numbered in layout order (block order,
+   unreachable blocks dropped). Instruction *i* reads its operands at
+   position 2*i* and writes its result at 2*i*+1.
+2. **Intervals.** Each vreg gets one interval: the hull of its liveness
+   (block live-in/live-out and every def and use). Constants with a single
+   definition get no interval; they are **rematerialized** as immediates (or
+   `lea` of a string object) wherever they are used.
+3. **Linear scan.** Intervals are allocated in order of their start.
+   - **Calls:** an interval that is live across a call may only use
+     callee-saved registers (`rbx`, `r12`–`r15`). Others prefer caller-saved
+     ones (`rax rcx rdx rsi rdi r8 r9`).
+   - **Hints:** parameters prefer their argument register, an argument that
+     dies at a call its argument register, results `rax`, and both sides of a
+     `mov` the same register, so most copies vanish.
+   - **Division:** values live across an `idiv` avoid `rax` and `rdx`.
+   - **Spilling:** when no register is free, the interval that ends last
+     is spilled to its own frame slot.
+   - **Scratch:** `r10` and `r11` are never allocated; they serve as scratch.
+4. **Frame.** Only functions with calls, spills, callee-saved registers or FFI
+   scratch need one:
+
+   ```
+   push rbp; mov rbp, rsp; push <callee-saved used>…; sub rsp, N
+   ```
+
+   N keeps `rsp` 16-byte aligned. Slot *k* is at `[rbp - 8·ncs - 8(k+1)]`.
+   Other functions are frameless.
+
+**Fixnum fast paths.** With a = 2x+1 and b = 2y+1, each operation is a few
+instructions. The 64-bit overflow flag is exactly "the result does not fit
+in 63 bits", so `jo` jumps to a shared noreturn stub (`and rsp, -16; call
+luma_int_overflow`).
+
+| Operation | Code |
+|---|---|
+| `a + b` | `lea t, [a - 1]; add t, b; jo` (a constant becomes `add t, imm`) |
+| `a - b` | `lea r11, [b - 1]; mov t, a; sub t, r11; jo` |
+| `a * b` | `mov r11, b; sar r11, 1; lea t, [a - 1]; imul t, r11; jo; or t, 1` (`imul t, t, k` for a constant) |
+| `a / 2^k`, `a mod 2^k` | `sar t, k+1; lea t, [t + t + 1]` and `and t, 2^(k+1) - 1` |
+| `a / b`, `a mod b` | zero test; `idiv` on the untagged values with a floor fix-up; `rax`/`rdx` are pushed and popped only if they hold other live values |
+| `-a` | `neg t; add t, 2; jo` |
+| `a < b` … | `cmp a, b` (tagged fixnums order like integers), then `setcc` or a fused `jcc` |
+| `a == b` | a word compare when either side can't be a string. Otherwise equal words are equal; any non-object operand means unequal; two objects call `luma_eq`. |
+| `not a` | `xor t, 8` for a `bool`; otherwise the truthiness test and `setcc` |
+
+**Tag checks.** Before a fast path, operands that might not be fixnums are
+tested (`test r8, 1`, or `mov r11, a; and r11, b; test r11b, 1` for two
+operands). On failure the code jumps to an **out-of-line slow path** after the
+function body. The slow path:
+
+1. pushes the caller-saved registers that hold values live across the
+   instruction (and only those);
+2. calls the generic runtime function (`luma_add`, …), which produces the
+   result or the same runtime error as `-O0`;
+3. restores the registers and jumps back.
+
+Operands whose inferred type is `int` are not tested at all, and an operation
+whose operands can never both be ints (string `+`, say) just calls the
+runtime inline. The fast path never writes the destination before its checks
+pass, so the slow path always sees the original operands.
+
+**Other instructions:**
+
+| Instruction | Code |
+|---|---|
+| `check` | Inline tests for its int/nil/bool members: `test r8, 1`, `cmp r, 6`, `and r10, -9; cmp r10, 2`. Strings and failures go to a slow path calling `luma_check_type`, which returns the value or raises the error. |
+| `load` | `mov t, [rip + .Lvar.g]; test t, t; je <undefined-variable stub>` |
+| `store` | `mov [rip + .Lvar.g], imm32 / reg` |
+| `br` | Uses the operand's type: a `bool` compares with `false`, a value that can't be `bool` compares with `nil`, and an `int`/`str` is always truthy. |
+
+**Branch fusion.** When a `br` tests the result of a comparison earlier in
+its block, the comparison is emitted at the branch as `cmp` + `jcc`. This
+applies when the result has no other use and only copies and constants that
+leave the operands alone come in between, as out-of-SSA leaves them. The
+slow path of a fused compare branches directly on the runtime's answer.
+
+**Calls:**
+- **Argument moves** into `rdi…r9` are a parallel move; cycles are broken
+  through `r11`.
+- **Tail calls:** a call to a Luma function immediately followed by `ret` of
+  its result becomes `epilogue; jmp fn.X`. This is also why
+  `tests/rt/stack_overflow.luma` recurses with `1 + forever(n + 1)`.
+- **FFI calls** convert each argument through `luma_ffi_arg_<T>` into frame
+  scratch slots before loading the argument registers, exactly as at `-O0`.
+
+**Peephole.** A final pass over the emitted lines removes jumps to the
+next line, inverts `jcc L1; jmp L2; L1:` into one branch, drops `mov r, r`,
+and removes a re-tag immediately undone (`lea r, [r + 1]; lea r, [r - 1]`).
+
+**Readability.** As at `-O0`, every LIR instruction appears as a `#` comment
+above its code. Each function's header comment says how many vregs are in
+registers or spilled, whether it has a frame, and which callee-saved
+registers it saves.
+
+## Code generation: naive backend (`src/x86_isel.c`, `-O0`)
 
 See [IR.md](IR.md) section 8 for the per-instruction templates.
 
@@ -398,6 +548,11 @@ against GNU `as`.
 
 ### Symbols and fixup resolution
 
+(Since milestone 5, a `jmp`/`jcc` to a **global** symbol defined in the same
+section is resolved locally and relaxed like a local label, as GNU `as`
+does; tail calls rely on this. Calls to such symbols keep their `PLT32`
+relocation.)
+
 Every PC-relative field (rel8 or rel32) is the last field of its instruction,
 so `P + size` is the address of the next instruction. The stored addend is
 therefore `(operand constant) − size`. Each fixup is resolved as follows:
@@ -481,7 +636,15 @@ tests.
 | Suite | What it covers |
 |---|---|
 | `make unit` | lexer, parser, lowering, IR parse/print/verify, assembler encodings and relaxation, ELF layout (built by hand) |
-| `make e2e` (`tests/run_e2e.sh`) | hello world pipeline and object inspection; for every `tests/pos` program: exact output, GNU `as` byte equivalence, `.lir` recompilation identity and IR round trip; compile errors with locations; runtime errors (exact stdout, stderr and exit status); hand-written `.lir` programs; lasm on its own |
-| `make difftest` (`tests/difftest.py`) | random programs with functions, globals, multi-argument `print` and random **type annotations**. Wrong-typed values are hidden behind an untyped `dyn()` so they reach runtime errors and the **runtime guards**, which the reference interpreter models with exact messages. Each program is compiled natively and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
+| `make e2e` (`tests/run_e2e.sh`) | hello world pipeline and object inspection (at `-O2` and `-O0`); for every `tests/pos` program: exact output at `-O0`, `-O1` and `-O2`, GNU `as` byte equivalence, `.lir` recompilation identity and IR round trip; properties of the optimized code (no runtime calls in typed `fib`, frameless leaf loops, shifts for division by 4, tail calls as jumps); compile errors with locations; runtime errors and FFI programs at every level (exact stdout, stderr and exit status); hand-written `.lir` programs; lasm on its own |
+| `make difftest` (`tests/difftest.py`) | random programs with functions, globals, multi-argument `print` and random **type annotations**. Wrong-typed values are hidden behind an untyped `dyn()` so they reach runtime errors and the **runtime guards**, which the reference interpreter models with exact messages. Each program is compiled natively at `-O0`, `-O1` and `-O2` (`DIFFTEST_LEVELS`) and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
 | `make selftest` | `examples/selftest.luma`: 91 checks written in Luma itself, built on a `check()` function. It exits through `extern fun exit` |
 | e2e FFI section | `tests/ffi`: the C helper library `ffi_helper.c` (built with the system cc, test-only), round trips for every C type and boundary value, 9 runtime-error cases, and the link modes |
+| `make bench` (`bench/run.py`) | wall time of six programs (recursion, loops, division, strings) at `-O0` and `-O2`, with their output |
+
+The optimizer and backend were also checked with ASan/UBSan builds of the
+compiler (`make BUILD=build-asan CFLAGS="-fsanitize=address,undefined …"`,
+then the suites with `LUMA=build-asan/luma`), and by planting bugs in the
+backend (a dropped `jo`, a wrong swapped condition, no register saving
+around slow paths, a missing floor fix-up, ignoring calls in allocation):
+`make difftest` catches each of them.
