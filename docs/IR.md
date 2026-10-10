@@ -1,4 +1,4 @@
-# LIR: the Luma intermediate representation (spec v0.2)
+# LIR: the Luma intermediate representation (spec v0.3)
 
 **Status:** implemented in milestone 2. The decisions in section 13 are resolved,
 and the places where the implementation refined the original draft are listed in section 14.
@@ -96,10 +96,12 @@ offset 8   …            type-specific
 
 ```
 module      := 'module' STRING NL { toplevel }
-toplevel    := extern | data | global | function
+toplevel    := extern | cextern | data | global | function
 extern      := 'extern' 'fn' GLOBAL '(' INT ')' NL          ; arity
 data        := 'data' GLOBAL '=' 'str' STRING NL
 global      := 'global' GLOBAL NL                            ; module variable (v0.2)
+cextern     := 'extern' 'c' 'fn' GLOBAL '(' [ IDENT ':' CTYPE { ',' IDENT ':' CTYPE } ] ')' ':' CTYPE NL  ; v0.3
+CTYPE       := i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64 | bool | cstr | cstr '?' | ptr | void
 function    := 'fn' GLOBAL '(' [ VREG { ',' VREG } ] ')' '{' NL { block } '}' NL
 block       := LABEL ':' NL { instr NL } terminator NL
 instr       := VREG '=' op
@@ -447,3 +449,33 @@ These are deferred, and each is listed with the milestone where it belongs:
   identical assembly, and the test suite checks this for every program.
 - **Unreachable blocks** are removed by lowering, so `ret` can be followed by
   dead source code without the IR containing it.
+
+## 16. v0.3 additions (milestone 4)
+
+- **C functions (`extern c fn`).** A call to such a global uses the ordinary
+  `call` instruction. Its operands and result are still Luma values, so the IR
+  keeps a single value type. The backend does the marshaling:
+
+  ```asm
+  # %r = call @puts(%s)          ; extern c fn @puts(s: cstr): i32
+      mov rdi, [rbp - s]
+      lea rsi, [rip + .Lffi.0]    # "argument 1 ('s') of puts"
+      call luma_ffi_arg_cstr@PLT  # type/range check -> raw C value
+      mov [rbp - scratch0], rax   # scratch slots follow the vreg slots
+      mov rdi, [rbp - scratch0]
+      xor eax, eax                # AL = 0: no vector registers (variadic-safe)
+      call puts@PLT
+      mov rdi, rax
+      lea rsi, [rip + .Lffi.1]    # "return value of puts"
+      call luma_ffi_ret_i32@PLT   # raw C value -> Luma value
+      mov [rbp - r], rax
+  ```
+
+  `void` results become `nil` without a call. The verifier rejects `void`
+  parameters and more than 6 parameters.
+- **Type guards** are not a new instruction. Lowering emits
+  `call @luma_check_type(%v, %mask, %context)`, where `%mask` is a fixnum
+  (int 1, str 2, bool 4, nil 8) and `%context` is a `data` string such as
+  `"argument 'b' of 'add'"`. The runtime raises `CONTEXT expects T, got U.`
+- **`while (true)`** is lowered without an exit edge (`jmp body` instead of
+  `br`), so code after an infinite loop is unreachable and pruned.

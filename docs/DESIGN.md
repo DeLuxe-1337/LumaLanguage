@@ -1,9 +1,10 @@
-# Luma bootstrap compiler: design notes (milestone 3)
+# Luma bootstrap compiler: design notes (milestone 4)
 
 This document describes how the Luma toolchain is built. Its sections cover:
 
 - the pipeline and its modules
 - the language subset accepted today
+- optional types and the C FFI
 - the C runtime
 - the x86-64 assembler (encodings, relaxation, relocations)
 - the ELF64 object writer
@@ -56,7 +57,7 @@ Every stage can be inspected or tested on its own:
 shared by the compiler, which emits tagged constants, and the runtime, which
 interprets them.
 
-## Language (milestone 3)
+## Language (milestone 4)
 
 The grammar is in `src/ast.h`. It started from Lox, and milestone 3 begins
 to diverge: `print` is a builtin function, and functions are compiled
@@ -117,6 +118,8 @@ Differences from reference Lox:
 | Numbers | doubles | 63-bit integers; literals 0 … 2⁶²−1; overflow is a runtime error; `/` is floor division |
 | `print` | statement: `print x;` | builtin function: `print(a, b, …)` |
 | Functions | first-class closures | top-level, hoisted, statically resolved; not first-class (yet) |
+| Types | none | optional gradual annotations (see below); doomed operations such as `1 + "a"` are compile errors |
+| C interop | none | `extern fun` with C types (see below) |
 | Undefined names | runtime errors | compile errors; a global read before its declaration executes is a runtime error |
 | Strings | multi-line, no escapes | single line; `\"` `\\` `\n` `\t` |
 | `class`, `this`, `super`, float literals | yes | rejected ("not supported yet") |
@@ -125,6 +128,103 @@ Compile errors have the form `path:line:col: error: message`, and compilation
 stops at the first one. When it does, no `.lir`, `.s`, `.o` or executable is
 written. Nesting depth, which includes long `a+b+c+…` chains, is bounded at
 1000, so malformed input cannot overflow the C stack.
+
+## Types (gradual, optional)
+
+Annotations are optional and can go on variables, parameters and return
+values:
+
+```js
+var count: int = 0;
+fun greet(name: str?): str { … }
+```
+
+| Type | Accepts |
+|---|---|
+| `int` | integers |
+| `str` | strings |
+| `bool` | `true` and `false` |
+| `nil` | `nil` |
+| `any` | anything; also the meaning of no annotation |
+| `T?` | `T` or `nil` |
+
+The compiler gives every expression a **static type**: the set of runtime
+types it might have.
+
+- Literals have exact types.
+- Unannotated variables, parameters and returns are `any`.
+- Operators compute result types: `int + int` is `int`; `x + 1` with `x: any`
+  is `int`, since a string plus 1 can never succeed; comparisons are `bool`.
+- A call has its callee's declared return type.
+- `and`/`or` have the union of their operand types.
+
+Values are checked at every **typed boundary**: initializing or assigning an
+annotated variable, passing an argument to an annotated parameter, and
+returning from a function with an annotated return type.
+
+| The value's static type… | Result |
+|---|---|
+| fits the slot (subset) | accepted, no code emitted |
+| can't fit (disjoint) | compile error: `variable 'n' expects int, got str` |
+| might fit (overlap, e.g. `any` into `int`) | runtime guard: `luma_check_type(v, mask, "variable 'n'")` raises `variable 'n' expects int, got str.` |
+
+Further rules:
+
+- **Doomed operators:** an operator whose operand types make it fail on every
+  execution is a compile error, for example `1 + "a"`, `-"x"` or `nil < 1`.
+- **Untyped code is unchanged:** code without annotations or literal type
+  mistakes behaves exactly as dynamic code, and its errors stay at runtime.
+- **Missing returns:** a function with a return type that doesn't include
+  `nil` must not be able to reach the end of its body. `while (true)` and
+  `for (;;)` count as never exiting.
+- **Initializers:** `var x: int;` needs an initializer, because it would
+  otherwise be `nil`.
+- **Global redeclarations** must keep their annotation.
+
+Types don't change code generation yet. A planned optimization will keep
+values whose static type is exactly `int` unboxed in registers.
+
+## C FFI (`extern fun`)
+
+```js
+extern fun puts(s: cstr): i32;
+extern fun getenv(name: cstr): cstr?;   // NULL <-> nil
+puts("hi");
+```
+
+`luma prog.luma -o prog -l NAME -L DIR` links C libraries. Extra `.o`, `.a`
+and `.so` arguments are passed to the linker, and libc needs no flags.
+`extern` declarations go at top level, every parameter must be typed, and a
+return type is required (`void` for none). The C symbol has the same name as
+the Luma function. Names starting with `luma_` are reserved, and at most 6
+parameters are allowed for now.
+
+| C type | Luma type | Argument conversion | Result conversion |
+|---|---|---|---|
+| `i8 i16 i32 i64` | `int` | must be an `int` that fits, otherwise a runtime error (`5000000000 does not fit in i32`) | sign-extended from the declared width; `i64` must fit in 63 bits |
+| `u8 u16 u32 u64` | `int` | must be ≥ 0 and fit | zero-extended; `u64` must fit in 63 bits |
+| `bool` | `bool` | `true` → 1, `false` → 0 | low byte ≠ 0 |
+| `cstr` | `str` | pointer to the string's NUL-terminated bytes, which C must not modify or keep | copied into a new Luma string; NULL is an error |
+| `cstr?` | `str?` | `nil` → NULL | NULL → `nil` |
+| `ptr` | `int` | an address | an address |
+| `void` | `nil` | (not allowed as a parameter) | `nil` |
+
+**What a call compiles to:**
+
+1. Each argument is converted by `luma_ffi_arg_<ctype>(value, "argument N ('p') of f")`
+   into a scratch stack slot.
+2. The raw values are loaded into `rdi`…`r9`.
+3. `eax` is zeroed, which tells a variadic callee that no vector registers are used.
+4. The C function is called.
+5. The result is converted with `luma_ffi_ret_<ctype>(rax, "return value of f")`.
+
+Mismatches the compiler can see are compile errors, for example passing `42`
+to a `cstr`. Everything else is checked by the converters at runtime. Values
+are never truncated silently: narrowing happens only when C itself returns a
+narrow type.
+
+Not supported yet: `f32`/`f64` (Luma has no floats), structs, callbacks,
+variadic declarations, and more than 6 parameters.
 
 ## Runtime (`runtime/luma_rt.c` → `build/libluma_rt.a`)
 
@@ -138,6 +238,8 @@ which calls `luma_main()`, flushes stdout, and exits with status 0.
 | `luma_print` | writes a value and a newline (kept for hand-written LIR) |
 | `luma_add/sub/mul/div/mod/neg/not/eq/ne/lt/le/gt/ge` | generic operations |
 | `luma_undefined_variable(name)` | called by a checked global `load` that finds an unassigned slot |
+| `luma_check_type(v, mask, context)` | the runtime guard at typed boundaries |
+| `luma_ffi_arg_<ctype>`, `luma_ffi_ret_<ctype>` | FFI converters, with range and type checks |
 
 The generic operations behave as follows:
 
@@ -380,5 +482,6 @@ tests.
 |---|---|
 | `make unit` | lexer, parser, lowering, IR parse/print/verify, assembler encodings and relaxation, ELF layout (built by hand) |
 | `make e2e` (`tests/run_e2e.sh`) | hello world pipeline and object inspection; for every `tests/pos` program: exact output, GNU `as` byte equivalence, `.lir` recompilation identity and IR round trip; compile errors with locations; runtime errors (exact stdout, stderr and exit status); hand-written `.lir` programs; lasm on its own |
-| `make difftest` (`tests/difftest.py`) | random, mostly well-typed programs with functions (an acyclic call graph, early returns, globals) and multi-argument `print`, with injected type errors, overflow and division by zero. Each program is compiled natively and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
-| `make selftest` | `examples/selftest.luma`: 91 checks written in Luma itself, built on a `check()` function |
+| `make difftest` (`tests/difftest.py`) | random programs with functions, globals, multi-argument `print` and random **type annotations**. Wrong-typed values are hidden behind an untyped `dyn()` so they reach runtime errors and the **runtime guards**, which the reference interpreter models with exact messages. Each program is compiled natively and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
+| `make selftest` | `examples/selftest.luma`: 91 checks written in Luma itself, built on a `check()` function. It exits through `extern fun exit` |
+| e2e FFI section | `tests/ffi`: the C helper library `ffi_helper.c` (built with the system cc, test-only), round trips for every C type and boundary value, 9 runtime-error cases, and the link modes |
