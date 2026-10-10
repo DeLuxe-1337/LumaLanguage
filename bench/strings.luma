@@ -1,0 +1,8 @@
+// String building and comparison (runtime-heavy; the optimizer helps less).
+var s = "";
+var matches = 0;
+for (var i = 0; i < 3000000; i = i + 1) {
+  s = "x" + "y";
+  if (s == "xy") matches = matches + 1;
+}
+print(matches);

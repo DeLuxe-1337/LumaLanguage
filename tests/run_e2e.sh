@@ -242,9 +242,13 @@ check "C program links against lasm object" cc -o "$OUT/answer" tests/asm/answer
 check "answer() == 42 and answer_msg() from .rodata" "$OUT/answer"
 check "lasm assembles coverage.s" "$LASM" tests/asm/coverage.s -o "$OUT/cov_luma.o"
 check "readelf accepts coverage object" readelf -h -S -s -r "$OUT/cov_luma.o"
-check "lasm rejects bad input" sh -c "printf 'mov [rax], rbx\n' > $OUT/bad.s && ! $LASM $OUT/bad.s -o $OUT/bad.o 2>$OUT/e && grep -q 'bad.s:1: error' $OUT/e"
+check "lasm rejects bad input" sh -c "printf 'mov [rax], [rbx]\n' > $OUT/bad.s && ! $LASM $OUT/bad.s -o $OUT/bad.o 2>$OUT/e && grep -q 'bad.s:1: error' $OUT/e"
 if [ "$HAVE_AS" -eq 1 ]; then
     check "differential: coverage.s identical to GNU as (bytes + relocations)" same_as_gas cov tests/asm/coverage.s "$OUT/cov_luma.o"
+    python3 -I tests/asm/gen_forms.py > "$OUT/forms.s"
+    check "differential: $(grep -c '^    [a-z]' "$OUT/forms.s") generated instruction forms identical to GNU as" sh -c \
+        "$LASM $OUT/forms.s -o $OUT/forms.o"
+    check "  (generated forms: bytes + relocations)" same_as_gas forms "$OUT/forms.s" "$OUT/forms.o"
 else
     printf 'SKIP  differential tests (GNU as not installed)\n'
 fi

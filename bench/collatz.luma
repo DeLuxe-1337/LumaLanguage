@@ -1,0 +1,16 @@
+// Longest Collatz chain below a limit: data-dependent branches and globals.
+var best = 0;
+var best_start = 0;
+fun steps(n) {
+  var s = 0;
+  while (n != 1) {
+    if (n - n / 2 * 2 == 0) n = n / 2; else n = 3 * n + 1;
+    s = s + 1;
+  }
+  return s;
+}
+for (var i = 1; i < 1000000; i = i + 1) {
+  var s = steps(i);
+  if (s > best) { best = s; best_start = i; }
+}
+print(best_start, best);

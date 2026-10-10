@@ -1,0 +1,10 @@
+// Trial division: nested loops, multiplication, division, branches.
+fun is_prime(n: int): bool {
+  if (n < 2) return false;
+  for (var d = 2; d * d <= n; d = d + 1)
+    if (n - n / d * d == 0) return false;
+  return true;
+}
+var count = 0;
+for (var k = 0; k < 2000000; k = k + 1) if (is_prime(k)) count = count + 1;
+print(count);

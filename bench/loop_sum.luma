@@ -1,0 +1,7 @@
+// A tight counting loop with globals-free locals.
+fun run(): int {
+  var total = 0;
+  for (var i = 0; i < 100000000; i = i + 1) total = total + (i - i / 4 * 4);
+  return total;
+}
+print(run());

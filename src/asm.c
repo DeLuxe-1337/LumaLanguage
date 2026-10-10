@@ -188,15 +188,19 @@ static int split_operands(char *s, char **parts, int max) {
 
 typedef enum { OP_REG, OP_IMM, OP_MEM, OP_SYM } OpKind;
 
-#define BASE_RIP (-1)
-#define REG_RBP 5
+#define NO_REG (-1)
+#define BASE_RIP (-2)
 
 typedef struct {
     OpKind kind;
-    int reg;       /* OP_REG: 0..15; OP_MEM: base register (REG_RBP) or BASE_RIP */
-    int size;      /* OP_REG: 32 or 64 */
-    int64_t imm;   /* OP_IMM value; OP_MEM displacement; OP_SYM unused */
-    char sym[256]; /* OP_MEM (rip only)/OP_SYM: symbol name, "" if none */
+    int reg;       /* OP_REG: 0..15 */
+    int size;      /* OP_REG: 8, 32 or 64. OP_MEM: from "byte/dword/qword ptr", 0 if unspecified */
+    bool rex_byte; /* OP_REG, size 8: spl/bpl/sil/dil, which need a (possibly empty) REX prefix */
+    int base;      /* OP_MEM: 0..15, BASE_RIP or NO_REG */
+    int index;     /* OP_MEM: 0..15 (never rsp) or NO_REG */
+    int scale;     /* OP_MEM: 1, 2, 4 or 8 */
+    int64_t imm;   /* OP_IMM: value. OP_MEM: displacement */
+    char sym[256]; /* OP_MEM (rip only) / OP_SYM: symbol name, "" if none */
     bool plt;      /* OP_SYM written as name@PLT */
 } Operand;
 
@@ -204,11 +208,14 @@ static const char *const REG64[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", 
                                       "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
 static const char *const REG32[16] = {"eax", "ecx", "edx",  "ebx",  "esp",  "ebp",  "esi",  "edi",
                                       "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"};
+static const char *const REG8[16] = {"al",  "cl",  "dl",   "bl",   "spl",  "bpl",  "sil",  "dil",
+                                     "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"};
 
 static bool lookup_reg(const char *s, int *reg, int *size) {
     for (int i = 0; i < 16; i++) {
         if (strcmp(s, REG64[i]) == 0) { *reg = i; *size = 64; return true; }
         if (strcmp(s, REG32[i]) == 0) { *reg = i; *size = 32; return true; }
+        if (strcmp(s, REG8[i]) == 0) { *reg = i; *size = 8; return true; }
     }
     return false;
 }
@@ -226,21 +233,56 @@ static bool copy_sym(Asm *a, char *dst, const char *src) {
     return true;
 }
 
-#define MEM_UNSUPPORTED "unsupported memory operand: only [rip + symbol] and [rbp +/- disp] are supported"
+/* Parses an index term "reg*scale" or "scale*reg". Returns false if the term
+ * is not of that shape (an error is reported only for malformed shapes). */
+static bool parse_scaled(Asm *a, const char *term, int *reg, int *scale, bool *ok) {
+    const char *star = strchr(term, '*');
+    *ok = false;
+    if (!star) return false;
+    char left[64], right[64];
+    size_t ln = (size_t)(star - term);
+    if (ln >= sizeof left || strlen(star + 1) >= sizeof right) {
+        asm_error(a, "malformed scaled index '%s'", term);
+        return true;
+    }
+    memcpy(left, term, ln);
+    left[ln] = '\0';
+    strcpy(right, star + 1);
+    int sz;
+    int64_t sc;
+    if (lookup_reg(left, reg, &sz) && parse_int(right, &sc)) {
+    } else if (lookup_reg(right, reg, &sz) && parse_int(left, &sc)) {
+    } else {
+        asm_error(a, "malformed scaled index '%s' (expected reg*1, reg*2, reg*4 or reg*8)", term);
+        return true;
+    }
+    if (sz != 64 || (sc != 1 && sc != 2 && sc != 4 && sc != 8)) {
+        asm_error(a, "invalid scaled index '%s' (64-bit register, scale 1, 2, 4 or 8)", term);
+        return true;
+    }
+    *scale = (int)sc;
+    *ok = true;
+    return true;
+}
 
-/* Parses "[rip + sym + n]" or "[rbp - n]" memory operands. */
+/* Parses "[ terms ]" where terms are joined by + or -:
+ *   rip (first; then only a symbol and/or displacement may follow),
+ *   a 64-bit base register, an index "reg*scale" (or a second plain register),
+ *   integer displacements and, for rip only, one symbol. */
 static bool parse_mem(Asm *a, char *s, Operand *op) {
     size_t n = strlen(s);
-    if (n < 2 || s[n - 1] != ']') {
+    if (n < 2 || s[0] != '[' || s[n - 1] != ']') {
         asm_error(a, "malformed memory operand '%s'", s);
         return false;
     }
     s[n - 1] = '\0';
     char *p = s + 1;
     op->kind = OP_MEM;
+    op->base = NO_REG;
+    op->index = NO_REG;
+    op->scale = 1;
     op->imm = 0;
     op->sym[0] = '\0';
-    bool have_base = false;
     int sign = 1;
     bool first = true;
     while (*(p = trim(p))) {
@@ -252,6 +294,9 @@ static bool parse_mem(Asm *a, char *s, Operand *op) {
                 return false;
             }
             p = trim(p + 1);
+        } else if (*p == '-') { /* leading negative displacement: [-8 + rbp] */
+            sign = -1;
+            p = trim(p + 1);
         }
         char *end = p;
         while (*end && *end != '+' && *end != '-' && *end != ' ' && *end != '\t') end++;
@@ -262,26 +307,49 @@ static bool parse_mem(Asm *a, char *s, Operand *op) {
         *end = save;
         p = end;
         int64_t v;
-        int r, sz;
-        if (first) {
-            if (strcmp(term, "rip") == 0) op->reg = BASE_RIP;
-            else if (strcmp(term, "rbp") == 0) op->reg = REG_RBP;
-            else {
-                asm_error(a, MEM_UNSUPPORTED);
+        int r, sz, sc;
+        bool ok;
+        if (!*term) {
+            asm_error(a, "empty term in memory operand");
+            return false;
+        }
+        if (strcmp(term, "rip") == 0) {
+            if (!first || sign < 0) {
+                asm_error(a, "'rip' must be the first term of a memory operand");
                 return false;
             }
-            have_base = true;
+            op->base = BASE_RIP;
+        } else if (parse_scaled(a, term, &r, &sc, &ok)) {
+            if (!ok) return false;
+            if (sign < 0 || op->index != NO_REG || op->base == BASE_RIP) {
+                asm_error(a, "invalid index register in memory operand");
+                return false;
+            }
+            op->index = r;
+            op->scale = sc;
+        } else if (lookup_reg(term, &r, &sz)) {
+            if (sz != 64) {
+                asm_error(a, "memory operands need 64-bit registers, got '%s'", term);
+                return false;
+            }
+            if (sign < 0 || op->base == BASE_RIP) {
+                asm_error(a, "invalid register '%s' in memory operand", term);
+                return false;
+            }
+            if (op->base == NO_REG) op->base = r;
+            else if (op->index == NO_REG) op->index = r;
+            else {
+                asm_error(a, "memory operand has more than two registers");
+                return false;
+            }
         } else if (parse_int(term, &v)) {
             if (v < INT32_MIN || v > INT32_MAX) {
                 asm_error(a, "memory displacement out of 32-bit range");
                 return false;
             }
             op->imm += sign * v;
-        } else if (lookup_reg(term, &r, &sz)) {
-            asm_error(a, MEM_UNSUPPORTED);
-            return false;
         } else {
-            if (op->reg != BASE_RIP) {
+            if (op->base != BASE_RIP) {
                 asm_error(a, "symbols are only allowed in [rip + symbol] operands");
                 return false;
             }
@@ -297,8 +365,12 @@ static bool parse_mem(Asm *a, char *s, Operand *op) {
         }
         first = false;
     }
-    if (!have_base) {
-        asm_error(a, "empty memory operand");
+    if (op->base == NO_REG && op->index == NO_REG) {
+        asm_error(a, "memory operand needs a base or index register (absolute addresses are not supported)");
+        return false;
+    }
+    if (op->index == 4) {
+        asm_error(a, "rsp cannot be an index register");
         return false;
     }
     if (op->imm < INT32_MIN || op->imm > INT32_MAX) {
@@ -310,13 +382,29 @@ static bool parse_mem(Asm *a, char *s, Operand *op) {
 
 static bool parse_operand(Asm *a, char *s, Operand *op) {
     memset(op, 0, sizeof *op);
-    if (*s == '[') return parse_mem(a, s, op);
-    if (strstr(s, " ptr ") || strncmp(s, "qword", 5) == 0 || strncmp(s, "dword", 5) == 0) {
-        asm_error(a, "size-qualified memory operands are not supported: '%s'", s);
+    static const struct { const char *prefix; int size; } SIZES[] = {
+        {"qword ptr", 64}, {"dword ptr", 32}, {"byte ptr", 8}};
+    for (size_t i = 0; i < sizeof SIZES / sizeof *SIZES; i++) {
+        size_t n = strlen(SIZES[i].prefix);
+        if (strncmp(s, SIZES[i].prefix, n) == 0 && (s[n] == ' ' || s[n] == '\t' || s[n] == '[')) {
+            char *rest = trim(s + n);
+            if (*rest != '[') {
+                asm_error(a, "'%s' must be followed by a memory operand", SIZES[i].prefix);
+                return false;
+            }
+            if (!parse_mem(a, rest, op)) return false;
+            op->size = SIZES[i].size;
+            return true;
+        }
+    }
+    if (strstr(s, " ptr")) {
+        asm_error(a, "unsupported size qualifier in '%s' (byte ptr, dword ptr or qword ptr)", s);
         return false;
     }
+    if (*s == '[') return parse_mem(a, s, op);
     if (lookup_reg(s, &op->reg, &op->size)) {
         op->kind = OP_REG;
+        op->rex_byte = op->size == 8 && op->reg >= 4 && op->reg <= 7;
         return true;
     }
     if (parse_int(s, &op->imm)) {
@@ -339,20 +427,15 @@ static bool parse_operand(Asm *a, char *s, Operand *op) {
 /* ------------------------------------------------------------------------ */
 /* Encoding helpers                                                         */
 
-static void emit_rex(Buf *b, int w, int r, int x, int base, bool force) {
-    uint8_t rex = (uint8_t)(0x40 | (w << 3) | ((r >> 3) << 2) | ((x >> 3) << 1) | (base >> 3));
-    if (rex != 0x40 || force) buf_byte(b, rex);
-}
-
 static uint8_t modrm(int mod, int reg, int rm) { return (uint8_t)((mod << 6) | ((reg & 7) << 3) | (rm & 7)); }
 
 static bool fits_i8(int64_t v) { return v >= -128 && v <= 127; }
 static bool fits_i32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
 
 /* Records a PC-relative field of `size` bytes at the current end of the
- * section and emits zero bytes for it. The field must be the last thing in
- * the instruction, so P + size is the address of the next instruction,
- * which is what the CPU adds the field to. */
+ * section and emits zero bytes for it. `addend` already accounts for any
+ * bytes that follow the field in the same instruction, so that the result
+ * is relative to the address of the next instruction, as the CPU computes. */
 static void add_fixup(Asm *a, const char *sym, int64_t addend, FixKind kind, size_t jump) {
     int size = kind == FX_REL8 ? 1 : 4;
     Fixup f;
@@ -368,24 +451,61 @@ static void add_fixup(Asm *a, const char *sym, int64_t addend, FixKind kind, siz
     buf_zeros(code(a), (size_t)size);
 }
 
-/* Emits ModRM (+disp) for a memory operand with `reg` in the reg field.
- * Must be called last for the instruction (RIP fixups assume this).
- *   [rip + disp32]   mod=00 rm=101
- *   [rbp + disp8]    mod=01 rm=101   (also used for [rbp], since mod=00 rm=101 means RIP)
- *   [rbp + disp32]   mod=10 rm=101 */
-static void emit_mem(Asm *a, int reg, const Operand *m) {
+static int scale_bits(int scale) { return scale == 1 ? 0 : scale == 2 ? 1 : scale == 4 ? 2 : 3; }
+
+/* Emits [REX] opcode ModRM [SIB] [disp] for an instruction whose ModRM.reg
+ * field holds `reg` (a register number or an opcode extension) and whose
+ * ModRM.rm operand is `rm` (a register or a memory operand). `imm_size` is
+ * the number of immediate bytes the caller emits afterwards (it matters for
+ * RIP-relative fixups). `force_rex` emits an empty REX prefix, which byte
+ * registers spl/bpl/sil/dil require. The encodings follow GNU as:
+ *   [base]          mod=00 (mod=01 disp8 0 when base is rbp/r13)
+ *   [base+disp8]    mod=01      [base+disp32]  mod=10
+ *   rsp/r12 bases and any index register use a SIB byte;
+ *   [index*s+disp]  SIB with base=101, mod=00, disp32;   [rip+disp]  mod=00 rm=101. */
+static void encode(Asm *a, int w, int reg, bool force_rex, const uint8_t *opc, int nopc, const Operand *rm,
+                   int imm_size) {
     Buf *b = code(a);
-    if (m->reg == BASE_RIP) {
-        buf_byte(b, modrm(0, reg, 5));
-        if (m->sym[0]) add_fixup(a, m->sym, m->imm, FX_PC32, 0);
-        else buf_u32(b, (uint32_t)m->imm);
-    } else if (fits_i8(m->imm)) {
-        buf_byte(b, modrm(1, reg, m->reg));
-        buf_byte(b, (uint8_t)m->imm);
-    } else {
-        buf_byte(b, modrm(2, reg, m->reg));
-        buf_u32(b, (uint32_t)m->imm);
+    int x = 0, base = 0;
+    if (rm->kind == OP_REG) base = rm->reg;
+    else {
+        if (rm->index >= 0) x = rm->index;
+        if (rm->base >= 0) base = rm->base;
     }
+    uint8_t rex = (uint8_t)(0x40 | (w << 3) | (((reg >> 3) & 1) << 2) | (((x >> 3) & 1) << 1) | ((base >> 3) & 1));
+    if (rex != 0x40 || force_rex) buf_byte(b, rex);
+    buf_append(b, opc, (size_t)nopc);
+    if (rm->kind == OP_REG) {
+        buf_byte(b, modrm(3, reg, rm->reg));
+        return;
+    }
+    if (rm->base == BASE_RIP) {
+        buf_byte(b, modrm(0, reg, 5));
+        if (rm->sym[0]) add_fixup(a, rm->sym, rm->imm - imm_size, FX_PC32, 0);
+        else buf_u32(b, (uint32_t)rm->imm);
+        return;
+    }
+    if (rm->base == NO_REG) { /* [index*scale + disp32] */
+        buf_byte(b, modrm(0, reg, 4));
+        buf_byte(b, (uint8_t)((scale_bits(rm->scale) << 6) | ((rm->index & 7) << 3) | 5));
+        buf_u32(b, (uint32_t)rm->imm);
+        return;
+    }
+    int mod = (rm->imm == 0 && (rm->base & 7) != 5) ? 0 : fits_i8(rm->imm) ? 1 : 2;
+    if (rm->index != NO_REG || (rm->base & 7) == 4) {
+        int idx = rm->index != NO_REG ? rm->index : 4; /* 100 = no index */
+        buf_byte(b, modrm(mod, reg, 4));
+        buf_byte(b, (uint8_t)((scale_bits(rm->scale) << 6) | ((idx & 7) << 3) | (rm->base & 7)));
+    } else {
+        buf_byte(b, modrm(mod, reg, rm->base));
+    }
+    if (mod == 1) buf_byte(b, (uint8_t)rm->imm);
+    else if (mod == 2) buf_u32(b, (uint32_t)rm->imm);
+}
+
+static void emit_rex(Buf *b, int w, int r, int x, int base, bool force) {
+    uint8_t rex = (uint8_t)(0x40 | (w << 3) | ((r >> 3) << 2) | ((x >> 3) << 1) | (base >> 3));
+    if (rex != 0x40 || force) buf_byte(b, rex);
 }
 
 static bool want(Asm *a, const char *mn, int nops, int expected) {
@@ -398,13 +518,33 @@ static bool want(Asm *a, const char *mn, int nops, int expected) {
 
 static void bad_operands(Asm *a, const char *mn) { asm_error(a, "unsupported operand combination for '%s'", mn); }
 
+static bool is_rm(const Operand *o) { return o->kind == OP_REG || o->kind == OP_MEM; }
+
+/* Operand size of a register or a size-qualified memory operand (0 if unknown). */
+static int opsize(const Operand *o) { return o->size; }
+
+/* For reg/mem pairs: the size both must agree on. Reports an error and returns
+ * 0 if they conflict or neither is known. */
+static int pair_size(Asm *a, const char *mn, const Operand *x, const Operand *y) {
+    int sx = is_rm(x) ? opsize(x) : 0, sy = is_rm(y) ? opsize(y) : 0;
+    if (sx && sy && sx != sy) {
+        asm_error(a, "operand size mismatch for '%s'", mn);
+        return 0;
+    }
+    int s = sx ? sx : sy;
+    if (!s) asm_error(a, "operand size of '%s' is ambiguous (use qword ptr / dword ptr / byte ptr)", mn);
+    return s;
+}
+
+static bool needs_rex(const Operand *o) { return o->kind == OP_REG && o->rex_byte; }
+
 /* ------------------------------------------------------------------------ */
 /* Instruction tables                                                       */
 
-/* Classic two-operand ALU group. Encodings:
- *   op r/m, r      rr  /r
- *   op r/m, imm8   83  /ext ib   (imm sign-extended)
- *   op rax, imm32  acc id        (accumulator short form, chosen by GAS)
+/* Classic two-operand ALU group. Encodings (GNU as choices):
+ *   op r/m, r      rr  /r          op r, r/m(mem)  rr+2 /r
+ *   op r/m, imm8   83  /ext ib     (imm sign-extended)
+ *   op rax, imm32  acc id          (accumulator short form)
  *   op r/m, imm32  81  /ext id */
 typedef struct {
     const char *name;
@@ -418,7 +558,7 @@ static const AluOp ALU_OPS[] = {
     {"sub", 0x29, 5, 0x2D}, {"xor", 0x31, 6, 0x35}, {"cmp", 0x39, 7, 0x3D},
 };
 
-/* Jcc condition codes (low nibble of 70+cc / 0F 80+cc). */
+/* Jcc/SETcc/CMOVcc condition codes (low nibble of the opcode). */
 typedef struct {
     const char *name;
     uint8_t cc;
@@ -432,13 +572,17 @@ static const CondCode CONDS[] = {
     {"g", 0xF},   {"nle", 0xF},
 };
 
+static int cond_code(const char *suffix) {
+    for (size_t i = 0; i < sizeof CONDS / sizeof *CONDS; i++)
+        if (strcmp(suffix, CONDS[i].name) == 0) return CONDS[i].cc;
+    return -1;
+}
+
 /* Returns the condition code for "jcc" mnemonics, 16 for "jmp", -1 otherwise. */
 static int jump_kind(const char *mn) {
     if (strcmp(mn, "jmp") == 0) return 16;
     if (mn[0] != 'j') return -1;
-    for (size_t i = 0; i < sizeof CONDS / sizeof *CONDS; i++)
-        if (strcmp(mn + 1, CONDS[i].name) == 0) return CONDS[i].cc;
-    return -1;
+    return cond_code(mn + 1);
 }
 
 static void assemble_jump(Asm *a, const char *mn, int kind, Operand *ops, int n) {
@@ -457,35 +601,50 @@ static void assemble_jump(Asm *a, const char *mn, int kind, Operand *ops, int n)
     }
 }
 
+static bool imm_fits(Asm *a, int64_t v, int size) {
+    bool ok = size == 8 ? (v >= -128 && v <= 255)
+            : size == 32 ? (v >= INT32_MIN && v <= (int64_t)UINT32_MAX)
+            : fits_i32(v);
+    if (!ok) asm_error(a, "immediate %lld out of range for a %d-bit operand", (long long)v, size);
+    return ok;
+}
+
 static void assemble_alu(Asm *a, const AluOp *op, Operand *ops, int n) {
     const char *mn = op->name;
     if (!want(a, mn, n, 2)) return;
     Operand *d = &ops[0], *s = &ops[1];
     Buf *b = code(a);
-    if (d->kind != OP_REG) { bad_operands(a, mn); return; }
-    if (s->kind == OP_REG) {
-        if (d->size != s->size) { bad_operands(a, mn); return; }
-        emit_rex(b, d->size == 64, s->reg, 0, d->reg, false);
-        buf_byte(b, op->rr);
-        buf_byte(b, modrm(3, s->reg, d->reg));
+    if (!is_rm(d) || (s->kind != OP_REG && s->kind != OP_MEM && s->kind != OP_IMM) ||
+        (d->kind == OP_MEM && s->kind == OP_MEM)) {
+        bad_operands(a, mn);
         return;
     }
-    if (s->kind != OP_IMM) { bad_operands(a, mn); return; }
-    if (!fits_i32(s->imm) && !(d->size == 32 && s->imm >= 0 && s->imm <= UINT32_MAX)) {
-        asm_error(a, "immediate out of 32-bit range");
+    int size = pair_size(a, mn, d, s);
+    if (!size) return;
+    if (size == 8) { asm_error(a, "8-bit operands are not supported for '%s'", mn); return; }
+    int w = size == 64;
+    if (s->kind == OP_REG) { /* op r/m, r */
+        uint8_t opc = op->rr;
+        encode(a, w, s->reg, false, &opc, 1, d, 0);
         return;
     }
-    emit_rex(b, d->size == 64, 0, 0, d->reg, false);
+    if (s->kind == OP_MEM) { /* op r, m */
+        uint8_t opc = (uint8_t)(op->rr + 2);
+        encode(a, w, d->reg, false, &opc, 1, s, 0);
+        return;
+    }
+    if (!imm_fits(a, s->imm, size)) return;
     if (fits_i8(s->imm)) {
-        buf_byte(b, 0x83);
-        buf_byte(b, modrm(3, op->ext, d->reg));
+        uint8_t opc = 0x83;
+        encode(a, w, op->ext, false, &opc, 1, d, 1);
         buf_byte(b, (uint8_t)s->imm);
-    } else if (d->reg == 0) {
+    } else if (d->kind == OP_REG && d->reg == 0) {
+        emit_rex(b, w, 0, 0, 0, false);
         buf_byte(b, op->acc);
         buf_u32(b, (uint32_t)s->imm);
     } else {
-        buf_byte(b, 0x81);
-        buf_byte(b, modrm(3, op->ext, d->reg));
+        uint8_t opc = 0x81;
+        encode(a, w, op->ext, false, &opc, 1, d, 4);
         buf_u32(b, (uint32_t)s->imm);
     }
 }
@@ -508,6 +667,10 @@ static void assemble_insn(Asm *a, const char *mn, Operand *ops, int n) {
         if (want(a, mn, n, 0)) buf_byte(b, 0x90);
         return;
     }
+    if (strcmp(mn, "cqo") == 0) { /* REX.W 99: sign-extend rax into rdx:rax */
+        if (want(a, mn, n, 0)) { buf_byte(b, 0x48); buf_byte(b, 0x99); }
+        return;
+    }
     if (strcmp(mn, "push") == 0 || strcmp(mn, "pop") == 0) {
         if (!want(a, mn, n, 1)) return;
         if (ops[0].kind != OP_REG || ops[0].size != 64) { bad_operands(a, mn); return; }
@@ -519,45 +682,23 @@ static void assemble_insn(Asm *a, const char *mn, Operand *ops, int n) {
     if (strcmp(mn, "mov") == 0) {
         if (!want(a, mn, n, 2)) return;
         Operand *d = &ops[0], *s = &ops[1];
-        if (d->kind == OP_REG && s->kind == OP_REG) {
-            if (d->size != s->size) { bad_operands(a, mn); return; }
-            /* 89 /r MOV r/m, r  (REX.W for 64-bit) */
-            emit_rex(b, d->size == 64, s->reg, 0, d->reg, false);
-            buf_byte(b, 0x89);
-            buf_byte(b, modrm(3, s->reg, d->reg));
-            return;
-        }
-        if (d->kind == OP_REG && s->kind == OP_MEM) {
-            if (d->size != 64) { bad_operands(a, mn); return; }
-            /* REX.W 8B /r MOV r64, r/m64 */
-            emit_rex(b, 1, d->reg, 0, 0, false);
-            buf_byte(b, 0x8B);
-            emit_mem(a, d->reg, s);
-            return;
-        }
-        if (d->kind == OP_MEM && s->kind == OP_REG) {
-            if (s->size != 64) { bad_operands(a, mn); return; }
-            /* REX.W 89 /r MOV r/m64, r64 */
-            emit_rex(b, 1, s->reg, 0, 0, false);
-            buf_byte(b, 0x89);
-            emit_mem(a, s->reg, d);
-            return;
-        }
         if (d->kind == OP_REG && s->kind == OP_IMM) {
-            if (d->size == 32) {
-                if (s->imm < INT32_MIN || s->imm > UINT32_MAX) {
-                    asm_error(a, "immediate out of range for 32-bit register");
-                    return;
-                }
+            if (d->size == 8) {
+                if (!imm_fits(a, s->imm, 8)) return;
+                /* B0+rb ib */
+                emit_rex(b, 0, 0, 0, d->reg, d->rex_byte);
+                buf_byte(b, (uint8_t)(0xB0 + (d->reg & 7)));
+                buf_byte(b, (uint8_t)s->imm);
+            } else if (d->size == 32) {
+                if (!imm_fits(a, s->imm, 32)) return;
                 /* B8+rd id MOV r32, imm32 (zero-extends into the 64-bit register) */
                 emit_rex(b, 0, 0, 0, d->reg, false);
                 buf_byte(b, (uint8_t)(0xB8 + (d->reg & 7)));
                 buf_u32(b, (uint32_t)s->imm);
             } else if (fits_i32(s->imm)) {
                 /* REX.W C7 /0 id MOV r/m64, imm32 (sign-extended) */
-                emit_rex(b, 1, 0, 0, d->reg, false);
-                buf_byte(b, 0xC7);
-                buf_byte(b, modrm(3, 0, d->reg));
+                uint8_t opc = 0xC7;
+                encode(a, 1, 0, false, &opc, 1, d, 4);
                 buf_u32(b, (uint32_t)s->imm);
             } else {
                 /* REX.W B8+rd io MOV r64, imm64 (movabs) */
@@ -567,7 +708,45 @@ static void assemble_insn(Asm *a, const char *mn, Operand *ops, int n) {
             }
             return;
         }
-        bad_operands(a, mn);
+        if (d->kind == OP_MEM && s->kind == OP_IMM) {
+            int size = opsize(d);
+            if (!size) { asm_error(a, "operand size of 'mov' is ambiguous (use qword ptr / dword ptr / byte ptr)"); return; }
+            if (!imm_fits(a, s->imm, size)) return;
+            uint8_t opc = size == 8 ? 0xC6 : 0xC7; /* C6 /0 ib, C7 /0 id */
+            encode(a, size == 64, 0, false, &opc, 1, d, size == 8 ? 1 : 4);
+            if (size == 8) buf_byte(b, (uint8_t)s->imm);
+            else buf_u32(b, (uint32_t)s->imm);
+            return;
+        }
+        if (!is_rm(d) || !is_rm(s) || (d->kind == OP_MEM && s->kind == OP_MEM)) { bad_operands(a, mn); return; }
+        int size = pair_size(a, mn, d, s);
+        if (!size) return;
+        if (s->kind == OP_REG) { /* 89 /r MOV r/m, r   (88 for 8-bit) */
+            uint8_t opc = size == 8 ? 0x88 : 0x89;
+            encode(a, size == 64, s->reg, needs_rex(s) || needs_rex(d), &opc, 1, d, 0);
+        } else { /* 8B /r MOV r, m   (8A for 8-bit) */
+            uint8_t opc = size == 8 ? 0x8A : 0x8B;
+            encode(a, size == 64, d->reg, needs_rex(d), &opc, 1, s, 0);
+        }
+        return;
+    }
+    if (strcmp(mn, "movzx") == 0) { /* 0F B6 /r MOVZX r32/64, r/m8 */
+        if (!want(a, mn, n, 2)) return;
+        Operand *d = &ops[0], *s = &ops[1];
+        if (d->kind != OP_REG || d->size == 8 || !is_rm(s) || (s->kind == OP_REG ? s->size != 8 : s->size != 8)) {
+            bad_operands(a, mn);
+            return;
+        }
+        static const uint8_t opc[2] = {0x0F, 0xB6};
+        encode(a, d->size == 64, d->reg, needs_rex(s), opc, 2, s, 0);
+        return;
+    }
+    if (strcmp(mn, "lea") == 0) {
+        if (!want(a, mn, n, 2)) return;
+        Operand *d = &ops[0], *s = &ops[1];
+        if (d->kind != OP_REG || d->size != 64 || s->kind != OP_MEM) { bad_operands(a, mn); return; }
+        uint8_t opc = 0x8D; /* REX.W 8D /r LEA r64, m */
+        encode(a, 1, d->reg, false, &opc, 1, s, 0);
         return;
     }
     for (size_t i = 0; i < sizeof ALU_OPS / sizeof *ALU_OPS; i++) {
@@ -579,42 +758,94 @@ static void assemble_insn(Asm *a, const char *mn, Operand *ops, int n) {
     if (strcmp(mn, "test") == 0) {
         if (!want(a, mn, n, 2)) return;
         Operand *d = &ops[0], *s = &ops[1];
-        if (d->kind != OP_REG) { bad_operands(a, mn); return; }
-        if (s->kind == OP_REG) {
-            if (d->size != s->size) { bad_operands(a, mn); return; }
-            /* 85 /r TEST r/m, r */
-            emit_rex(b, d->size == 64, s->reg, 0, d->reg, false);
-            buf_byte(b, 0x85);
-            buf_byte(b, modrm(3, s->reg, d->reg));
+        if (d->kind == OP_REG && s->kind == OP_MEM) { Operand t = *d; *d = *s; *s = t; } /* test is symmetric */
+        if (!is_rm(d)) { bad_operands(a, mn); return; }
+        if (s->kind == OP_REG) { /* 85 /r TEST r/m, r   (84 for 8-bit) */
+            int size = pair_size(a, mn, d, s);
+            if (!size) return;
+            uint8_t opc = size == 8 ? 0x84 : 0x85;
+            encode(a, size == 64, s->reg, needs_rex(s) || needs_rex(d), &opc, 1, d, 0);
             return;
         }
-        if (s->kind == OP_IMM) {
-            if (!fits_i32(s->imm) && !(d->size == 32 && s->imm >= 0 && s->imm <= UINT32_MAX)) {
-                asm_error(a, "immediate out of 32-bit range");
-                return;
-            }
-            /* A9 id TEST eax/rax, imm32 ; F7 /0 id TEST r/m, imm32 (no imm8 form exists) */
-            emit_rex(b, d->size == 64, 0, 0, d->reg, false);
-            if (d->reg == 0) {
-                buf_byte(b, 0xA9);
-            } else {
-                buf_byte(b, 0xF7);
-                buf_byte(b, modrm(3, 0, d->reg));
-            }
-            buf_u32(b, (uint32_t)s->imm);
-            return;
+        if (s->kind != OP_IMM) { bad_operands(a, mn); return; }
+        int size = opsize(d);
+        if (!size) { asm_error(a, "operand size of 'test' is ambiguous (use qword ptr / dword ptr / byte ptr)"); return; }
+        if (!imm_fits(a, s->imm, size)) return;
+        if (d->kind == OP_REG && d->reg == 0) { /* A8 ib / A9 id: TEST al/eax/rax, imm */
+            emit_rex(b, size == 64, 0, 0, 0, false);
+            buf_byte(b, size == 8 ? 0xA8 : 0xA9);
+        } else { /* F6 /0 ib, F7 /0 id */
+            uint8_t opc = size == 8 ? 0xF6 : 0xF7;
+            encode(a, size == 64, 0, needs_rex(d), &opc, 1, d, size == 8 ? 1 : 4);
         }
-        bad_operands(a, mn);
+        if (size == 8) buf_byte(b, (uint8_t)s->imm);
+        else buf_u32(b, (uint32_t)s->imm);
         return;
     }
-    if (strcmp(mn, "lea") == 0) {
+    if (strcmp(mn, "imul") == 0) {
+        if (n != 2 && n != 3) { asm_error(a, "'imul' expects 2 or 3 operands, got %d", n); return; }
+        Operand *d = &ops[0], *s = &ops[1];
+        if (d->kind != OP_REG || d->size == 8 || !is_rm(s)) { bad_operands(a, mn); return; }
+        int size = pair_size(a, mn, d, s);
+        if (!size) return;
+        if (n == 2) { /* 0F AF /r IMUL r, r/m */
+            static const uint8_t opc[2] = {0x0F, 0xAF};
+            encode(a, size == 64, d->reg, false, opc, 2, s, 0);
+            return;
+        }
+        if (ops[2].kind != OP_IMM || !fits_i32(ops[2].imm)) { bad_operands(a, mn); return; }
+        bool small = fits_i8(ops[2].imm); /* 6B /r ib  or  69 /r id: IMUL r, r/m, imm */
+        uint8_t opc = small ? 0x6B : 0x69;
+        encode(a, size == 64, d->reg, false, &opc, 1, s, small ? 1 : 4);
+        if (small) buf_byte(b, (uint8_t)ops[2].imm);
+        else buf_u32(b, (uint32_t)ops[2].imm);
+        return;
+    }
+    if (strcmp(mn, "neg") == 0 || strcmp(mn, "not") == 0 || strcmp(mn, "idiv") == 0) {
+        if (!want(a, mn, n, 1)) return;
+        Operand *d = &ops[0];
+        int size = is_rm(d) ? opsize(d) : 0;
+        if (!size) { if (is_rm(d)) asm_error(a, "operand size of '%s' is ambiguous", mn); else bad_operands(a, mn); return; }
+        if (size == 8) { asm_error(a, "8-bit operands are not supported for '%s'", mn); return; }
+        int ext = mn[0] == 'n' ? (mn[1] == 'e' ? 3 : 2) : 7; /* F7 /3 NEG, /2 NOT, /7 IDIV */
+        uint8_t opc = 0xF7;
+        encode(a, size == 64, ext, false, &opc, 1, d, 0);
+        return;
+    }
+    if (strcmp(mn, "shl") == 0 || strcmp(mn, "shr") == 0 || strcmp(mn, "sar") == 0) {
         if (!want(a, mn, n, 2)) return;
         Operand *d = &ops[0], *s = &ops[1];
-        if (d->kind != OP_REG || d->size != 64 || s->kind != OP_MEM) { bad_operands(a, mn); return; }
-        /* REX.W 8D /r LEA r64, m */
-        emit_rex(b, 1, d->reg, 0, 0, false);
-        buf_byte(b, 0x8D);
-        emit_mem(a, d->reg, s);
+        int size = is_rm(d) ? opsize(d) : 0;
+        if (!size || s->kind != OP_IMM) { bad_operands(a, mn); return; }
+        if (size == 8) { asm_error(a, "8-bit operands are not supported for '%s'", mn); return; }
+        if (s->imm < 0 || s->imm >= size) { asm_error(a, "shift count %lld out of range", (long long)s->imm); return; }
+        int ext = mn[1] == 'h' ? (mn[2] == 'l' ? 4 : 5) : 7; /* /4 SHL, /5 SHR, /7 SAR */
+        if (s->imm == 1) { /* D1 /n: shift by one */
+            uint8_t opc = 0xD1;
+            encode(a, size == 64, ext, false, &opc, 1, d, 0);
+        } else { /* C1 /n ib */
+            uint8_t opc = 0xC1;
+            encode(a, size == 64, ext, false, &opc, 1, d, 1);
+            buf_byte(b, (uint8_t)s->imm);
+        }
+        return;
+    }
+    if (strncmp(mn, "set", 3) == 0 && cond_code(mn + 3) >= 0) { /* 0F 90+cc /0 SETcc r/m8 */
+        if (!want(a, mn, n, 1)) return;
+        Operand *d = &ops[0];
+        if (!is_rm(d) || opsize(d) != 8) { bad_operands(a, mn); return; }
+        uint8_t opc[2] = {0x0F, (uint8_t)(0x90 + cond_code(mn + 3))};
+        encode(a, 0, 0, needs_rex(d), opc, 2, d, 0);
+        return;
+    }
+    if (strncmp(mn, "cmov", 4) == 0 && cond_code(mn + 4) >= 0) { /* 0F 40+cc /r CMOVcc r, r/m */
+        if (!want(a, mn, n, 2)) return;
+        Operand *d = &ops[0], *s = &ops[1];
+        if (d->kind != OP_REG || d->size == 8 || !is_rm(s)) { bad_operands(a, mn); return; }
+        int size = pair_size(a, mn, d, s);
+        if (!size) return;
+        uint8_t opc[2] = {0x0F, (uint8_t)(0x40 + cond_code(mn + 4))};
+        encode(a, size == 64, d->reg, false, opc, 2, s, 0);
         return;
     }
     if (strcmp(mn, "call") == 0) {
