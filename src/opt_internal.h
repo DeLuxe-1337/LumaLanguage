@@ -43,5 +43,6 @@ bool opt_sccp(IrModule *m, IrFunc *f);
 bool opt_gvn(IrModule *m, IrFunc *f);
 bool opt_licm(IrModule *m, IrFunc *f);
 bool opt_dce(IrModule *m, IrFunc *f);
+bool opt_objects(IrModule *m, IrFunc *f); /* non-SSA: devirtualize struct accesses, forward field loads */
 
 #endif

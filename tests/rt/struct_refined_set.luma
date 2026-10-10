@@ -1,0 +1,9 @@
+struct P { x: int }
+fun dyn(v) { return v; }
+fun f(n: P?) {
+  if (n != nil) {
+    print(n.x);          // n is known to be a P here: a static read
+    n.x = dyn("no");     // ...but the value still needs its run-time check
+  }
+}
+f(P { x: 1 });

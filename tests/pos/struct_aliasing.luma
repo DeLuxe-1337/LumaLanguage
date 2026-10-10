@@ -1,0 +1,39 @@
+// Field reads must see writes made through another reference to the same
+// object, inside calls and through dynamic (untyped) accesses: the
+// optimizer's field load forwarding has to forget what it knows then.
+struct C { n: int }
+struct D { n: int }
+impl C {
+  fun set(self, v: int) { self.n = v; }
+}
+fun bump(c: C) { c.n = c.n + 1; }
+fun dyn(x) { return x; }
+
+fun test() {
+  var a: C = C { n: 1 };
+  var b: C = a;
+  var d = dyn(a);       // the same object again, statically unknown
+  var x = a.n;
+  b.n = 5;              // the same object as a
+  print(a.n, x);
+  bump(a);              // a call may write fields
+  print(a.n);
+  var y = a.n;
+  d.n = 7;              // a dynamic write
+  print(a.n, b.n, y);
+  a.set(8);             // a method call
+  print(a.n);
+  d.set(9);             // a dynamic method call
+  print(a.n);
+  var other: D = D { n: 100 };
+  var before = a.n;
+  other.n = 0;          // another struct's field of the same name
+  print(a.n, before, other.n);
+  var i = 0;
+  while (i < 3) {       // reads in a loop see each iteration's write
+    b.n = b.n + 10;
+    print(a.n);
+    i = i + 1;
+  }
+}
+test();

@@ -21,6 +21,7 @@ static bool optimize_function(IrModule *m, IrFunc *f) {
     opt_from_ssa(f);
     opt_coalesce(f);
     opt_simplify_cfg(m, f, false);
+    opt_objects(m, f);
     ir_func_compact(f);
     ir_func_canonicalize(f);
     return true;

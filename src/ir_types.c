@@ -84,6 +84,65 @@ void ir_types_refine(const IrInstr *in, IrTy *state) {
 
 static bool refining; /* ir_types_compute_refined in progress */
 
+/* ---- branch conditions ----
+ * On the edges out of `br %c, T, F` a value is known to be truthy (T) or
+ * falsy (F); when %c was computed in the same block as `ne %v, %n` /
+ * `eq %v, %n` with %n exactly nil (or `not %x`), %v itself is known to be
+ * nil or not on each edge. This is what makes `while (node != nil)
+ * node = node.next;` see a struct, not a struct-or-nil, inside the loop. */
+
+static void narrow(IrTy *st, int v, IrTy t) {
+    IrTy r = ir_ty_inter(st[v], t);
+    if (r) st[v] = r; /* never narrow to "no value": keep the analysis conservative */
+}
+
+static void narrow_truth(IrTy *st, int v, bool truthy) {
+    if (truthy) {
+        IrTy r = st[v] & ~(IrTy)TY_NIL; /* a truthy value is not nil (it may still be true) */
+        if (r) st[v] = r;
+    } else {
+        narrow(st, v, TY_NIL | TY_BOOL);
+    }
+}
+
+/* Is v assigned by an instruction of blk after index `from` (up to the terminator)? */
+static bool assigned_after(const IrBlock *blk, int from, int v) {
+    for (int k = from + 1; k < blk->n; k++)
+        if (blk->instrs[k].dst == v) return true;
+    return false;
+}
+
+static void branch_refine(const IrBlock *blk, IrTy *st, bool truthy) {
+    const IrInstr *br = &blk->instrs[blk->n - 1];
+    int c = br->a;
+    if (c < 0) return;
+    narrow_truth(st, c, truthy);
+    for (int depth = 0; depth < 4; depth++) {
+        int j = -1;
+        for (int k = blk->n - 2; k >= 0 && j < 0; k--)
+            if (blk->instrs[k].dst == c) j = k;
+        if (j < 0) return;
+        const IrInstr *d = &blk->instrs[j];
+        if (d->op == IR_NOT && d->a >= 0 && !assigned_after(blk, j, d->a)) {
+            truthy = !truthy;
+            c = d->a;
+            narrow_truth(st, c, truthy);
+            continue;
+        }
+        if ((d->op == IR_EQ || d->op == IR_NE) && d->a >= 0 && d->b >= 0) {
+            int v = st[d->b] == TY_NIL ? d->a : st[d->a] == TY_NIL ? d->b : -1;
+            if (v < 0 || assigned_after(blk, j, d->a) || assigned_after(blk, j, d->b)) return;
+            bool is_nil = (d->op == IR_EQ) == truthy;
+            if (is_nil) narrow(st, v, TY_NIL);
+            else {
+                IrTy r = st[v] & ~(IrTy)TY_NIL;
+                if (r) st[v] = r;
+            }
+        }
+        return;
+    }
+}
+
 void ir_types_free(IrTypes *t) {
     free(t->in);
     free(t->out);
@@ -102,6 +161,7 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
     for (int p = 0; p < f->nparams; p++) t->in[p] = ir_param_ty(g, p);
 
     IrTy *st = xmalloc((size_t)(nv ? nv : 1) * sizeof *st);
+    IrTy *edge = xmalloc((size_t)(nv ? nv : 1) * sizeof *edge);
     bool *queued = xcalloc((size_t)nb, sizeof *queued);
     int *work = xmalloc((size_t)nb * sizeof *work);
     int nw = 0;
@@ -138,8 +198,14 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
             if (succ < 0 || succ >= nb) continue;
             IrTy *sin = &t->in[(size_t)succ * nv];
             bool grew = !seen[succ];
+            const IrTy *src = st;
+            if (term->op == IR_BR) {
+                memcpy(edge, st, (size_t)nv * sizeof *edge);
+                branch_refine(blk, edge, s == 0);
+                src = edge;
+            }
             for (int v = 0; v < nv; v++) {
-                IrTy u = ir_ty_union(sin[v], st[v]);
+                IrTy u = ir_ty_union(sin[v], src[v]);
                 if (u != sin[v]) {
                     sin[v] = u;
                     grew = true;
@@ -153,6 +219,7 @@ void ir_types_compute(const IrModule *m, const IrFunc *f, IrTypes *t) {
         }
     }
     free(st);
+    free(edge);
     free(queued);
     free(work);
     free(seen);

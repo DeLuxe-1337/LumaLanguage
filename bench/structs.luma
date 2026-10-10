@@ -1,0 +1,33 @@
+// Structs: small objects, field reads and writes, methods (typed), a linked
+// list walked with `node != nil` (typed as Node? and narrowed by the loop test).
+struct Vec { x: int, y: int }
+
+impl Vec {
+  fun add(self, o: Vec) { self.x = self.x + o.x; self.y = self.y + o.y; }
+  fun dot(self, o: Vec): int { return self.x * o.x + self.y * o.y; }
+}
+
+struct Node { value: int, next: Node? }
+
+fun run(): int {
+  var pos = Vec { x: 0, y: 0 };
+  var vel = Vec { x: 3, y: -2 };
+  var acc = 0;
+  for (var i = 0; i < 20000000; i = i + 1) {
+    pos.add(vel);
+    if (pos.x > 1000) pos.x = pos.x - 2000;
+    if (pos.y < -1000) pos.y = pos.y + 2000;
+    acc = acc + pos.dot(vel) / 1024;
+  }
+  var list: Node? = nil;
+  for (var i = 0; i < 200000; i = i + 1) list = Node { value: i, next: list };
+  for (var k = 0; k < 50; k = k + 1) {
+    var n: Node? = list;
+    while (n != nil) {
+      acc = acc + (n.value - n.value / 7 * 7);
+      n = n.next;
+    }
+  }
+  return acc;
+}
+print(run());
