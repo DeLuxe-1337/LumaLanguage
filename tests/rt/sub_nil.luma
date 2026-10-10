@@ -1,1 +1,2 @@
-print(nil - 1);
+var n = nil;
+print(n - 1);

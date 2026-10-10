@@ -1,3 +1,6 @@
+// untyped values: the mismatch is only discovered at runtime
+var one = 1;
+var a = "a";
 print("before");
-print(1 + "a");
+print(one + a);
 print("after");

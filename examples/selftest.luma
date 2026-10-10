@@ -3,7 +3,8 @@
 // Each check is one call:  check(CONDITION, "description");
 // A check passes only if CONDITION is exactly true. Failing checks print
 // "FAIL: description". The program ends with a summary and
-// "SELFTEST PASSED" (exit 0), or "SELFTEST FAILED" and exit status 1.
+// "SELFTEST PASSED" (exit 0), or "SELFTEST FAILED" and exit status 1
+// (via C's exit(), declared with `extern fun`).
 //
 //   ./build/luma examples/selftest.luma -o build/selftest && ./build/selftest
 
@@ -228,10 +229,11 @@ check(trace == "xy", "arguments evaluate left to right");
 
 // ---------------------------------------------------------------- summary
 print("selftest:", passed, "passed,", failed, "failed");
+// C's exit() through the FFI: flushes stdout and sets the exit status.
+extern fun exit(code: i32): void;
 if (failed == 0) {
   print("SELFTEST PASSED");
 } else {
   print("SELFTEST FAILED");
-  // Luma has no exit() yet: a deliberate runtime error makes the process exit with status 1.
-  nil - 1;
+  exit(1);
 }
