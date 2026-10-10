@@ -1,0 +1,3 @@
+fun f(x): int {
+  if (x) return 1;
+}

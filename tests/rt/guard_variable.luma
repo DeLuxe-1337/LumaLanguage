@@ -1,0 +1,4 @@
+fun untyped(x) { return x; }
+var n: int = 1;
+print(n);
+n = untyped("oops");

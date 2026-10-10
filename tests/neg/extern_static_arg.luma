@@ -1,0 +1,2 @@
+extern fun puts(s: cstr): i32;
+puts(42);

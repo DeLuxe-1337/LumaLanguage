@@ -1,0 +1,1 @@
+extern fun luma_add(a: i64): i64;

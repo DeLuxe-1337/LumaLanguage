@@ -1,0 +1,1 @@
+global 'a' was declared as int; redeclaring it as str is not allowed

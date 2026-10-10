@@ -3,9 +3,19 @@
 compared against an independent reference interpreter written here.
 
 Each program is generated as a small AST, rendered to Luma source, and
-evaluated by `Interp` below with Lox semantics plus Luma's integer rules
-(63-bit fixnums, overflow is a runtime error, floor division). Both stdout
-and the runtime error message (if any) must match exactly.
+evaluated by `Interp` below with Luma semantics: Lox-style values, 63-bit
+fixnums (overflow is a runtime error), floor division, functions, globals,
+variadic print, and gradual types (annotated slots are guarded at runtime).
+Stdout, the runtime error message (if any) and the exit status must match.
+
+Programs are mostly well typed. Deliberate type errors are injected through
+an untyped identity function `dyn(x)`, so the compiler's static checker
+cannot see them and they surface as runtime errors (or runtime type guards
+when they reach an annotated variable, parameter or return value).
+
+For every program the tester also checks that the emitted .lir recompiles to
+identical assembly and that GNU as (validation only) assembles our .s into
+identical bytes.
 
 usage: tests/difftest.py [COUNT] [SEED]      (run from the repository root)
 """
@@ -64,17 +74,31 @@ def show(v):
     return str(v)
 
 
+def type_of(v):
+    if v is None:
+        return "nil"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "int"
+    return "str"
+
+
 # ---------------------------------------------------------------- AST + render
 # expressions: ('int', n) ('str', s) ('nil',) ('bool', b) ('var', name)
 #              ('assign', name, e) ('un', op, e) ('bin', op, l, r) ('log', op, l, r)
 #              ('call', fname, [args])
-# statements:  ('print', [exprs]) ('expr', e) ('var', name, e) ('block', [stmts])
+# statements:  ('print', [exprs]) ('expr', e) ('var', name, e, ann|None) ('block', [stmts])
 #              ('if', c, then, else|None) ('loop', counter, n, [stmts]) ('return', e)
-# functions:   ('fun', name, [params], [stmts])   -- rendered first (they are hoisted)
+# functions:   ('fun', name, [params], [stmts], [param anns], ret ann)   -- rendered first
 
 
 def esc(s):
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
+
+
+def ann(a):
+    return ": %s" % a if a else ""
 
 
 def render_e(e):
@@ -106,12 +130,13 @@ def render_s(s, ind=0):
     if k == "return":
         return p + "return %s;\n" % render_e(s[1])
     if k == "fun":
-        return (p + "fun %s(%s) {\n" % (s[1], ", ".join(s[2])) + "".join(render_s(x, ind + 1) for x in s[3])
+        params = ", ".join(n + ann(a) for n, a in zip(s[2], s[4]))
+        return (p + "fun %s(%s)%s {\n" % (s[1], params, ann(s[5])) + "".join(render_s(x, ind + 1) for x in s[3])
                 + p + "}\n")
     if k == "expr":
         return p + "%s;\n" % render_e(s[1])
     if k == "var":
-        return p + "var %s = %s;\n" % (s[1], render_e(s[2]))
+        return p + "var %s%s = %s;\n" % (s[1], ann(s[3]), render_e(s[2]))
     if k == "block":
         return p + "{\n" + "".join(render_s(x, ind + 1) for x in s[1]) + p + "}\n"
     if k == "if":
@@ -133,17 +158,26 @@ class Return(Exception):
         self.value = value
 
 
+DYN = ("fun", "dyn", ["x"], [("return", ("var", "x"))], [None], None)
+
+
 class Interp:
+    """Scopes map name -> [value, annotation]; scopes[0] holds the globals."""
+
     def __init__(self, funs=()):
         self.out = []
-        self.scopes = [{}]          # scopes[0] holds the globals
+        self.scopes = [{}]
         self.funs = {f[1]: f for f in funs}
         self.depth = 0
+
+    def guard(self, value, annotation, what):
+        if annotation and type_of(value) != annotation:
+            raise LumaError("%s expects %s, got %s." % (what, annotation, type_of(value)))
 
     def lookup(self, name):
         for sc in reversed(self.scopes):
             if name in sc:
-                return sc
+                return sc[name]
         raise AssertionError("generator bug: undefined " + name)
 
     def ev(self, e):
@@ -157,10 +191,12 @@ class Interp:
         if k == "bool":
             return e[1]
         if k == "var":
-            return self.lookup(e[1])[e[1]]
+            return self.lookup(e[1])[0]
         if k == "assign":
             v = self.ev(e[2])
-            self.lookup(e[1])[e[1]] = v
+            cell = self.lookup(e[1])
+            cell[0] = v
+            self.guard(v, cell[1], "variable '%s'" % e[1])
             return v
         if k == "un":
             v = self.ev(e[2])
@@ -172,8 +208,10 @@ class Interp:
         if k == "call":
             fn = self.funs[e[1]]
             args = [self.ev(a) for a in e[2]]      # all arguments, left to right
+            for name, value, a in zip(fn[2], args, fn[4]):   # then each typed parameter's guard
+                self.guard(value, a, "argument '%s' of '%s'" % (name, fn[1]))
             saved = self.scopes
-            self.scopes = [saved[0], dict(zip(fn[2], args))]   # params share the body scope
+            self.scopes = [saved[0], {n: [v, a] for n, v, a in zip(fn[2], args, fn[4])}]
             self.depth += 1
             if self.depth > 200:
                 raise AssertionError("generator bug: runaway recursion")
@@ -226,12 +264,15 @@ class Interp:
             vals = [self.ev(a) for a in s[1]]       # evaluated before anything is written
             self.out.append(" ".join(show(v) for v in vals))
         elif k == "return":
-            raise Return(self.ev(s[1]))
+            v = self.ev(s[1])
+            fn = self.current_fun
+            raise Return(v) if fn is None else self.ret(v, fn)
         elif k == "expr":
             self.ev(s[1])
         elif k == "var":
             v = self.ev(s[2])
-            self.scopes[-1][s[1]] = v
+            self.scopes[-1][s[1]] = [v, s[3]]
+            self.guard(v, s[3], "variable '%s'" % s[1])
         elif k == "block":
             self.scopes.append({})
             try:
@@ -245,33 +286,56 @@ class Interp:
                 self.ex(s[3])
         elif k == "loop":
             c = s[1]
-            self.scopes[-1][c] = s[2]
-            while self.scopes[-1][c] > 0:
+            self.scopes[-1][c] = [s[2], None]
+            while self.scopes[-1][c][0] > 0:
                 self.scopes.append({})
                 try:
                     self.run(s[3])
                 finally:
                     self.scopes.pop()
-                self.scopes[-1][c] = self.scopes[-1][c] - 1
+                self.scopes[-1][c][0] -= 1
+
+    current_fun = None
+
+    def ret(self, v, fn):
+        self.guard(v, fn[5], "return value of '%s'" % fn[1])
+        raise Return(v)
+
+
+class FunInterp(Interp):
+    """Tracks the function whose body is executing, for return-value guards."""
+
+    def ev(self, e):
+        if e[0] != "call":
+            return super().ev(e)
+        saved = self.current_fun
+        self.current_fun = self.funs[e[1]]
+        try:
+            return super().ev(e)
+        finally:
+            self.current_fun = saved
 
 
 # ---------------------------------------------------------------- generator
 # Programs are mostly well typed so they run long enough to exercise control
-# flow, scoping and arithmetic; with probability ERR_RATE an expression is
-# deliberately ill typed (or a divisor may be zero) to exercise error paths.
-# Each variable keeps one static type for its lifetime; assignments preserve it.
+# flow, scoping, functions and arithmetic. With probability ERR_RATE an
+# expression of the wrong type is generated and wrapped in dyn(...), which
+# hides it from the static checker.
 TYPES = ("int", "str", "bool", "nil")
 ERR_RATE = 0.003  # per expression; programs are large, so most still contain none
+ANNOTATE = 0.4    # chance that a declaration carries a type annotation
+GUARD_RATE = 0.04 # chance that a value headed for an annotated slot is a hidden wrong type
 
 
 class Gen:
     def __init__(self, rng):
         self.r = rng
         self.n = 0
-        self.scopes = [{}]   # per scope: name -> static type (assignable variables)
-        self.funs = []       # (name, [param types], return type), in definition order
+        self.scopes = [{}]   # per scope: name -> (static type, annotation or None)
+        self.funs = []       # (name, [param types], return type, [param annotations]), in definition order
         self.callable = 0    # calls may target funs[:callable] (no recursion: always terminates)
         self.ret_type = None # inside a function body: its return type
+        self.ret_ann = None  # ... and its annotation
 
     def fresh(self, prefix):
         self.n += 1
@@ -281,7 +345,7 @@ class Gen:
         seen = {}
         for sc in self.scopes:
             seen.update(sc)   # inner declarations shadow outer ones
-        return seen
+        return {k: v[0] for k, v in seen.items()}
 
     def literal(self, t):
         r = self.r
@@ -299,7 +363,8 @@ class Gen:
         """An expression of static type t (unless an error is injected)."""
         r = self.r
         if r.random() < ERR_RATE:
-            t = r.choice(TYPES)   # type confusion: may produce a runtime error
+            wrong = r.choice(TYPES)   # type confusion, hidden from the checker
+            return ("call", "dyn", [self.expr(wrong, depth - 1, exclude)])
         names = [v for v, vt in self.visible().items() if vt == t and v not in exclude]
         if depth <= 0 or r.random() < 0.2:
             if names and r.random() < 0.6:
@@ -310,8 +375,8 @@ class Gen:
             return ("assign", r.choice(names), self.expr(t, depth - 1, exclude))
         cands = [f for f in self.funs[:self.callable] if f[2] == t]
         if cands and r.random() < 0.15:
-            name, ptypes, _ = r.choice(cands)
-            return ("call", name, [self.expr(pt, depth - 1, exclude) for pt in ptypes])
+            name, ptypes, _, panns = r.choice(cands)
+            return ("call", name, [self.slot_expr(pt, pa, depth - 1, exclude) for pt, pa in zip(ptypes, panns)])
         if c < 0.2:   # same-typed short-circuit: result has the operands' type
             return ("log", r.choice(["and", "or"]), self.expr(t, depth - 1, exclude), self.expr(t, depth - 1, exclude))
         if t == "int":
@@ -336,8 +401,25 @@ class Gen:
                     self.expr("int", depth - 1, exclude))
         return self.literal("nil")
 
+    def slot_expr(self, t, annotation, depth, exclude=()):
+        """A value for a slot of type t; for annotated slots, sometimes a hidden
+        wrong type, which the runtime guard must catch."""
+        if annotation and self.r.random() < GUARD_RATE:
+            wrong = self.r.choice([x for x in TYPES if x != t])
+            return ("call", "dyn", [self.expr(wrong, depth - 1, exclude)])
+        return self.expr(t, depth, exclude)
+
+    def ann_of(self, name):
+        for sc in reversed(self.scopes):
+            if name in sc:
+                return sc[name][1]
+        return None
+
     def any_type(self):
         return self.r.choice(("int", "int", "int", "str", "str", "bool", "nil"))
+
+    def annotation(self, t):
+        return t if self.r.random() < ANNOTATE else None
 
     def stmts(self, n, depth):
         return [self.stmt(depth) for _ in range(n)]
@@ -353,7 +435,7 @@ class Gen:
         c = r.random()
         vis = self.visible()
         if self.ret_type and c < 0.05:
-            return ("return", self.expr(self.ret_type, 2))   # early return
+            return ("return", self.slot_expr(self.ret_type, self.ret_ann, 2))   # early return
         if c < 0.3:
             return ("print", [self.expr(self.any_type(), 3) for _ in range(r.choice((1, 1, 1, 2, 3, 0)))])
         if c < 0.45:
@@ -364,18 +446,22 @@ class Gen:
                 name = r.choice([v for v in vis if v not in self.scopes[-1]] or [self.fresh("v")])  # shadowing
             else:
                 name = self.fresh("v")
-            t = vis[name] if (top and name in vis) else self.any_type()   # redeclaration keeps the type
-            init = self.expr(t, 3, exclude=() if top else (name,))
-            self.scopes[-1][name] = t
-            return ("var", name, init)
+            if top and name in self.scopes[0]:
+                t, a = self.scopes[0][name]   # a redeclaration keeps the type and the annotation
+            else:
+                t = self.any_type()
+                a = self.annotation(t)
+            init = self.slot_expr(t, a, 3, exclude=() if top else (name,))
+            self.scopes[-1][name] = (t, a)
+            return ("var", name, init, a)
         if c < 0.6 and vis:
             name = r.choice(list(vis))
-            return ("expr", ("assign", name, self.expr(vis[name], 3)))
+            return ("expr", ("assign", name, self.slot_expr(vis[name], self.ann_of(name), 3)))
         if c < 0.67:
             return ("expr", self.expr(self.any_type(), 2))
         if c < 0.71 and self.funs[:self.callable]:
-            name, ptypes, _ = r.choice(self.funs[:self.callable])   # call as a statement
-            return ("expr", ("call", name, [self.expr(pt, 2) for pt in ptypes]))
+            name, ptypes, _, panns = r.choice(self.funs[:self.callable])   # call as a statement
+            return ("expr", ("call", name, [self.slot_expr(pt, pa, 2) for pt, pa in zip(ptypes, panns)]))
         if depth <= 0:
             return ("print", [self.expr(self.any_type(), 2)])
         if c < 0.77:
@@ -395,15 +481,17 @@ class Gen:
         name = self.fresh("f")
         ptypes = [self.any_type() for _ in range(r.randint(0, 3))]
         params = [self.fresh("p") for _ in ptypes]
+        panns = [self.annotation(t) for t in ptypes]
         ret = self.any_type()
-        saved = (self.scopes, self.callable, self.ret_type)
-        self.scopes = [dict(self.scopes[0]), dict(zip(params, ptypes))]
+        rann = self.annotation(ret)
+        saved = (self.scopes, self.callable, self.ret_type, self.ret_ann)
+        self.scopes = [dict(self.scopes[0]), {p: (t, a) for p, t, a in zip(params, ptypes, panns)}]
         self.callable = len(self.funs)
-        self.ret_type = ret
-        body = self.stmts(r.randint(1, 4), 2) + [("return", self.expr(ret, 2))]
-        self.scopes, self.callable, self.ret_type = saved
-        self.funs.append((name, ptypes, ret))
-        return ("fun", name, params, body)
+        self.ret_type, self.ret_ann = ret, rann
+        body = self.stmts(r.randint(1, 4), 2) + [("return", self.slot_expr(ret, rann, 2))]
+        self.scopes, self.callable, self.ret_type, self.ret_ann = saved
+        self.funs.append((name, ptypes, ret, panns))
+        return ("fun", name, params, body, panns, rann)
 
 
 def generate(seed):
@@ -416,13 +504,13 @@ def generate(seed):
     funs = [g.function() for _ in range(rng.randint(0, 4))]
     g.callable = len(g.funs)
     prog = globals_ + g.stmts(rng.randint(3, 14), 3)
-    return funs, prog
+    return [DYN] + funs, prog
 
 
 def one(seed, workdir):
     funs, prog = generate(seed)
     src = "".join(render_s(f) for f in funs) + "".join(render_s(s) for s in prog)
-    it = Interp(funs)
+    it = FunInterp(funs)
     err = None
     try:
         it.run(prog)

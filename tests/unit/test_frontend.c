@@ -260,9 +260,54 @@ static void test_lower(void) {
     expect_ir_contains("var n = 0; fun inc() { n = n + 1; }", "fn @fn.inc() {\nentry:\n  %0 = load @var.n");
     expect_ir_contains("fun f(a) { var a2 = a; { var a = 1; return a; } }", "%a.1 = const 1");
 
+    /* gradual typing */
+    expect_ir_contains("fun f(a: int): int { return a; } print(f(1));", "%1 = call @fn.f(%0)"); /* fits: no guard */
+    expect_ir_contains("fun u(x) { return x; } fun f(a: int) {} f(u(1));",
+                       "call @luma_check_type(%1, %2, %3)\n  call @fn.f(%1)");        /* any -> int: guarded */
+    expect_ir_contains("fun u(x) { return x; } fun f(a: int) {} f(u(1));", "data @s0 = str \"argument 'a' of 'f'\"");
+    expect_ir_contains("fun u(x) { return x; } var n: int = u(1);",
+                       "%2 = const 1\n  %3 = const @s0\n  call @luma_check_type(%1, %2, %3)\n  store @var.n, %1"); /* mask 1 = int */
+    expect_ir_contains("fun u(x) { return x; } var n: int = u(1) + 1;", "%3 = add %1, %2\n  store @var.n, %3"); /* '+' with int -> int: no guard */
+    expect_ir_contains("fun f(): int { for (;;) { return 1; } }", "fn @fn.f() {\nentry:\n  jmp while.cond.0\n");
+    char *g = lower_str("var n: int = 1; n = 2;");
+    CHECK(g && strstr(g, "luma_check_type") == NULL); /* fully typed: no guards at all */
+    free(g);
+    g = lower_str("var s: str? = nil; var b: bool = 1 < 2; var a: any = s;");
+    CHECK(g && strstr(g, "luma_check_type") == NULL);
+    free(g);
+    /* extern fun */
+    expect_ir_contains("extern fun puts(s: cstr): i32; puts(\"x\");", "extern c fn @puts(s: cstr): i32\n");
+    expect_ir_contains("extern fun puts(s: cstr): i32; puts(\"x\");", "  call @puts(%0)\n");
+    expect_ir_contains("extern fun getenv(n: cstr): cstr?; var h: str? = getenv(\"H\");", "store @var.h, %1");
+
     fprintf(stderr, "[expected diagnostics follow]\n");
     char *ir;
     CHECK((ir = lower_str("print(y);")) == NULL);                         /* undefined */
+    CHECK((ir = lower_str("var n: int = \"x\";")) == NULL);
+    CHECK((ir = lower_str("var n: int;")) == NULL);
+    CHECK((ir = lower_str("fun f(a: str) {} f(1);")) == NULL);
+    CHECK((ir = lower_str("fun f(): int {}")) == NULL);
+    CHECK((ir = lower_str("fun f(): int { return nil; }")) == NULL);
+    CHECK((ir = lower_str("fun f(x): str { if (x) return \"a\"; }")) == NULL);
+    CHECK((ir = lower_str("var x: u8 = 1;")) == NULL);
+    CHECK((ir = lower_str("var x: number = 1;")) == NULL);
+    CHECK((ir = lower_str("print(1 + \"a\");")) == NULL);
+    CHECK((ir = lower_str("print(\"a\" - \"b\");")) == NULL);
+    CHECK((ir = lower_str("print(-true);")) == NULL);
+    CHECK((ir = lower_str("print(nil < 1);")) == NULL);
+    CHECK((ir = lower_str("var b: bool = true; var i: int = b;")) == NULL);
+    CHECK((ir = lower_str("var a: int = 1; var a = 2;")) == NULL);      /* redeclared with another type */
+    CHECK((ir = lower_str("extern fun f(x: int): void;")) == NULL);
+    CHECK((ir = lower_str("extern fun f(x: f64): void;")) == NULL);
+    CHECK((ir = lower_str("extern fun f(): i64; f(1);")) == NULL);      /* arity */
+    CHECK((ir = lower_str("extern fun f(s: cstr): void; f(1);")) == NULL);
+    CHECK((ir = lower_str("extern fun f(): void; extern fun f(): void;")) == NULL);
+    CHECK((ir = lower_str("extern fun print(): void;")) == NULL);
+    CHECK((ir = lower_str("extern fun luma_x(): void;")) == NULL);
+    CHECK((ir = lower_str("extern fun f(a: i8, b: i8, c: i8, d: i8, e: i8, g: i8, h: i8): void;")) == NULL);
+    ir = lower_str("print(1 + 2, \"a\" + \"b\");");                  /* well-typed literals are fine */
+    CHECK(ir != NULL);
+    free(ir);
     CHECK((ir = lower_str("print;")) == NULL);                            /* builtin not called */
     CHECK((ir = lower_str("fun f(a) {} f();")) == NULL);                  /* arity */
     CHECK((ir = lower_str("fun f() {} var x = f;")) == NULL);             /* not first-class */

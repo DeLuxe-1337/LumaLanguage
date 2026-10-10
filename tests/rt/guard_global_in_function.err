@@ -1,0 +1,1 @@
+luma: runtime error: variable 'total' expects int, got str.
