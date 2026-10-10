@@ -56,7 +56,7 @@ static const struct {
 } KEYWORDS[] = {
     {"and", TOK_AND},       {"class", TOK_CLASS}, {"else", TOK_ELSE},     {"false", TOK_FALSE},
     {"for", TOK_FOR},       {"fun", TOK_FUN},     {"if", TOK_IF},         {"nil", TOK_NIL},
-    {"or", TOK_OR},         {"print", TOK_PRINT}, {"return", TOK_RETURN}, {"super", TOK_SUPER},
+    {"or", TOK_OR},         {"return", TOK_RETURN}, {"super", TOK_SUPER},
     {"this", TOK_THIS},     {"true", TOK_TRUE},   {"var", TOK_VAR},       {"while", TOK_WHILE},
 };
 
@@ -245,7 +245,7 @@ const char *token_kind_name(TokenKind k) {
         "LEFT_PAREN", "RIGHT_PAREN", "LEFT_BRACE", "RIGHT_BRACE", "COMMA", "DOT", "MINUS", "PLUS",
         "SEMICOLON", "SLASH", "STAR", "BANG", "BANG_EQUAL", "EQUAL", "EQUAL_EQUAL", "GREATER",
         "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "AND", "CLASS",
-        "ELSE", "FALSE", "FOR", "FUN", "IF", "NIL", "OR", "PRINT", "RETURN", "SUPER", "THIS", "TRUE",
+        "ELSE", "FALSE", "FOR", "FUN", "IF", "NIL", "OR", "RETURN", "SUPER", "THIS", "TRUE",
         "VAR", "WHILE", "EOF",
     };
     return (unsigned)k < sizeof names / sizeof *names ? names[k] : "?";

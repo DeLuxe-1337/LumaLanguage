@@ -8,7 +8,9 @@
  * escape, a raw newline, or EOF inside a string is an error. (Unlike
  * reference Lox, which has no escapes and allows multi-line strings.)
  *
- * Comments: // to end of line. */
+ * Comments: // to end of line.
+ *
+ * `print` is not a keyword: it is the name of a builtin function. */
 #ifndef LUMA_LEXER_H
 #define LUMA_LEXER_H
 
@@ -27,7 +29,7 @@ typedef enum {
     TOK_IDENTIFIER, TOK_STRING, TOK_NUMBER,
     /* keywords */
     TOK_AND, TOK_CLASS, TOK_ELSE, TOK_FALSE, TOK_FOR, TOK_FUN, TOK_IF, TOK_NIL,
-    TOK_OR, TOK_PRINT, TOK_RETURN, TOK_SUPER, TOK_THIS, TOK_TRUE, TOK_VAR, TOK_WHILE,
+    TOK_OR, TOK_RETURN, TOK_SUPER, TOK_THIS, TOK_TRUE, TOK_VAR, TOK_WHILE,
     TOK_EOF,
 } TokenKind;
 
