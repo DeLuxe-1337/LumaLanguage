@@ -1,0 +1,3 @@
+extern fun maybe_name(give: bool): cstr;   // should have been cstr?
+print(maybe_name(true));
+print(maybe_name(false));

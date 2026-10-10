@@ -1,0 +1,4 @@
+fun need_str(s: str): str { return s; }
+fun untyped(x) { return x; }
+print(need_str("fine"));
+print(need_str(untyped(5)));

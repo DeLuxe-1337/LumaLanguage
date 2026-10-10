@@ -1,0 +1,11 @@
+print();
+print("one");
+print("a", "b", "c");
+print(1, nil, true, false, "s");
+print("x =", 6 * 7);
+var v = print("print returns:");
+print(v);
+// all arguments are evaluated before anything is written
+var log = "";
+fun note(s) { log = log + s; return s; }
+print(note("1"), note("2"), log);

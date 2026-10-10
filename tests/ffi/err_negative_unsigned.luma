@@ -1,0 +1,2 @@
+extern fun id_u8(x: u8): u8;
+print(id_u8(-1));

@@ -1,1 +1,2 @@
-print -"x";
+var s = "x";
+print(-s);

@@ -10,12 +10,15 @@
 #include "util.h"
 
 #define MAX_DEPTH 1000
+#define MAX_ARGS 255 /* syntactic limit (as in Lox); lowering currently allows 6 */
 
 typedef struct {
     const char *path;
     TokenList *toks;
     size_t pos;
     int depth;
+    int block_depth;   /* > 0 inside a block or function body */
+    bool in_function;
     bool failed;
 } Parser;
 
@@ -101,8 +104,6 @@ static void stmt_push(Stmt *block, Stmt *s) {
 
 static const char *unsupported_keyword(TokenKind k) {
     switch (k) {
-    case TOK_FUN: return "'fun' (functions) is not supported yet";
-    case TOK_RETURN: return "'return' is not supported yet";
     case TOK_CLASS: return "'class' is not supported yet";
     case TOK_THIS: return "'this' is not supported yet";
     case TOK_SUPER: return "'super' is not supported yet";
@@ -159,6 +160,56 @@ static Expr *primary(Parser *p) {
     }
 }
 
+static Expr *finish_call(Parser *p, Expr *callee, const Token *open) {
+    if (callee->kind != EXPR_VAR) {
+        error_at(p, open, "only named functions can be called (functions are not first-class values yet)");
+        expr_free(callee);
+        return NULL;
+    }
+    Expr *c = new_expr(EXPR_CALL, open);
+    c->line = callee->line;
+    c->col = callee->col;
+    c->name = callee->name;
+    callee->name = NULL;
+    expr_free(callee);
+    size_t cap = 0;
+    if (!check(p, TOK_RIGHT_PAREN)) {
+        do {
+            if (c->nargs == MAX_ARGS) {
+                error_at(p, cur(p), "too many arguments (maximum is 255)");
+                expr_free(c);
+                return NULL;
+            }
+            Expr *arg = expression(p);
+            if (!arg) { expr_free(c); return NULL; }
+            if (c->nargs == cap) {
+                cap = cap ? cap * 2 : 4;
+                c->args = xrealloc(c->args, cap * sizeof *c->args);
+            }
+            c->args[c->nargs++] = arg;
+        } while (match(p, TOK_COMMA));
+    }
+    if (!consume(p, TOK_RIGHT_PAREN, "')' after arguments")) {
+        expr_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+static Expr *call(Parser *p) {
+    Expr *e = primary(p);
+    while (e && check(p, TOK_LEFT_PAREN)) {
+        Token *open = advance(p);
+        if (e->kind == EXPR_CALL) {
+            error_at(p, open, "calling the result of a call is not supported yet (functions are not first-class values)");
+            expr_free(e);
+            return NULL;
+        }
+        e = finish_call(p, e, open);
+    }
+    return e;
+}
+
 static Expr *unary(Parser *p) {
     if (check(p, TOK_BANG) || check(p, TOK_MINUS)) {
         if (!enter(p)) return NULL;
@@ -171,7 +222,7 @@ static Expr *unary(Parser *p) {
         e->right = right;
         return e;
     }
-    return primary(p);
+    return call(p);
 }
 
 typedef Expr *(*ParseFn)(Parser *);
@@ -273,6 +324,57 @@ static Expr *expression(Parser *p) { return assignment(p); }
 static Stmt *declaration(Parser *p);
 static Stmt *statement(Parser *p);
 
+/* type → ( IDENTIFIER | "nil" ) "?"?   Names are validated by lowering. */
+static bool parse_type(Parser *p, TypeRef *out) {
+    Token *t = cur(p);
+    if (t->kind != TOK_IDENTIFIER && t->kind != TOK_NIL) {
+        expected(p, "a type name");
+        return false;
+    }
+    advance(p);
+    out->name = xstrndup(t->lexeme, t->lexeme_len);
+    out->line = t->line;
+    out->col = t->col;
+    out->nullable = match(p, TOK_QUESTION);
+    return true;
+}
+
+/* Parses "(" params ")" into s. With require_types (extern), every parameter
+ * needs ": type". */
+static bool parse_params(Parser *p, Stmt *s, bool require_types) {
+    if (!consume(p, TOK_LEFT_PAREN, "'(' after function name")) return false;
+    size_t cap = 0;
+    if (!check(p, TOK_RIGHT_PAREN)) {
+        do {
+            if (s->nparams == MAX_ARGS) {
+                error_at(p, cur(p), "too many parameters (maximum is 255)");
+                return false;
+            }
+            Token *pt = cur(p);
+            if (!consume(p, TOK_IDENTIFIER, "parameter name")) return false;
+            if (s->nparams == cap) {
+                cap = cap ? cap * 2 : 4;
+                s->params = xrealloc(s->params, cap * sizeof *s->params);
+                s->param_line = xrealloc(s->param_line, cap * sizeof *s->param_line);
+                s->param_col = xrealloc(s->param_col, cap * sizeof *s->param_col);
+                s->param_types = xrealloc(s->param_types, cap * sizeof *s->param_types);
+            }
+            size_t i = s->nparams++;
+            s->params[i] = xstrndup(pt->lexeme, pt->lexeme_len);
+            s->param_line[i] = pt->line;
+            s->param_col[i] = pt->col;
+            memset(&s->param_types[i], 0, sizeof s->param_types[i]);
+            if (match(p, TOK_COLON)) {
+                if (!parse_type(p, &s->param_types[i])) return false;
+            } else if (require_types) {
+                expected(p, "':' and a C type for this parameter (extern parameters must be typed)");
+                return false;
+            }
+        } while (match(p, TOK_COMMA));
+    }
+    return consume(p, TOK_RIGHT_PAREN, "')' after parameters");
+}
+
 static Stmt *var_declaration(Parser *p, const Token *kw) {
     Token *name = cur(p);
     if (!consume(p, TOK_IDENTIFIER, "variable name after 'var'")) return NULL;
@@ -280,6 +382,7 @@ static Stmt *var_declaration(Parser *p, const Token *kw) {
     s->name = xstrndup(name->lexeme, name->lexeme_len);
     s->line = name->line;
     s->col = name->col;
+    if (match(p, TOK_COLON) && !parse_type(p, &s->type)) { stmt_free(s); return NULL; }
     if (match(p, TOK_EQUAL)) {
         s->expr = expression(p);
         if (!s->expr) { stmt_free(s); return NULL; }
@@ -291,6 +394,12 @@ static Stmt *var_declaration(Parser *p, const Token *kw) {
 static Stmt *expr_statement(Parser *p, StmtKind kind, const Token *at, const char *semi_what) {
     Expr *e = expression(p);
     if (!e) return NULL;
+    if (e->kind == EXPR_VAR && strcmp(e->name, "print") == 0 && !check(p, TOK_SEMICOLON)) {
+        /* old statement syntax: print x; */
+        error_at(p, at, "print is a function now: write print(...)");
+        expr_free(e);
+        return NULL;
+    }
     if (!consume(p, TOK_SEMICOLON, semi_what)) {
         expr_free(e);
         return NULL;
@@ -302,13 +411,58 @@ static Stmt *expr_statement(Parser *p, StmtKind kind, const Token *at, const cha
 
 static Stmt *block_body(Parser *p, const Token *open) {
     Stmt *b = new_stmt(STMT_BLOCK, open);
+    p->block_depth++;
     while (!check(p, TOK_RIGHT_BRACE) && !check(p, TOK_EOF)) {
         Stmt *s = declaration(p);
-        if (!s) { stmt_free(b); return NULL; }
+        if (!s) { p->block_depth--; stmt_free(b); return NULL; }
         stmt_push(b, s);
     }
+    p->block_depth--;
     if (!consume(p, TOK_RIGHT_BRACE, "'}' after block")) { stmt_free(b); return NULL; }
     return b;
+}
+
+static Stmt *return_statement(Parser *p, const Token *kw) {
+    if (!p->in_function) {
+        error_at(p, kw, "cannot return from top-level code");
+        return NULL;
+    }
+    Stmt *s = new_stmt(STMT_RETURN, kw);
+    if (!check(p, TOK_SEMICOLON)) {
+        s->expr = expression(p);
+        if (!s->expr) { stmt_free(s); return NULL; }
+    }
+    if (!consume(p, TOK_SEMICOLON, "';' after return value")) { stmt_free(s); return NULL; }
+    return s;
+}
+
+static Stmt *fun_declaration(Parser *p, const Token *kw) {
+    if (p->block_depth > 0 || p->in_function) {
+        error_at(p, kw, "functions can only be declared at top level for now (closures are not supported yet)");
+        return NULL;
+    }
+    Token *name = cur(p);
+    if (!consume(p, TOK_IDENTIFIER, "function name after 'fun'")) return NULL;
+    Stmt *s = new_stmt(STMT_FUN, kw);
+    s->name = xstrndup(name->lexeme, name->lexeme_len);
+    s->line = name->line;
+    s->col = name->col;
+    if (!parse_params(p, s, false)) { stmt_free(s); return NULL; }
+    if (match(p, TOK_COLON) && !parse_type(p, &s->type)) { stmt_free(s); return NULL; }
+    Token *open = cur(p);
+    if (!consume(p, TOK_LEFT_BRACE, "'{' before function body")) { stmt_free(s); return NULL; }
+    p->in_function = true;
+    Stmt *body = block_body(p, open);
+    p->in_function = false;
+    if (!body) { stmt_free(s); return NULL; }
+    /* the body's statements become the function's own list */
+    s->stmts = body->stmts;
+    s->n = body->n;
+    s->cap = body->cap;
+    body->stmts = NULL;
+    body->n = body->cap = 0;
+    stmt_free(body);
+    return s;
 }
 
 static Stmt *if_statement(Parser *p, const Token *kw) {
@@ -391,7 +545,7 @@ static Stmt *statement(Parser *p) {
     Token *t = cur(p);
     Stmt *s;
     switch (t->kind) {
-    case TOK_PRINT: advance(p); s = expr_statement(p, STMT_PRINT, t, "';' after value"); break;
+    case TOK_RETURN: advance(p); s = return_statement(p, t); break;
     case TOK_IF: advance(p); s = if_statement(p, t); break;
     case TOK_WHILE: advance(p); s = while_statement(p, t); break;
     case TOK_FOR: advance(p); s = for_statement(p, t); break;
@@ -407,7 +561,40 @@ static Stmt *statement(Parser *p) {
     return s;
 }
 
+/* extern fun NAME(p: ctype, ...): ctype;   -- declares a C function */
+static Stmt *extern_declaration(Parser *p, const Token *kw) {
+    if (p->block_depth > 0 || p->in_function) {
+        error_at(p, kw, "extern declarations are only allowed at top level");
+        return NULL;
+    }
+    if (!consume(p, TOK_FUN, "'fun' after 'extern'")) return NULL;
+    Token *name = cur(p);
+    if (!consume(p, TOK_IDENTIFIER, "C function name after 'extern fun'")) return NULL;
+    Stmt *s = new_stmt(STMT_EXTERN, kw);
+    s->name = xstrndup(name->lexeme, name->lexeme_len);
+    s->line = name->line;
+    s->col = name->col;
+    if (!parse_params(p, s, true)) { stmt_free(s); return NULL; }
+    if (!consume(p, TOK_COLON, "':' and a C return type (use 'void' for none)")) { stmt_free(s); return NULL; }
+    if (!parse_type(p, &s->type)) { stmt_free(s); return NULL; }
+    if (check(p, TOK_LEFT_BRACE)) {
+        error_at(p, cur(p), "extern functions are implemented in C and cannot have a body");
+        stmt_free(s);
+        return NULL;
+    }
+    if (!consume(p, TOK_SEMICOLON, "';' after extern declaration")) { stmt_free(s); return NULL; }
+    return s;
+}
+
 static Stmt *declaration(Parser *p) {
+    if (check(p, TOK_EXTERN)) {
+        Token *kw = advance(p);
+        return extern_declaration(p, kw);
+    }
+    if (check(p, TOK_FUN)) {
+        Token *kw = advance(p);
+        return fun_declaration(p, kw);
+    }
     if (check(p, TOK_VAR)) {
         Token *kw = advance(p);
         return var_declaration(p, kw);
@@ -422,7 +609,7 @@ bool parse(const char *path, TokenList *tokens, Program *out) {
         fprintf(stderr, "%s: error: internal: token stream not terminated\n", path);
         return false;
     }
-    Parser p = {path, tokens, 0, 0, false};
+    Parser p = {path, tokens, 0, 0, 0, false, false};
     while (!check(&p, TOK_EOF)) {
         Stmt *s = declaration(&p);
         if (!s) {
@@ -445,6 +632,8 @@ void expr_free(Expr *e) {
     if (!e) return;
     expr_free(e->left);
     expr_free(e->right);
+    for (size_t i = 0; i < e->nargs; i++) expr_free(e->args[i]);
+    free(e->args);
     free(e->str);
     free(e->name);
     free(e);
@@ -459,6 +648,15 @@ void stmt_free(Stmt *s) {
     stmt_free(s->then_branch);
     stmt_free(s->else_branch);
     stmt_free(s->body);
+    for (size_t i = 0; i < s->nparams; i++) {
+        free(s->params[i]);
+        if (s->param_types) free(s->param_types[i].name);
+    }
+    free(s->params);
+    free(s->param_types);
+    free(s->type.name);
+    free(s->param_line);
+    free(s->param_col);
     free(s);
 }
 
@@ -519,16 +717,37 @@ static void dump_expr(const Expr *e) {
         dump_expr(e->right);
         putchar(')');
         break;
+    case EXPR_CALL:
+        printf("(call %s", e->name);
+        for (size_t i = 0; i < e->nargs; i++) {
+            putchar(' ');
+            dump_expr(e->args[i]);
+        }
+        putchar(')');
+        break;
     }
+}
+
+static void dump_type(const TypeRef *t) {
+    if (t->name) printf(":%s%s", t->name, t->nullable ? "?" : "");
+}
+
+static void dump_params(const Stmt *s) {
+    printf("(");
+    for (size_t i = 0; i < s->nparams; i++) {
+        printf("%s%s", i ? " " : "", s->params[i]);
+        if (s->param_types) dump_type(&s->param_types[i]);
+    }
+    printf(")");
 }
 
 static void dump_stmt(const Stmt *s, int indent) {
     printf("%*s", indent * 2, "");
     switch (s->kind) {
-    case STMT_PRINT: printf("(print @%d:%d ", s->line, s->col); dump_expr(s->expr); printf(")\n"); break;
     case STMT_EXPR: printf("(expr "); dump_expr(s->expr); printf(")\n"); break;
     case STMT_VAR:
         printf("(var %s", s->name);
+        dump_type(&s->type);
         if (s->expr) { putchar(' '); dump_expr(s->expr); }
         printf(")\n");
         break;
@@ -551,6 +770,25 @@ static void dump_stmt(const Stmt *s, int indent) {
         printf("\n");
         dump_stmt(s->body, indent + 1);
         printf("%*s)\n", indent * 2, "");
+        break;
+    case STMT_FUN:
+        printf("(fun %s ", s->name);
+        dump_params(s);
+        dump_type(&s->type);
+        printf("\n");
+        for (size_t i = 0; i < s->n; i++) dump_stmt(s->stmts[i], indent + 1);
+        printf("%*s)\n", indent * 2, "");
+        break;
+    case STMT_EXTERN:
+        printf("(extern %s ", s->name);
+        dump_params(s);
+        dump_type(&s->type);
+        printf(")\n");
+        break;
+    case STMT_RETURN:
+        printf("(return");
+        if (s->expr) { putchar(' '); dump_expr(s->expr); }
+        printf(")\n");
         break;
     }
 }

@@ -81,6 +81,13 @@ static const char *LOOP =
 static void test_roundtrip(void) {
     expect_roundtrip(LOOP);
     expect_roundtrip("module \"\"\n");
+    expect_roundtrip("module \"t\"\n\nglobal @g: int\nglobal @h: str|bool\ndata @c = str \"x\"\n\n"
+                     "fn @f(%a: int, %b, %c: str?): int? {\nentry:\n  %d = check %b, int, @c\n  store @g, %d\n  ret %a\n}\n");
+    expect_roundtrip("module \"c\"\n\nextern c fn @puts(s: cstr): i32\nextern c fn @f(a: i8, b: u64, c: bool, d: cstr?, e: ptr): void\n"
+                     "extern c fn @g(): cstr?\n\nfn @luma_main() {\nentry:\n  %0 = call @g()\n  %1 = call @puts(%0)\n  ret %1\n}\n");
+    expect_roundtrip("module \"g\"\n\nglobal @var.count\nextern fn @luma_print(1)\n\n"
+                     "fn @luma_main() {\nentry:\n  %0 = const 1\n  store @var.count, %0\n"
+                     "  %1 = load @var.count\n  call @luma_print(%1)\n  ret %1\n}\n");
     expect_roundtrip("module \"x\"\n\nfn @f() {\nb:\n  %0 = const 1\n  ret %0\n}\n");
 }
 
@@ -142,6 +149,18 @@ static void test_parse_errors(void) {
         "module \"m\"\nfn @f() {\ne:\n  %0 = const 99999999999999999999\n  ret %0\n}\n",
         "module \"m\"\nfn @f() {\ne:\n  %0 = const 1\n  ret %0\n",  /* EOF inside function */
         "module \"m\"\nextern fn @f(x)\n",
+        "module \"m\"\nglobal g\n",                               /* missing @ */
+        "module \"m\"\nglobal @g: integer\n",                      /* unknown type */
+        "module \"m\"\nfn @f(%a: int?str) {\ne:\n  ret %a\n}\n",
+        "module \"m\"\ndata @c = str \"c\"\nfn @f(%a) {\ne:\n  %b = check %a, @c\n  ret %b\n}\n", /* missing type */
+        "module \"m\"\nextern c fn @f(a: int): void\n",            /* not a C type */
+        "module \"m\"\nextern c fn @f(a: i32?): void\n",           /* only cstr? is nullable */
+        "module \"m\"\nextern c fn @f(a): void\n",                 /* untyped parameter */
+        "module \"m\"\nextern c fn @f(a: i32)\n",                  /* missing return type */
+        "module \"m\"\nglobal @g\nglobal @g\n",                    /* duplicate */
+        "module \"m\"\nfn @f() {\ne:\n  store %0\n  ret %0\n}\n",   /* store needs @global */
+        "module \"m\"\nglobal @g\nfn @f() {\ne:\n  store @g %0\n  ret %0\n}\n", /* missing comma */
+        "module \"m\"\nfn @f() {\ne:\n  %0 = load @missing\n  ret %0\n}\n",
     };
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         bool ok = parse_str(bad[i], &m);
@@ -189,6 +208,31 @@ static void test_verifier(void) {
     expect_verify_fails("module \"m\"\nfn @f() {\ne:\n  %0 = const 4611686018427387904\n  ret %0\n}\n");
     /* const must reference data */
     expect_verify_fails("module \"m\"\nfn @f() {\ne:\n  %0 = const @f\n  ret %0\n}\n");
+    /* declared types must be provable */
+    expect_verify_fails("module \"m\"\nfn @f(%a: int): int {\ne:\n  ret %a\n}\nfn @g(%x) {\ne:\n  %r = call @f(%x)\n  ret %r\n}\n");
+    expect_verify_fails("module \"m\"\nfn @f(%a): int {\ne:\n  ret %a\n}\n");
+    expect_verify_fails("module \"m\"\nglobal @g: int\nfn @f() {\ne:\n  %a = const nil\n  store @g, %a\n  ret %a\n}\n");
+    expect_verify_fails("module \"m\"\nfn @f(%a) {\ne:\n  %b = check %a, int, @f\n  ret %b\n}\n"); /* context must be data */
+    /* ...and a check, or flow through int-only operations, proves them */
+    {
+        IrModule m;
+        CHECK(parse_str("module \"m\"\ndata @c = str \"ctx\"\nfn @f(%a: int): int {\ne:\n  ret %a\n}\n"
+                        "fn @g(%x, %y) {\ne:\n  %x = check %x, int, @c\n  %r = call @f(%x)\n  %s = sub %y, %x\n"
+                        "  %t = call @f(%s)\n  br %y, a, b\na:\n  %u = const 1\n  jmp j\nb:\n  %u = const 2\n  jmp j\n"
+                        "j:\n  %v = call @f(%u)\n  ret %v\n}\n", &m));
+        CHECK(ir_verify(&m, "t.lir"));
+        ir_module_free(&m);
+    }
+    /* load/store must name a 'global' variable */
+    expect_verify_fails("module \"m\"\ndata @s = str \"x\"\nfn @f() {\ne:\n  %0 = load @s\n  ret %0\n}\n");
+    expect_verify_fails("module \"m\"\nfn @f() {\ne:\n  %0 = const 1\n  store @f, %0\n  ret %0\n}\n");
+    /* store reads its operand: it must be assigned */
+    expect_verify_fails("module \"m\"\nglobal @g\nfn @f() {\ne:\n  store @g, %x\n  %0 = const 1\n  ret %0\n}\n");
+    /* cannot call a global variable */
+    expect_verify_fails("module \"m\"\nglobal @g\nfn @f() {\ne:\n  %0 = call @g()\n  ret %0\n}\n");
+    /* C functions: void parameters and arity */
+    expect_verify_fails("module \"m\"\nextern c fn @f(a: void): void\nfn @g() {\ne:\n  %0 = const 1\n  ret %0\n}\n");
+    expect_verify_fails("module \"m\"\nextern c fn @f(a: i32): void\nfn @g() {\ne:\n  %0 = call @f()\n  ret %0\n}\n");
     /* cannot call data */
     expect_verify_fails("module \"m\"\ndata @s = str \"x\"\nfn @f() {\ne:\n  %0 = call @s()\n  ret %0\n}\n");
 

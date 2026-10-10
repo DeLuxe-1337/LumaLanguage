@@ -1,0 +1,27 @@
+// Round trips for every C type through tests/ffi/ffi_helper.c
+extern fun id_i8(x: i8): i8;
+extern fun id_i16(x: i16): i16;
+extern fun id_i32(x: i32): i32;
+extern fun id_i64(x: i64): i64;
+extern fun id_u8(x: u8): u8;
+extern fun id_u16(x: u16): u16;
+extern fun id_u32(x: u32): u32;
+extern fun id_u64(x: u64): u64;
+extern fun wrap_i8(x: i32): i8;
+extern fun wrap_u8(x: i32): u8;
+extern fun weigh6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64): i64;
+extern fun mixed(a: i8, b: u16, c: bool, d: cstr, e: i32): i64;
+extern fun negate(b: bool): bool;
+extern fun is_positive(x: i64): bool;
+
+print(id_i8(-128), id_i8(127), id_i16(-32768), id_i16(32767));
+print(id_i32(-2147483648), id_i32(2147483647));
+print(id_i64(-4611686018427387903 - 1), id_i64(4611686018427387903));
+print(id_u8(0), id_u8(255), id_u16(65535), id_u32(4294967295));
+print(id_u64(0), id_u64(4611686018427387903));
+print(wrap_i8(200), wrap_i8(-129), wrap_u8(256 + 7), wrap_u8(-1));
+print(weigh6(1, 2, 3, 4, 5, 6));
+print(mixed(-1, 65535, true, "four", 100000));
+print(negate(true), negate(false), is_positive(5), is_positive(-5));
+var dynamic = 7;                      // untyped: converted (and checked) at runtime
+print(id_i32(dynamic) + 1);

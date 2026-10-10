@@ -1,1 +1,3 @@
-print "a" < "b";
+var a = "a";
+var b = "b";
+print(a < b);

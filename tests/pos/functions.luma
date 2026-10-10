@@ -1,0 +1,25 @@
+// calls, returns, implicit nil, early return, recursion, hoisting
+fun add(a, b) { return a + b; }
+fun noop() {}
+fun sign(n) {
+  if (n < 0) return -1;
+  if (n == 0) return 0;
+  return 1;
+}
+fun fact(n) { if (n <= 1) return 1; return n * fact(n - 1); }
+fun fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
+print(add(2, 3));
+print(add("con", "cat"));
+print(noop());
+print(sign(-5), sign(0), sign(7));
+print(fact(20));
+print(fib(25));
+print(later(4));              // hoisted: defined below
+fun later(x) { return x * 10; }
+fun six(a, b, c, d, e, f) { return a + b * 10 + c * 100 + d * 1000 + e * 10000 + f * 100000; }
+print(six(1, 2, 3, 4, 5, 6));
+fun first_square_over(limit) {
+  for (var i = 0; ; i = i + 1)
+    if (i * i > limit) return i;
+}
+print(first_square_over(1000));

@@ -1,0 +1,35 @@
+// Optional, gradual types: annotated code is checked; untyped code stays dynamic.
+var count: int = 0;
+var label: str = "items";
+var note: str? = nil;
+var flag: bool = count == 0;
+var anything: any = 1;
+anything = "now a string";
+
+fun add(a: int, b: int): int { return a + b; }
+fun describe(n: int, what: str): str { return what + ":"; }
+fun first_word(s: str?): str {
+  if (s == nil) return "(none)";
+  return s;
+}
+fun maybe(give: bool): str? {
+  if (give) return "something";
+  return nil;
+}
+fun untyped(x) { return x; }
+
+count = add(count, 41);
+print(describe(count, label), count + 1, flag);
+print(first_word(note), first_word("hello"), maybe(true), maybe(false));
+note = maybe(true);
+print(note);
+var checked: int = untyped(10) * 2;     // untyped(10) is 'any'; '*' makes it int
+var guarded: int = untyped(5);          // any -> int: runtime guard (passes)
+print(checked, guarded, anything);
+fun forever(): int { for (;;) { return 7; } }
+print(forever());
+{
+  var local: int = 3;
+  local = local * local;
+  print(local);
+}

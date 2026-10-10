@@ -89,6 +89,34 @@ static void test_encodings(void) {
     EXPECT("test edx, 1", 0xf7, 0xc2, 0x01, 0x00, 0x00, 0x00);
     EXPECT("test eax, 1", 0xa9, 0x01, 0x00, 0x00, 0x00);
     EXPECT("test rax, rcx", 0x48, 0x85, 0xc8);
+
+    /* milestone 5: general addressing (ModRM/SIB), byte registers, more instructions */
+    EXPECT("mov rax, [rbx]", 0x48, 0x8b, 0x03);
+    EXPECT("mov rax, [rsp]", 0x48, 0x8b, 0x04, 0x24);               /* rsp base needs SIB */
+    EXPECT("mov rax, [r12 + 8]", 0x49, 0x8b, 0x44, 0x24, 0x08);
+    EXPECT("mov rax, [r13]", 0x49, 0x8b, 0x45, 0x00);               /* r13 base needs disp8 */
+    EXPECT("lea rax, [rbx + rcx*8 + 16]", 0x48, 0x8d, 0x44, 0xcb, 0x10);
+    EXPECT("lea rax, [r11*8 + 2]", 0x4a, 0x8d, 0x04, 0xdd, 0x02, 0x00, 0x00, 0x00); /* no base */
+    EXPECT("lea r9, [rax - 1]", 0x4c, 0x8d, 0x48, 0xff);
+    EXPECT("mov qword ptr [rbp - 8], 5", 0x48, 0xc7, 0x45, 0xf8, 0x05, 0x00, 0x00, 0x00);
+    EXPECT("cmp qword ptr [rbp - 8], 1000", 0x48, 0x81, 0x7d, 0xf8, 0xe8, 0x03, 0x00, 0x00);
+    EXPECT("add rdx, [rbp - 16]", 0x48, 0x03, 0x55, 0xf0);
+    EXPECT("sete al", 0x0f, 0x94, 0xc0);
+    EXPECT("setl sil", 0x40, 0x0f, 0x9c, 0xc6);                     /* sil needs an empty REX */
+    EXPECT("movzx eax, al", 0x0f, 0xb6, 0xc0);
+    EXPECT("movzx r11d, r11b", 0x45, 0x0f, 0xb6, 0xdb);
+    EXPECT("test al, 1", 0xa8, 0x01);
+    EXPECT("test r11b, 1", 0x41, 0xf6, 0xc3, 0x01);
+    EXPECT("sar rax, 1", 0x48, 0xd1, 0xf8);
+    EXPECT("sar rax, 3", 0x48, 0xc1, 0xf8, 0x03);
+    EXPECT("shl r10, 4", 0x49, 0xc1, 0xe2, 0x04);
+    EXPECT("imul rax, rcx", 0x48, 0x0f, 0xaf, 0xc1);
+    EXPECT("imul rax, rcx, 10", 0x48, 0x6b, 0xc1, 0x0a);
+    EXPECT("imul rax, rax, 1000", 0x48, 0x69, 0xc0, 0xe8, 0x03, 0x00, 0x00);
+    EXPECT("neg rax", 0x48, 0xf7, 0xd8);
+    EXPECT("idiv r11", 0x49, 0xf7, 0xfb);
+    EXPECT("cqo", 0x48, 0x99);
+    EXPECT("cmovl rax, rcx", 0x48, 0x0f, 0x4c, 0xc1);
 }
 
 /* Returns the .text bytes of src, or NULL (caller frees via obj_free). */
@@ -163,6 +191,21 @@ static void test_relaxation(void) {
     CHECK_EQ_INT(o.relocs[0].type, OBJ_R_X86_64_PLT32);
     CHECK_EQ_INT(o.relocs[1].offset, 7);
     obj_free(&o);
+    /* jumps to a GLOBAL symbol defined in the same section bind locally and
+     * relax (as GNU as does: tail calls); calls keep their PLT32 relocation */
+    CHECK(assemble_str(".text\n.globl f\nf: jmp g\ncall g\n.globl g\ng: ret\n", &o));
+    {
+        const Buf *tx = &o.sections[0].data;
+        CHECK(tx->len == 2 + 5 + 1 && tx->data[0] == 0xeb && tx->data[1] == 5 && tx->data[2] == 0xe8);
+    }
+    CHECK_EQ_INT(o.nrelocs, 1);
+    CHECK_EQ_INT(o.relocs[0].offset, 3);
+    obj_free(&o);
+    src = nops(".text\n.globl f\nf: jmp g\n", 200, ".globl g\ng: ret\n");
+    t = text_of(src, &o);
+    CHECK(t && t->data[0] == 0xe9 && t->data[1] == 200 && t->data[2] == 0);
+    CHECK_EQ_INT(o.nrelocs, 0);
+    obj_free(&o); free(src);
 }
 
 static void test_data_directives(void) {
@@ -247,8 +290,8 @@ static void test_errors(void) {
     const char *bad[] = {
         "frobnicate rax\n",            /* unknown instruction */
         "mov rax, ebx\n",              /* size mismatch */
-        "mov [rax], rbx\n",            /* non-RIP memory */
-        "lea rax, [rbx + 8]\n",        /* non-RIP memory */
+        "mov [rax], [rbx]\n",          /* two memory operands */
+        "lea rax, [rbx + rcx + rdx]\n", /* three registers */
         "push eax\n",                  /* 32-bit push */
         "ret rax\n",                   /* operand count */
         "call .Lnowhere\n",            /* undefined local label */
@@ -263,9 +306,19 @@ static void test_errors(void) {
         ".intel_syntax prefix\n",      /* unsupported syntax */
         "lea rdi, [rip + a + b]\n",    /* two symbols */
         "mov rax, rbx, rcx, rdx\n",    /* too many operands */
-        "mov rax, [rsp + 8]\n",        /* rsp base needs SIB: unsupported */
+        "mov rax, [rbx + rsp*2]\n",    /* rsp cannot be an index */
         "mov rax, [rbp + sym]\n",      /* symbols only with rip */
-        "mov eax, [rbp - 8]\n",        /* 32-bit loads unsupported */
+        "mov rax, [ebx]\n",            /* 32-bit address registers */
+        "mov rax, [rbx*3]\n",          /* invalid scale */
+        "mov [rbx], 5\n",              /* ambiguous size */
+        "add qword ptr [rbx], rax, 1\n", /* too many operands for add */
+        "mov rax, word ptr [rbx]\n",   /* unsupported size qualifier */
+        "mov eax, rbx\n",              /* size mismatch */
+        "sar rax, 64\n",               /* shift count */
+        "sete rax\n",                  /* setcc needs a byte register */
+        "movzx eax, ebx\n",            /* movzx needs an 8-bit source */
+        "imul rax, rbx, 0x100000000\n",
+        "mov al, 300\n",
         "jmp rax\n",                   /* indirect jumps unsupported */
         "jmp .Lnowhere\n",             /* undefined local label */
         ".text\n.p2align 4\n",         /* .p2align in code */

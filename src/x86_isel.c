@@ -1,6 +1,7 @@
 #include "x86_isel.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "value.h"
@@ -8,7 +9,7 @@
 static const char *const ARG_REGS[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 
 /* Escapes bytes for an .ascii directive (printable ASCII literal, else octal). */
-static void emit_ascii(Buf *out, const char *s, size_t n) {
+void x86_emit_ascii(Buf *out, const char *s, size_t n) {
     buf_printf(out, "    .ascii \"");
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -30,6 +31,26 @@ static void emit_preview(Buf *out, const char *s, size_t n) {
         else buf_byte(out, '?');
     }
     if (n > 48) buf_printf(out, "...");
+}
+
+static int load_labels; /* unique suffix for the labels of checked loads */
+static Buf ffi_data;     /* .rodata context strings for FFI calls, emitted at the end */
+static int ffi_labels;
+
+/* Runtime converter suffix for a C type: "i32", "cstr_opt", ... */
+static const char *ctype_suffix(CType t) { return t == CT_CSTR_OPT ? "cstr_opt" : ctype_name(t); }
+
+/* Adds a NUL-terminated context string ("argument 1 ('s') of puts") and
+ * returns its label number. */
+static int ffi_context(const char *fmt, int argno, const char *pname, const char *fname) {
+    int n = ffi_labels++;
+    char text[600];
+    if (argno > 0) snprintf(text, sizeof text, fmt, argno, pname, fname);
+    else snprintf(text, sizeof text, fmt, fname);
+    buf_printf(&ffi_data, ".Lffi.%d:\n", n);
+    x86_emit_ascii(&ffi_data, text, strlen(text));
+    buf_printf(&ffi_data, "    .byte 0\n");
+    return n;
 }
 
 static int64_t slot(int v) { return -8 * ((int64_t)v + 1); }
@@ -87,11 +108,67 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         break;
     case IR_CALL: {
         const IrGlobal *g = &m->globals[in->global];
+        if (g->kind == IRG_CEXTERN) {
+            /* FFI call. Each Luma argument is converted (and type/range checked)
+             * by a runtime helper into a raw C value kept in a scratch slot
+             * past the vreg slots; then the raw values go to rdi..r9. */
+            int scratch = f->nvregs;
+            for (int i = 0; i < in->nargs; i++) {
+                int c = ffi_context("argument %d ('%s') of %s", i + 1, g->cnames[i], g->name);
+                load(out, "rdi", in->args[i]);
+                buf_printf(out, "    lea rsi, [rip + .Lffi.%d]\n", c);
+                buf_printf(out, "    call luma_ffi_arg_%s@PLT\n", ctype_suffix(g->cparams[i]));
+                store(out, scratch + i, "rax");
+            }
+            for (int i = 0; i < in->nargs; i++) load(out, ARG_REGS[i], scratch + i);
+            buf_printf(out, "    xor eax, eax    # no vector registers used (variadic-safe)\n");
+            buf_printf(out, "    call %s@PLT\n", g->name);
+            if (g->cret == CT_VOID) {
+                buf_printf(out, "    mov rax, %" PRIu64 "    # void -> nil\n", (uint64_t)LUMA_NIL);
+            } else {
+                int c = ffi_context("return value of %s", 0, NULL, g->name);
+                buf_printf(out, "    mov rdi, rax\n");
+                buf_printf(out, "    lea rsi, [rip + .Lffi.%d]\n", c);
+                buf_printf(out, "    call luma_ffi_ret_%s@PLT\n", ctype_suffix(g->cret));
+            }
+            if (in->dst != IR_NONE) store(out, in->dst, "rax");
+            break;
+        }
         for (int i = 0; i < in->nargs; i++) load(out, ARG_REGS[i], in->args[i]);
         buf_printf(out, "    call %s%s\n", g->name, g->kind == IRG_EXTERN ? "@PLT" : "");
         if (in->dst != IR_NONE) store(out, in->dst, "rax");
         break;
     }
+    case IR_LOAD: {
+        /* A slot still holding 0 (never a valid value) was never assigned:
+         * e.g. a function read a top-level variable before its declaration ran. */
+        const char *g = m->globals[in->global].name;
+        int n = load_labels++;
+        buf_printf(out, "    mov rax, [rip + .Lvar.%s]\n", g);
+        buf_printf(out, "    test rax, rax\n");
+        buf_printf(out, "    jne .Lload_ok.%d\n", n);
+        buf_printf(out, "    lea rdi, [rip + .Lvarname.%s]\n", g);
+        buf_printf(out, "    call luma_undefined_variable@PLT\n");
+        buf_printf(out, ".Lload_ok.%d:\n", n);
+        store(out, in->dst, "rax");
+        break;
+    }
+    case IR_CHECK:
+        /* luma_check_type(value, mask as a fixnum, context string) returns only if the type matches */
+        load(out, "rdi", in->a);
+        buf_printf(out, "    mov rsi, %" PRId64 "\n", (int64_t)luma_fixnum((int64_t)in->ty));
+        buf_printf(out, "    lea rdx, [rip + .Ldata.%s]\n", m->globals[in->global].name);
+        buf_printf(out, "    call luma_check_type@PLT\n");
+        load(out, "rax", in->a);
+        store(out, in->dst, "rax");
+        break;
+    case IR_PHI:
+    case IR_NOP:
+        break; /* never reach the backend (the verifier rejects them) */
+    case IR_STORE:
+        load(out, "rax", in->a);
+        buf_printf(out, "    mov [rip + .Lvar.%s], rax\n", m->globals[in->global].name);
+        break;
     case IR_JMP:
         if (in->target[0] != b + 1) jump(out, "jmp", m, f, in->target[0]);
         break;
@@ -122,7 +199,14 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
 
 static void emit_func(const IrModule *m, const IrFunc *f, Buf *out) {
     const char *name = m->globals[f->global].name;
-    int64_t frame = ((int64_t)f->nvregs * 8 + 15) / 16 * 16;
+    /* scratch slots for raw C arguments of FFI calls live after the vreg slots */
+    int scratch = 0;
+    for (int b = 0; b < f->nblocks; b++)
+        for (int k = 0; k < f->blocks[b].n; k++) {
+            const IrInstr *in = &f->blocks[b].instrs[k];
+            if (in->op == IR_CALL && m->globals[in->global].kind == IRG_CEXTERN && in->nargs > scratch) scratch = in->nargs;
+        }
+    int64_t frame = ((int64_t)(f->nvregs + scratch) * 8 + 15) / 16 * 16;
     buf_printf(out, "\n    .text\n");
     buf_printf(out, "    .globl %s\n", name);
     buf_printf(out, "    .type %s, @function\n", name);
@@ -139,9 +223,7 @@ static void emit_func(const IrModule *m, const IrFunc *f, Buf *out) {
     buf_printf(out, "    .size %s, .-%s\n", name, name);
 }
 
-void x86_emit_module(const IrModule *m, Buf *out) {
-    buf_printf(out, "# Generated by luma from %s -- do not edit.\n", m->source);
-    buf_printf(out, "    .intel_syntax noprefix\n");
+void x86_emit_data(const IrModule *m, Buf *out) {
     bool any_data = false;
     for (int i = 0; i < m->nglobals; i++) {
         const IrGlobal *g = &m->globals[i];
@@ -154,10 +236,45 @@ void x86_emit_module(const IrModule *m, Buf *out) {
         buf_printf(out, "\"\n");
         buf_printf(out, "    .quad %d    # header: string\n", LUMA_TYPE_STRING);
         buf_printf(out, "    .quad %zu    # length\n", g->data_len);
-        if (g->data_len) emit_ascii(out, g->data, g->data_len);
+        if (g->data_len) x86_emit_ascii(out, g->data, g->data_len);
         buf_printf(out, "    .byte 0\n");
     }
+    /* Global variables: an 8-byte slot in .data, zero (= "unassigned") until
+     * first stored, plus the display name used in "Undefined variable" errors. */
+    bool any_var = false;
+    for (int i = 0; i < m->nglobals; i++) {
+        const IrGlobal *g = &m->globals[i];
+        if (g->kind != IRG_VAR) continue;
+        if (!any_var) buf_printf(out, "\n    .data\n    .p2align 3\n");
+        any_var = true;
+        buf_printf(out, ".Lvar.%s:\n    .quad 0\n", g->name);
+    }
+    if (any_var) {
+        buf_printf(out, "\n    .section .rodata\n");
+        for (int i = 0; i < m->nglobals; i++) {
+            const IrGlobal *g = &m->globals[i];
+            if (g->kind != IRG_VAR) continue;
+            const char *dn = ir_var_display_name(g->name);
+            buf_printf(out, ".Lvarname.%s:\n", g->name);
+            x86_emit_ascii(out, dn, strlen(dn));
+            buf_printf(out, "    .byte 0\n");
+        }
+    }
+}
+
+void x86_emit_module(const IrModule *m, Buf *out) {
+    buf_printf(out, "# Generated by luma from %s -- do not edit.\n", m->source);
+    buf_printf(out, "    .intel_syntax noprefix\n");
+    x86_emit_data(m, out);
+    load_labels = 0;
+    ffi_labels = 0;
+    buf_free(&ffi_data);
     for (int i = 0; i < m->nglobals; i++)
         if (m->globals[i].kind == IRG_FUNC) emit_func(m, &m->funcs[m->globals[i].func], out);
+    if (ffi_data.len) {
+        buf_printf(out, "\n    .section .rodata    # FFI error-message contexts\n");
+        buf_append(out, ffi_data.data, ffi_data.len);
+    }
+    buf_free(&ffi_data);
     buf_printf(out, "\n    .section .note.GNU-stack\n");
 }

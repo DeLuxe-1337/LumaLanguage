@@ -1,0 +1,3 @@
+extern fun id_i32(x: i32): i32;
+var s = "not a number";   // untyped: only known at runtime
+print(id_i32(s));

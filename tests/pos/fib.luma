@@ -9,4 +9,4 @@ while (n < 89) {
   b = t;
   n = n + 1;
 }
-print b;
+print(b);

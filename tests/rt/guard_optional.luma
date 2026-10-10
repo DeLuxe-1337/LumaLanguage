@@ -1,0 +1,4 @@
+fun untyped(x) { return x; }
+var s: str? = untyped(nil);
+print(s);
+s = untyped(true);

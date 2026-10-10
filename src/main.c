@@ -2,6 +2,7 @@
  *
  *   luma INPUT.(luma|lir) [-o OUT] [--emit-ir | -S | -c]
  *        [--dump-tokens] [--dump-ast] [--dump-ir] [-v]
+ *        [-l LIB] [-L DIR] [EXTRA.o | EXTRA.a | EXTRA.so ...]
  *
  * Stages (each leaves an inspectable file next to OUT):
  *   1. lex + parse INPUT.luma        -> AST          (--dump-tokens, --dump-ast)
@@ -11,7 +12,9 @@
  *   4. x86-64 instruction selection  -> OUT.s        (stop: -S)
  *   5. Luma assembler reads OUT.s    -> ObjFile
  *   6. Luma ELF writer               -> OUT.o        (stop: -c)
- *   7. system linker: cc -o OUT OUT.o libluma_rt.a   ($LUMA_CC, $LUMA_RUNTIME)
+ *   7. system linker: cc -o OUT OUT.o [EXTRA...] libluma_rt.a [-LDIR...] [-lLIB...]
+ *      ($LUMA_CC, $LUMA_RUNTIME). -l/-L and extra objects are how `extern fun`
+ *      declarations are resolved against C libraries.
  *
  * No external assembler is ever invoked for Luma code: `cc` receives only
  * object files and an archive, so it runs only the linker. */
@@ -29,8 +32,10 @@
 #include "ir.h"
 #include "lexer.h"
 #include "lower.h"
+#include "opt.h"
 #include "parser.h"
 #include "util.h"
+#include "x86_gen.h"
 #include "x86_isel.h"
 
 extern char **environ;
@@ -46,7 +51,11 @@ static void usage(FILE *f) {
             "  --dump-tokens   print the token stream\n"
             "  --dump-ast      print the AST\n"
             "  --dump-ir       print the LIR module\n"
+            "  --dump-opt-ir   print the optimized LIR module\n"
+            "  -O0, -O1, -O2   optimization level (default -O2; see docs/DESIGN.md)\n"
             "  -v              print each stage and the link command\n"
+            "  -l LIB, -L DIR  link with libLIB / search DIR (for extern fun)\n"
+            "  EXTRA.o/.a/.so  additional objects or libraries passed to the linker\n"
             "environment:\n"
             "  LUMA_CC         linker driver to use (default: cc)\n"
             "  LUMA_RUNTIME    path to libluma_rt.a (default: next to the luma binary)\n");
@@ -78,7 +87,25 @@ static char *runtime_path(void) {
     return with_ext(exe, "libluma_rt.a");
 }
 
-static int run_linker(const char *obj, const char *out, bool verbose) {
+typedef struct {
+    char **items;
+    int n, cap;
+} StrList;
+
+static void strlist_push(StrList *l, char *s) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 8;
+        l->items = xrealloc(l->items, (size_t)l->cap * sizeof *l->items);
+    }
+    l->items[l->n++] = s;
+}
+
+static void strlist_free(StrList *l) {
+    for (int i = 0; i < l->n; i++) free(l->items[i]);
+    free(l->items);
+}
+
+static int run_linker(const char *obj, const char *out, const StrList *extra, const StrList *libs, bool verbose) {
     const char *cc = getenv("LUMA_CC");
     if (!cc || !*cc) cc = "cc";
     char *rt = runtime_path();
@@ -87,16 +114,30 @@ static int run_linker(const char *obj, const char *out, bool verbose) {
         free(rt);
         return 1;
     }
-    char *argv[] = {(char *)cc, "-o", (char *)out, (char *)obj, rt, NULL};
-    if (verbose) fprintf(stderr, "luma: link: %s -o %s %s %s\n", cc, out, obj, rt);
+    /* cc -o OUT OUT.o EXTRA... RUNTIME -L.../-l...  (libraries after the objects that use them) */
+    int n = 0;
+    char **argv = xmalloc((size_t)(6 + extra->n + libs->n) * sizeof *argv);
+    argv[n++] = (char *)cc;
+    argv[n++] = "-o";
+    argv[n++] = (char *)out;
+    argv[n++] = (char *)obj;
+    for (int i = 0; i < extra->n; i++) argv[n++] = extra->items[i];
+    argv[n++] = rt;
+    for (int i = 0; i < libs->n; i++) argv[n++] = libs->items[i];
+    argv[n] = NULL;
+    if (verbose) {
+        fprintf(stderr, "luma: link:");
+        for (int i = 0; i < n; i++) fprintf(stderr, " %s", argv[i]);
+        fputc('\n', stderr);
+    }
     pid_t pid;
     int err = posix_spawnp(&pid, cc, NULL, NULL, argv, environ);
+    free(argv);
+    free(rt);
     if (err != 0) {
         fprintf(stderr, "luma: error: cannot run linker '%s': %s\n", cc, strerror(err));
-        free(rt);
         return 1;
     }
-    free(rt);
     int status;
     while (waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
@@ -114,10 +155,26 @@ static int run_linker(const char *obj, const char *out, bool verbose) {
 int main(int argc, char **argv) {
     const char *input = NULL, *out = "a.out";
     bool stop_ir = false, stop_s = false, stop_c = false;
-    bool dump_tokens = false, dump_ast = false, dump_ir = false, verbose = false;
+    bool dump_tokens = false, dump_ast = false, dump_ir = false, dump_opt_ir = false, verbose = false;
+    int opt_level = 2;
+    StrList extra = {0}, libs = {0};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (strcmp(a, "-o") == 0) {
+        if ((a[0] == '-' && (a[1] == 'l' || a[1] == 'L'))) {
+            const char *v = a[2] ? a + 2 : NULL;
+            if (!v) {
+                if (++i >= argc) { fprintf(stderr, "luma: error: %s requires an argument\n", a); return 2; }
+                v = argv[i];
+            }
+            if (!*v || v[0] == '-') { fprintf(stderr, "luma: error: invalid argument for %.2s: '%s'\n", a, v); return 2; }
+            char *opt = xmalloc(strlen(v) + 3);
+            opt[0] = '-';
+            opt[1] = a[1];
+            strcpy(opt + 2, v);
+            strlist_push(&libs, opt);
+        } else if (a[0] != '-' && (ends_with(a, ".o") || ends_with(a, ".a") || ends_with(a, ".so"))) {
+            strlist_push(&extra, xstrdup(a));
+        } else if (strcmp(a, "-o") == 0) {
             if (++i >= argc) { fprintf(stderr, "luma: error: -o requires an argument\n"); return 2; }
             out = argv[i];
         } else if (strcmp(a, "--emit-ir") == 0) stop_ir = true;
@@ -126,6 +183,8 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--dump-tokens") == 0) dump_tokens = true;
         else if (strcmp(a, "--dump-ast") == 0) dump_ast = true;
         else if (strcmp(a, "--dump-ir") == 0) dump_ir = true;
+        else if (strcmp(a, "--dump-opt-ir") == 0) dump_opt_ir = true;
+        else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '2' && !a[3]) opt_level = a[2] - '0';
         else if (strcmp(a, "-v") == 0) verbose = true;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(stdout); return 0; }
         else if (a[0] == '-' && a[1]) { fprintf(stderr, "luma: error: unknown option '%s'\n", a); usage(stderr); return 2; }
@@ -138,6 +197,8 @@ int main(int argc, char **argv) {
 
     int rc = 1;
     char *ir_path = with_ext(out, ".lir");
+    char *opt_path = with_ext(out, ".opt.lir");
+    Buf opt_buf = {0};
     char *asm_path = with_ext(out, ".s");
     char *obj_path = with_ext(out, ".o");
     size_t src_len = 0, asm_len = 0;
@@ -176,6 +237,20 @@ int main(int argc, char **argv) {
     /* 3. verify (always, including IR we produced ourselves) */
     /* (line numbers refer to INPUT: .lir lines, or .luma lines for lowered IR) */
     if (!ir_verify(&ir, input)) goto done;
+
+    /* 3b. optimize (-O2): the result is written to OUT.opt.lir and must verify */
+    if (opt_level >= 2) {
+        opt_module(&ir, opt_level);
+        ir_print_module(&ir, &opt_buf);
+        if (dump_opt_ir) fwrite(opt_buf.data, 1, opt_buf.len, stdout);
+        if (!write_file(opt_path, opt_buf.data, opt_buf.len)) goto done;
+        if (verbose) fprintf(stderr, "luma: wrote optimized IR %s\n", opt_path);
+        if (!ir_verify(&ir, opt_path)) {
+            fprintf(stderr, "luma: internal error: the optimizer produced invalid IR (%s); "
+                            "-O1 or -O0 avoids the optimizer\n", opt_path);
+            goto done;
+        }
+    }
     if (stop_ir) {
         if (from_ir) { fprintf(stderr, "luma: error: --emit-ir needs a .luma input\n"); goto done; }
         rc = 0;
@@ -183,7 +258,8 @@ int main(int argc, char **argv) {
     }
 
     /* 4. instruction selection */
-    x86_emit_module(&ir, &asm_buf);
+    if (opt_level >= 1) x86_gen_module(&ir, &asm_buf);
+    else x86_emit_module(&ir, &asm_buf);
     if (!write_file(asm_path, asm_buf.data, asm_buf.len)) goto done;
     if (verbose) fprintf(stderr, "luma: wrote assembly %s (%zu bytes)\n", asm_path, asm_buf.len);
     if (stop_s) { rc = 0; goto done; }
@@ -200,7 +276,7 @@ int main(int argc, char **argv) {
     if (stop_c) { rc = 0; goto done; }
 
     /* 7. link */
-    rc = run_linker(obj_path, out, verbose);
+    rc = run_linker(obj_path, out, &extra, &libs, verbose);
     if (rc == 0 && verbose) fprintf(stderr, "luma: wrote executable %s\n", out);
 
 done:
@@ -213,7 +289,11 @@ done:
     buf_free(&asm_buf);
     obj_free(&obj);
     free(ir_path);
+    free(opt_path);
+    buf_free(&opt_buf);
     free(asm_path);
     free(obj_path);
+    strlist_free(&extra);
+    strlist_free(&libs);
     return rc;
 }

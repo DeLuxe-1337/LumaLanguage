@@ -6,6 +6,7 @@
 #   make test       run unit + end-to-end + differential tests
 #   make selftest   compile and run the self-checking program examples/selftest.luma
 #   make difftest   random programs vs. a reference interpreter (DIFFTEST_COUNT=N)
+#   make bench      benchmarks: -O0 (naive backend) vs. the default -O2
 #   make clean      remove build/
 
 CC      ?= cc
@@ -17,12 +18,13 @@ DEFS    := -D_POSIX_C_SOURCE=200809L
 RT_CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 BUILD   ?= build
 
-CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_parse.c src/ir_verify.c \
-             src/x86_isel.c src/obj.c src/asm.c src/elf_writer.c
+CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_types.c src/ir_parse.c src/ir_verify.c \
+             src/cfg.c src/opt.c src/opt_util.c src/opt_cfg.c src/opt_ssa.c src/opt_passes.c \
+             src/x86_isel.c src/x86_gen.c src/obj.c src/asm.c src/elf_writer.c
 CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
 HEADERS   := $(wildcard src/*.h)
 
-.PHONY: all clean test unit e2e difftest selftest hello inspect
+.PHONY: all clean test unit e2e difftest selftest hello inspect bench
 
 all: $(BUILD)/luma $(BUILD)/lasm $(BUILD)/libluma_rt.a
 
@@ -83,6 +85,10 @@ e2e: all
 DIFFTEST_COUNT ?= 300
 difftest: all
 	python3 -I tests/difftest.py $(DIFFTEST_COUNT)
+
+# Benchmarks (bench/*.luma): wall time at -O0 and at the default level.
+bench: all
+	python3 bench/run.py --compare
 
 # A Luma program that checks the compiler from the inside (examples/selftest.luma).
 selftest: all

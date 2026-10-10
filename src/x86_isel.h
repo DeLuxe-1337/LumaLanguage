@@ -12,4 +12,9 @@
 
 void x86_emit_module(const IrModule *m, Buf *out);
 
+/* Shared with the optimizing backend (x86_gen.c): string objects, global
+ * variable slots and their display names; and .ascii escaping. */
+void x86_emit_data(const IrModule *m, Buf *out);
+void x86_emit_ascii(Buf *out, const char *s, size_t n);
+
 #endif

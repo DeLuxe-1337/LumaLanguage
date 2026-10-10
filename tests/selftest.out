@@ -1,5 +1,2 @@
-selftest checks run:
-77
-selftest checks failed:
-0
+selftest: 91 passed, 0 failed
 SELFTEST PASSED

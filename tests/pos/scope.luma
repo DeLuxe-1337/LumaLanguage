@@ -5,15 +5,15 @@ var b = "global b";
   var a = "outer a";
   {
     var a = "inner a";
-    print a;
-    print b;
+    print(a);
+    print(b);
     b = "assigned from inner";
   }
-  print a;
+  print(a);
 }
-print a;
-print b;
+print(a);
+print(b);
 var a = a + " (redeclared)";
-print a;
+print(a);
 var u;
-print u;
+print(u);

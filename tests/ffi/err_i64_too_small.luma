@@ -1,0 +1,2 @@
+extern fun too_small_i64(): i64;
+print(too_small_i64());

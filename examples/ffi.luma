@@ -1,0 +1,15 @@
+// Calling C directly: declare the C signature with `extern fun`, then call it
+// like any Luma function. libc symbols need no extra flags; other libraries
+// are linked with `luma prog.luma -o prog -l NAME` (and -L DIR).
+extern fun puts(s: cstr): i32;
+extern fun strlen(s: cstr): u64;
+extern fun abs(n: i32): i32;
+extern fun atoi(s: cstr): i32;
+extern fun getenv(name: cstr): cstr?;      // NULL comes back as nil
+
+puts("hello, luma via C");
+var word: str = "natively compiled";
+print("strlen:", strlen(word));
+print("abs(-42) =", abs(-42), "| atoi(\"123\") + 1 =", atoi("123") + 1);
+var home = getenv("LUMA_EXAMPLE_SURELY_UNSET");
+if (home == nil) print("getenv returned NULL -> nil");
