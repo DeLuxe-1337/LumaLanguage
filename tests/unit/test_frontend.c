@@ -263,12 +263,14 @@ static void test_lower(void) {
     /* gradual typing */
     expect_ir_contains("fun f(a: int): int { return a; } print(f(1));", "%1 = call @fn.f(%0)"); /* fits: no guard */
     expect_ir_contains("fun u(x) { return x; } fun f(a: int) {} f(u(1));",
-                       "call @luma_check_type(%1, %2, %3)\n  call @fn.f(%1)");        /* any -> int: guarded */
+                       "%1 = check %1, int, @s0\n  call @fn.f(%1)");                 /* any -> int: guarded */
     expect_ir_contains("fun u(x) { return x; } fun f(a: int) {} f(u(1));", "data @s0 = str \"argument 'a' of 'f'\"");
     expect_ir_contains("fun u(x) { return x; } var n: int = u(1);",
-                       "%2 = const 1\n  %3 = const @s0\n  call @luma_check_type(%1, %2, %3)\n  store @var.n, %1"); /* mask 1 = int */
+                       "%1 = check %1, int, @s0\n  store @var.n, %1");
+    expect_ir_contains("fun u(x) { return x; } var n: int = u(1);", "global @var.n: int\n");
+    expect_ir_contains("fun f(a: int, b, c: str?): bool { return true; }", "fn @fn.f(%a: int, %b, %c: str?): bool {");
     expect_ir_contains("fun u(x) { return x; } var n: int = u(1) + 1;", "%3 = add %1, %2\n  store @var.n, %3"); /* '+' with int -> int: no guard */
-    expect_ir_contains("fun f(): int { for (;;) { return 1; } }", "fn @fn.f() {\nentry:\n  jmp while.cond.0\n");
+    expect_ir_contains("fun f(): int { for (;;) { return 1; } }", "fn @fn.f(): int {\nentry:\n  jmp while.cond.0\n");
     char *g = lower_str("var n: int = 1; n = 2;");
     CHECK(g && strstr(g, "luma_check_type") == NULL); /* fully typed: no guards at all */
     free(g);

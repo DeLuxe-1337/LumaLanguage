@@ -106,7 +106,7 @@ typedef struct {
     GVar *gvars;
     int ngvars;
     int nstrings;
-    int write_fn, space_fn, newline_fn, check_fn; /* runtime externs, created on first use */
+    int write_fn, space_fn, newline_fn; /* runtime externs, created on first use */
     Fn *f;
     bool failed;
 } L;
@@ -250,15 +250,13 @@ static Ty flow(L *l, Val v, Ty slot, const char *what, int line, int col) {
         lerr(l, line, col, "%s expects %s, got %s", what, want, got);
         return slot;
     }
-    /* gradual boundary: check at runtime (message uses the same wording) */
-    int args[3] = {v.v, temp(l), temp(l)};
-    IrInstr *in = emit(l, IR_CONST_INT, line);
-    in->dst = args[1];
-    in->imm = (int64_t)slot;
-    in = emit(l, IR_CONST_DATA, line);
-    in->dst = args[2];
+    /* gradual boundary: `%v = check %v, SLOT, @context` narrows the value in
+     * place (the runtime message uses the same wording) */
+    IrInstr *in = emit(l, IR_CHECK, line);
+    in->dst = v.v;
+    in->a = v.v;
+    in->ty = slot;
     in->global = string_data(l, what, strlen(what));
-    emit_call(l, IR_NONE, runtime_extern(l, &l->check_fn, "luma_check_type", 3), args, 3, line);
     return v.ty & slot;
 }
 
@@ -987,6 +985,15 @@ static void collect_declarations(L *l, const Program *prog) {
             info.ptypes = xmalloc((s->nparams ? s->nparams : 1) * sizeof *info.ptypes);
             for (size_t k = 0; k < s->nparams; k++) info.ptypes[k] = resolve_type(l, &s->param_types[k]);
             info.ret = resolve_type(l, &s->type);
+            /* the signature is part of the IR: callers and returns must uphold it */
+            IrGlobal *g = &l->m->globals[info.global];
+            g->ty = info.ret;
+            bool typed = false;
+            for (size_t k = 0; k < s->nparams; k++) typed |= info.ptypes[k] != T_ANY;
+            if (typed) {
+                g->ptys = xmalloc(s->nparams * sizeof *g->ptys);
+                for (size_t k = 0; k < s->nparams; k++) g->ptys[k] = info.ptypes[k];
+            }
             l->fns = xrealloc(l->fns, (size_t)(l->nfns + 1) * sizeof *l->fns);
             l->fns[l->nfns++] = info;
         } else if (s->kind == STMT_EXTERN) {
@@ -1030,7 +1037,9 @@ static void collect_declarations(L *l, const Program *prog) {
             char sym[300];
             snprintf(sym, sizeof sym, "var.%s", s->name);
             l->gvars = xrealloc(l->gvars, (size_t)(l->ngvars + 1) * sizeof *l->gvars);
-            l->gvars[l->ngvars++] = (GVar){s->name, ir_add_var(l->m, sym), false, ty};
+            int gi = ir_add_var(l->m, sym);
+            l->m->globals[gi].ty = ty;
+            l->gvars[l->ngvars++] = (GVar){s->name, gi, false, ty};
         }
     }
     for (int i = 0; i < l->ngvars && !l->failed; i++) {
@@ -1047,7 +1056,7 @@ bool lower_program(const Program *prog, IrModule *out) {
     L l = {0};
     l.path = prog->source_path;
     l.m = out;
-    l.write_fn = l.space_fn = l.newline_fn = l.check_fn = -1;
+    l.write_fn = l.space_fn = l.newline_fn = -1;
     Fn main_fn;
     int main_fi = ir_add_func(out, "luma_main", 0);
     collect_declarations(&l, prog);

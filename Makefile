@@ -17,7 +17,7 @@ DEFS    := -D_POSIX_C_SOURCE=200809L
 RT_CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 BUILD   ?= build
 
-CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_parse.c src/ir_verify.c \
+CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_types.c src/ir_parse.c src/ir_verify.c \
              src/x86_isel.c src/obj.c src/asm.c src/elf_writer.c
 CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
 HEADERS   := $(wildcard src/*.h)

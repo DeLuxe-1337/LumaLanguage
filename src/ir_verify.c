@@ -39,7 +39,7 @@ static bool vreg_ok(const IrFunc *f, int r) { return r >= 0 && r < f->nvregs; }
 /* Calls fn(ctx, vreg) for every vreg the instruction reads. */
 static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) {
     switch (in->op) {
-    case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE:
+    case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
         fn(ctx, in->a);
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
@@ -48,6 +48,7 @@ static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) 
         fn(ctx, in->b);
         break;
     case IR_CALL:
+    case IR_PHI:
         for (int i = 0; i < in->nargs; i++) fn(ctx, in->args[i]);
         break;
     default: break;
@@ -83,6 +84,14 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
         if (in->global < 0 || in->global >= m->nglobals) verr(v, f, b, in, "const references an undefined global");
         else if (m->globals[in->global].kind != IRG_DATA)
             verr(v, f, b, in, "'const @%s' must reference a data global", m->globals[in->global].name);
+        break;
+    case IR_CHECK:
+        if (in->global < 0 || in->global >= m->nglobals || m->globals[in->global].kind != IRG_DATA)
+            verr(v, f, b, in, "'check' needs a data global as its error context");
+        if (in->ty == 0 || (in->ty & ~(IrTy)TY_ANY)) verr(v, f, b, in, "'check' has an invalid type");
+        break;
+    case IR_PHI:
+        verr(v, f, b, in, "phi instructions only exist inside the optimizer");
         break;
     case IR_LOAD: case IR_STORE:
         if (in->global < 0 || in->global >= m->nglobals) verr(v, f, b, in, "'%s' references an undefined global", ir_op_name(in->op));
@@ -175,6 +184,50 @@ static void verify_def_before_use(V *v, const IrFunc *f) {
     free(reach);
 }
 
+/* ---- declared types (proved with ir_types) ---- */
+
+static void type_error(V *v, const IrFunc *f, int b, const IrInstr *in, const char *what, IrTy got, IrTy want) {
+    char g[64], w[64];
+    ir_ty_name(got, g, sizeof g);
+    ir_ty_name(want, w, sizeof w);
+    verr(v, f, b, in, "%s may be %s, but it is declared %s (add a 'check')", what, g, w);
+}
+
+static void verify_types(V *v, const IrFunc *f) {
+    const IrModule *m = v->m;
+    IrTypes t;
+    ir_types_compute(m, f, &t);
+    IrTy *st = xmalloc((size_t)(f->nvregs ? f->nvregs : 1) * sizeof *st);
+    const IrGlobal *self = &m->globals[f->global];
+    char what[300];
+    for (int b = 0; b < f->nblocks; b++) {
+        memcpy(st, &t.in[(size_t)b * f->nvregs], (size_t)f->nvregs * sizeof *st);
+        const IrBlock *bl = &f->blocks[b];
+        for (int k = 0; k < bl->n; k++) {
+            const IrInstr *in = &bl->instrs[k];
+            if (in->op == IR_CALL && m->globals[in->global].kind == IRG_FUNC) {
+                const IrGlobal *g = &m->globals[in->global];
+                for (int i = 0; i < in->nargs && i < g->arity; i++) {
+                    IrTy want = ir_param_ty(g, i);
+                    if (st[in->args[i]] & ~want) {
+                        snprintf(what, sizeof what, "argument %d of '@%s'", i + 1, g->name);
+                        type_error(v, f, b, in, what, st[in->args[i]], want);
+                    }
+                }
+            } else if (in->op == IR_RET && (st[in->a] & ~self->ty)) {
+                snprintf(what, sizeof what, "the return value of '@%s'", self->name);
+                type_error(v, f, b, in, what, st[in->a], self->ty);
+            } else if (in->op == IR_STORE && (st[in->a] & ~m->globals[in->global].ty)) {
+                snprintf(what, sizeof what, "the value stored to '@%s'", m->globals[in->global].name);
+                type_error(v, f, b, in, what, st[in->a], m->globals[in->global].ty);
+            }
+            ir_types_step(m, in, st);
+        }
+    }
+    free(st);
+    ir_types_free(&t);
+}
+
 bool ir_verify(const IrModule *m, const char *path) {
     V v = {m, path, 0};
     for (int i = 0; i < m->nglobals; i++)
@@ -208,6 +261,7 @@ bool ir_verify(const IrModule *m, const char *path) {
             }
         }
         if (v.errors == 0) verify_def_before_use(&v, f);
+        if (v.errors == 0) verify_types(&v, f);
     }
     if (v.errors > 20) fprintf(stderr, "%s: ... %d more error(s)\n", path, v.errors - 20);
     return v.errors == 0;

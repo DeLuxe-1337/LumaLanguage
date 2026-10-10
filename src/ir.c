@@ -5,6 +5,75 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ---- types ---- */
+
+void ir_ty_name(IrTy t, char *buf, size_t n) {
+    static const struct { IrTy bit; const char *name; } T[] = {
+        {TY_INT, "int"}, {TY_STR, "str"}, {TY_BOOL, "bool"}, {TY_NIL, "nil"}};
+    t &= TY_ANY;
+    if (t == TY_ANY) { snprintf(buf, n, "any"); return; }
+    if (t == 0) { snprintf(buf, n, "never"); return; }
+    IrTy rest = t & ~(IrTy)TY_NIL;
+    if ((t & TY_NIL) && rest && (rest & (rest - 1)) == 0) {
+        for (int i = 0; i < 3; i++)
+            if (T[i].bit == rest) { snprintf(buf, n, "%s?", T[i].name); return; }
+    }
+    buf[0] = '\0';
+    for (int i = 0; i < 4; i++) {
+        if (!(t & T[i].bit)) continue;
+        if (buf[0]) strncat(buf, "|", n - strlen(buf) - 1);
+        strncat(buf, T[i].name, n - strlen(buf) - 1);
+    }
+}
+
+bool ir_ty_parse(const char *s, IrTy *out) {
+    static const struct { const char *name; IrTy ty; } N[] = {
+        {"int", TY_INT}, {"str", TY_STR}, {"bool", TY_BOOL}, {"nil", TY_NIL}, {"any", TY_ANY}};
+    IrTy t = 0;
+    const char *p = s;
+    if (!*p) return false;
+    for (;;) {
+        size_t len = strcspn(p, "|?");
+        bool found = false;
+        for (size_t i = 0; i < sizeof N / sizeof *N; i++)
+            if (strlen(N[i].name) == len && strncmp(p, N[i].name, len) == 0) {
+                t |= N[i].ty;
+                found = true;
+            }
+        if (!found) return false;
+        p += len;
+        if (*p == '?') {
+            t |= TY_NIL;
+            p++;
+            if (*p) return false;
+            break;
+        }
+        if (!*p) break;
+        p++; /* '|' */
+    }
+    *out = t;
+    return true;
+}
+
+IrTy ir_param_ty(const IrGlobal *g, int i) { return g->ptys ? g->ptys[i] : TY_ANY; }
+
+IrTy ir_ctype_ty(CType c) {
+    switch (c) {
+    case CT_BOOL: return TY_BOOL;
+    case CT_CSTR: return TY_STR;
+    case CT_CSTR_OPT: return TY_STR | TY_NIL;
+    case CT_VOID: return TY_NIL;
+    default: return TY_INT; /* every integer type and ptr */
+    }
+}
+
+void ir_instr_free(IrInstr *in) {
+    free(in->args);
+    free(in->phi_blocks);
+    in->args = NULL;
+    in->phi_blocks = NULL;
+}
+
 void ir_module_init(IrModule *m, const char *source) {
     memset(m, 0, sizeof *m);
     m->source = xstrdup(source ? source : "");
@@ -14,7 +83,7 @@ void ir_module_free(IrModule *m) {
     for (int i = 0; i < m->nfuncs; i++) {
         IrFunc *f = &m->funcs[i];
         for (int b = 0; b < f->nblocks; b++) {
-            for (int k = 0; k < f->blocks[b].n; k++) free(f->blocks[b].instrs[k].args);
+            for (int k = 0; k < f->blocks[b].n; k++) ir_instr_free(&f->blocks[b].instrs[k]);
             free(f->blocks[b].instrs);
             free(f->blocks[b].label);
         }
@@ -28,6 +97,7 @@ void ir_module_free(IrModule *m) {
             for (int k = 0; k < g->arity; k++) free(g->cnames[k]);
         free(g->cnames);
         free(g->cparams);
+        free(g->ptys);
         free(g->name);
         free(g->data);
     }
@@ -50,6 +120,7 @@ static int add_global(IrModule *m, IrGlobalKind kind, const char *name) {
     g->kind = kind;
     g->name = xstrdup(name);
     g->func = -1;
+    g->ty = TY_ANY;
     return m->nglobals++;
 }
 
@@ -244,6 +315,8 @@ const char *ir_op_name(IrOp op) {
     case IR_CALL: return "call";
     case IR_LOAD: return "load";
     case IR_STORE: return "store";
+    case IR_CHECK: return "check";
+    case IR_PHI: return "phi";
     case IR_JMP: return "jmp";
     case IR_BR: return "br";
     case IR_RET: return "ret";
@@ -311,6 +384,17 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
         break;
     case IR_LOAD: buf_printf(out, "load @%s", gname(m, in->global)); break;
     case IR_STORE: buf_printf(out, "store @%s, %%%s", gname(m, in->global), vname(f, in->a)); break;
+    case IR_CHECK: {
+        char tn[64];
+        ir_ty_name(in->ty, tn, sizeof tn);
+        buf_printf(out, "check %%%s, %s, @%s", vname(f, in->a), tn, gname(m, in->global));
+        break;
+    }
+    case IR_PHI:
+        buf_printf(out, "phi");
+        for (int i = 0; i < in->nargs; i++)
+            buf_printf(out, "%s [%%%s, %s]", i ? "," : "", vname(f, in->args[i]), bname(f, in->phi_blocks[i]));
+        break;
     case IR_JMP: buf_printf(out, "jmp %s", bname(f, in->target[0])); break;
     case IR_BR:
         buf_printf(out, "br %%%s, %s, %s", vname(f, in->a), bname(f, in->target[0]), bname(f, in->target[1]));
@@ -320,9 +404,22 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
 }
 
 static void print_func(const IrModule *m, const IrFunc *f, Buf *out) {
-    buf_printf(out, "fn @%s(", m->globals[f->global].name);
-    for (int i = 0; i < f->nparams; i++) buf_printf(out, "%s%%%s", i ? ", " : "", f->vregs[i]);
-    buf_printf(out, ") {\n");
+    const IrGlobal *g = &m->globals[f->global];
+    char tn[64];
+    buf_printf(out, "fn @%s(", g->name);
+    for (int i = 0; i < f->nparams; i++) {
+        buf_printf(out, "%s%%%s", i ? ", " : "", f->vregs[i]);
+        if (ir_param_ty(g, i) != TY_ANY) {
+            ir_ty_name(ir_param_ty(g, i), tn, sizeof tn);
+            buf_printf(out, ": %s", tn);
+        }
+    }
+    buf_printf(out, ")");
+    if (g->ty != TY_ANY) {
+        ir_ty_name(g->ty, tn, sizeof tn);
+        buf_printf(out, ": %s", tn);
+    }
+    buf_printf(out, " {\n");
     for (int b = 0; b < f->nblocks; b++) {
         buf_printf(out, "%s:\n", f->blocks[b].label);
         for (int k = 0; k < f->blocks[b].n; k++) {
@@ -348,7 +445,13 @@ void ir_print_module(const IrModule *m, Buf *out) {
         if (g->kind == IRG_EXTERN) {
             buf_printf(out, "extern fn @%s(%d)\n", g->name, g->arity);
         } else if (g->kind == IRG_VAR) {
-            buf_printf(out, "global @%s\n", g->name);
+            buf_printf(out, "global @%s", g->name);
+            if (g->ty != TY_ANY) {
+                char tn[64];
+                ir_ty_name(g->ty, tn, sizeof tn);
+                buf_printf(out, ": %s", tn);
+            }
+            buf_byte(out, '\n');
         } else if (g->kind == IRG_CEXTERN) {
             buf_printf(out, "extern c fn @%s(", g->name);
             for (int k = 0; k < g->arity; k++)

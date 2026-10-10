@@ -153,6 +153,18 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         store(out, in->dst, "rax");
         break;
     }
+    case IR_CHECK:
+        /* luma_check_type(value, mask as a fixnum, context string) returns only if the type matches */
+        load(out, "rdi", in->a);
+        buf_printf(out, "    mov rsi, %" PRId64 "\n", (int64_t)luma_fixnum((int64_t)in->ty));
+        buf_printf(out, "    lea rdx, [rip + .Ldata.%s]\n", m->globals[in->global].name);
+        buf_printf(out, "    call luma_check_type@PLT\n");
+        load(out, "rax", in->a);
+        store(out, in->dst, "rax");
+        break;
+    case IR_PHI:
+        buf_printf(out, "    # (phi: never reaches the backend)\n");
+        break;
     case IR_STORE:
         load(out, "rax", in->a);
         buf_printf(out, "    mov [rip + .Lvar.%s], rax\n", m->globals[in->global].name);
