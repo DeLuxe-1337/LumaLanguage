@@ -43,14 +43,11 @@ typedef uint64_t LumaValue;
 #define LUMA_POISON ((LumaValue)0x00000DEAD0000004)
 
 /* Memory-management modes (luma --mm=..., emitted as the luma_mm symbol). */
-#define LUMA_STRUCT_SHARED 1 /* descriptor flags: every instance is counted */
 #define LUMA_MM_NONE 0
 #define LUMA_MM_MANUAL 1
 
-/* Struct descriptor kinds (LumaStructDesc.kind; IrStructKind). */
-#define LUMA_STRUCT_USER 0
-#define LUMA_STRUCT_RC 1
-#define LUMA_STRUCT_ARENA 2
+/* Struct descriptor flags (LumaStructDesc.flags). */
+#define LUMA_STRUCT_SHARED 1 /* every instance is counted */
 
 /* A struct instance: header = LUMA_TYPE_STRUCT | (struct index + 1) << 8
  * | count << 32, then a pointer to the struct's descriptor, then one word

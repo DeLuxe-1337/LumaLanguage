@@ -153,19 +153,12 @@ typedef struct {
 /* A struct type (v0.5). Instances are heap objects: a header word (type id 2
  * and the struct's index + 1 in bits 8-31), a pointer to the struct's
  * descriptor, then one word per field in declaration order. */
-/* Builtin struct kinds (v0.7). Their names are reserved, and the kind
- * follows from the name: "Rc" (a box holding any non-struct value),
- * "Rc.S" (a box holding an instance of struct S; written Rc<S> in Luma) and
- * "Arena". docs/DESIGN.md "Memory". */
-typedef enum { IR_STRUCT_USER = 0, IR_STRUCT_RC = 1, IR_STRUCT_ARENA = 2 } IrStructKind;
-IrStructKind ir_struct_kind_of(const char *name);
-/* The name used in messages and printed values: "Rc.Point" -> "Rc<Point>",
- * "Rc" -> "Rc<any>"; other names unchanged. */
+/* The name used in messages and printed values: a space after each comma
+ * of a generic instance's name ("Pair<int,str>" -> "Pair<int, str>"). */
 void ir_struct_display(const char *name, char *buf, size_t n);
 
 typedef struct {
     char *name;
-    IrStructKind kind;
     int nfields;
     char **fields;    /* field names (owned) */
     IrTy *ftys;       /* declared field types (owned) */
@@ -192,6 +185,10 @@ typedef struct IrModule {
     IrStruct *structs; /* v0.5 */
     int nstructs;
 } IrModule;
+
+/* The global of struct sid's show hook: a method `show(self): str` (print
+ * shows an instance as the string it returns); -1 if none. */
+int ir_struct_show(const IrModule *m, int sid);
 
 /* ---- construction ---- */
 void ir_module_init(IrModule *m, const char *source);

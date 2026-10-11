@@ -1,1 +1,1 @@
-luma: runtime error: Struct 'P' has no field 'y'.
+luma: runtime error: Struct 'Rc<P>' has no field 'y' (nor does 'P', through deref).

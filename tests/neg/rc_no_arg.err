@@ -1,1 +1,1 @@
-Rc needs a type argument: Rc<Point>, or Rc<any> for a value that is not a struct
+'Rc' takes 1 type argument, got 0

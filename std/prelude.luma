@@ -1,0 +1,30 @@
+// The Luma prelude: part of every program. Only what a program uses is
+// compiled (docs/DESIGN.md "The prelude"). Names starting with __ are
+// runtime intrinsics, callable only here.
+
+// Rc<T>: shared ownership. Copying a handle shares the box; the last handle
+// frees the box and, through drop, the value it owns. Fields and methods the
+// box lacks go to the value (deref).
+shared struct Rc<T> { __value: T }
+
+impl Rc<T> {
+  fun new(move v: T): Rc<T> { return Rc { __value: v }; }
+  fun get(self): T { return self.__value; }
+  fun count(self): int { return refcount(self); }   // a debugging aid
+  fun deref(self): T { return self.__value; }        // r.x is r's value's x
+  fun drop(self) { dispose(self.__value); }          // the box owns its value
+  fun show(self): str { return "Rc(" + __show(self.__value) + ")"; }
+}
+
+// Arena: `arena { ... }` is `with Arena::new() { ... }`. While entered,
+// struct instances that would be freed by hand are allocated in the arena;
+// they are freed together when its last handle goes away.
+shared struct Arena { __state: int }
+
+impl Arena {
+  fun new(): Arena { return Arena { __state: __arena_create() }; }
+  fun enter(self) { __arena_push(self); }
+  fun leave(self) { __arena_pop(); }
+  fun drop(self) { __arena_destroy(self.__state); }
+  fun show(self): str { return "Arena"; }
+}

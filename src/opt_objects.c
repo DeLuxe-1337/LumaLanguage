@@ -81,7 +81,6 @@ static bool devirtualize(const IrModule *m, IrInstr *in, const IrTy *st) {
         in->a = IR_NONE;
         return true;
     }
-    if (sd->kind != IR_STRUCT_USER) return false; /* .f on an Rc means its value's field (the runtime derefs) */
     int k = ir_struct_field(sd, in->name);
     if (k < 0) return false;
     if (in->op == IR_SETFIELD && !ir_ty_sub(st[in->b], sd->ftys[k])) return false; /* the runtime check stays */
@@ -139,11 +138,9 @@ bool opt_objects(IrModule *m, IrFunc *f) {
                 /* Luma code may write fields; free() and leaving an arena end
                  * instances (a later read must reach memory, where memcheck can
                  * see the bug): only runtime calls known to do neither keep
-                 * what we know */
-                static const char *const KEEP[] = {"luma_write", "luma_write_space", "luma_write_newline", "luma_print",
-                                                   "luma_rc_new", "luma_rc_get", "luma_rc_count", "luma_arena_enter",
-                                                   "luma_refcount"};
-                bool keep = g->kind == IRG_CEXTERN;
+                 * what we know (printing runs show() methods, if any) */
+                static const char *const KEEP[] = {"luma_write_space", "luma_write_newline", "luma_refcount"};
+                bool keep = g->kind == IRG_CEXTERN || (opt_is_print_call(m, in) && !opt_runs_code(m, in));
                 for (size_t i = 0; g->kind == IRG_EXTERN && i < sizeof KEEP / sizeof *KEEP; i++)
                     keep |= strcmp(g->name, KEEP[i]) == 0;
                 if (!keep) nknown = 0;

@@ -1,1 +1,1 @@
-'Rc' is a builtin type name and cannot name a struct
+'Rc' is defined by the prelude

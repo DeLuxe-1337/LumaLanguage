@@ -38,6 +38,7 @@
 
 #include "cfg.h"
 #include "opt_internal.h"
+#include "prelude.h"
 
 /* ---------------------------------------------------------------------- */
 /* Compile-time use-after-free / double-free                               */
@@ -61,16 +62,6 @@ static bool is_free_call(const IrModule *m, const IrInstr *in) {
 /* "free" or "dispose", for messages */
 static const char *free_word(const IrModule *m, const IrInstr *in) {
     return strcmp(m->globals[in->global].name, "luma_dispose") == 0 ? "dispose" : "free";
-}
-
-/* Rc::new(x) moves x into the box: `new Rc.S(%x)` or `call @luma_rc_new(%x)`.
- * Returns the moved vreg or -1. */
-static int moved_into_rc(const IrModule *m, const IrInstr *in) {
-    if (in->op == IR_NEW && in->nargs == 1 && m->structs[in->sid].kind == IR_STRUCT_RC) return in->args[0];
-    if (in->op == IR_CALL && in->nargs == 1 && m->globals[in->global].kind == IRG_EXTERN &&
-        strcmp(m->globals[in->global].name, "luma_rc_new") == 0)
-        return in->args[0];
-    return -1;
 }
 
 /* A call of a Luma function moves the arguments of its `move` parameters
@@ -101,7 +92,7 @@ static void fn_display(const char *sym, char *buf, size_t n) {
     snprintf(buf, n, "%s", sym);
 }
 
-static int *mover; /* per vreg: the global of the function a move went to (-1: Rc::new) */
+static int *mover; /* per vreg: the global of the function a move went to */
 
 #define DISPOSED (1 << 24) /* state bit: freed by dispose() rather than free() */
 
@@ -123,16 +114,15 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
         if (!name) continue;
         if (report) {
             char at[64];
-            if (in->col > 0) snprintf(at, sizeof at, "%d:%d", in->line, in->col);
-            else snprintf(at, sizeof at, "%d", in->line);
-            if (state[v] < 0 && mover[v] >= 0) {
+            if (in->col > 0) snprintf(at, sizeof at, "%d:%d", prelude_line(in->line), in->col);
+            else snprintf(at, sizeof at, "%d", prelude_line(in->line));
+            path = prelude_path(path, in->line);
+            if (state[v] < 0) {
                 char fd[300];
                 fn_display(m->globals[mover[v]].name, fd, sizeof fd);
                 fprintf(stderr, "%s:%s: error: '%s' is %s after it was moved into %s() on line %d\n", path, at, name,
                         freeing ? "freed" : "used", fd, -state[v]);
-            } else if (state[v] < 0)
-                fprintf(stderr, "%s:%s: error: '%s' was moved into an Rc on line %d; use the Rc instead%s\n", path, at,
-                        name, -state[v], freeing ? " (the Rc frees it)" : "");
+            }
             else if (freeing)
                 fprintf(stderr, "%s:%s: error: '%s' is freed twice (%s(%s) on line %d already freed it)\n", path, at,
                         name, state[v] & DISPOSED ? "dispose" : "free", name, state[v] & ~DISPOSED);
@@ -146,11 +136,6 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
     if (in->dst >= 0) state[in->dst] = 0;
     if (freeing && in->args[0] >= 0)
         state[in->args[0]] = (in->line > 0 ? in->line : 1) | (strcmp(free_word(m, in), "dispose") == 0 ? DISPOSED : 0);
-    int mv = moved_into_rc(m, in);
-    if (mv >= 0) {
-        state[mv] = -(in->line > 0 ? in->line : 1);
-        mover[mv] = -1;
-    }
     int movedv[64];
     int nm = in->nargs <= 64 ? moved_args(m, in, movedv) : 0;
     for (int i = 0; i < nm; i++) {
@@ -166,7 +151,7 @@ static bool check_func_frees(const IrModule *m, const IrFunc *f, const char *pat
     bool any_free = false;
     for (int b = 0; b < nb && !any_free; b++)
         for (int k = 0; k < f->blocks[b].n; k++)
-            if (is_free_call(m, &f->blocks[b].instrs[k]) || moved_into_rc(m, &f->blocks[b].instrs[k]) >= 0 ||
+            if (is_free_call(m, &f->blocks[b].instrs[k]) ||
                 (f->blocks[b].instrs[k].op == IR_CALL && m->globals[f->blocks[b].instrs[k].global].kind == IRG_FUNC &&
                  m->globals[f->blocks[b].instrs[k].global].moves))
                 any_free = true;
@@ -311,9 +296,8 @@ static void choose_counted(IrModule *m, bool *sid_counted) {
         for (int s = 0; s < m->nstructs; s++) sid_counted[s] = false;
         return;
     }
-    /* Rc boxes and arena handles are always counted (Rc::new of a dynamic
-     * value creates boxes in the runtime, where no `new` shows them) */
-    for (int s = 0; s < m->nstructs; s++) sid_counted[s] = m->structs[s].kind != IR_STRUCT_USER || m->structs[s].shared;
+    /* instances of shared structs are always counted */
+    for (int s = 0; s < m->nstructs; s++) sid_counted[s] = m->structs[s].shared;
     bool **pesc = xcalloc((size_t)m->nfuncs + 1, sizeof *pesc);
     for (int i = 0; i < m->nfuncs; i++) pesc[i] = xcalloc((size_t)m->funcs[i].nparams + 1, sizeof **pesc);
     int maxv = 1;
@@ -341,9 +325,8 @@ static void choose_counted(IrModule *m, bool *sid_counted) {
             for (int k = 0; k < f->blocks[b].n; k++) {
                 IrInstr *in = &f->blocks[b].instrs[k];
                 if (in->op != IR_NEW) continue;
-                /* Rc boxes and arena handles are always counted: their lifetime
-                 * is the point; user structs when they never escape */
-                in->imm = m->structs[in->sid].kind != IR_STRUCT_USER || m->structs[in->sid].shared ||
+                /* shared structs always; others when they never escape */
+                in->imm = m->structs[in->sid].shared ||
                           (in->dst >= 0 && !esc[uf_find(parent, in->dst)]);
                 if (in->imm) sid_counted[in->sid] = true;
             }
@@ -514,8 +497,8 @@ static bool may_free(const IrModule *m, const IrInstr *in) {
         const IrGlobal *g = &m->globals[in->global];
         if (g->kind == IRG_CEXTERN) return false;
         if (g->kind == IRG_FUNC) return true;
-        static const char *const SAFE[] = {"luma_write", "luma_write_space", "luma_write_newline", "luma_print", "luma_refcount",
-                                           "luma_rc_count", "luma_rc_get", "luma_rc_new"};
+        if (opt_is_print_call(m, in)) return opt_runs_code(m, in); /* show() methods */
+        static const char *const SAFE[] = {"luma_write_space", "luma_write_newline", "luma_refcount"};
         for (size_t i = 0; i < sizeof SAFE / sizeof *SAFE; i++)
             if (strcmp(g->name, SAFE[i]) == 0) return false;
         return true;

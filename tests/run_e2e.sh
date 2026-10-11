@@ -323,9 +323,18 @@ check "retain/release cannot be written in LIR" sh -c \
 check "unknown --mm mode is reported" sh -c "! $LUMA --mm=gc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'unknown memory mode' $OUT/e"
 printf 'struct P { x: int }\nvar a = nil;\nvar b = nil;\nfun setup() { a = Rc::new(P { x: 1 }); b = a; }\nfun count() { return Rc::count(a); }\nsetup();\nprint(count());\nb = nil;\nprint(count());\n' >"$OUT/rcc.luma"
 for lvl in 0 2; do
-    check "Rc::count sees the handles held by globals (-O$lvl)" sh -c \
-        "$LUMA -O$lvl $OUT/rcc.luma -o $OUT/rcc$lvl && [ \"\$($OUT/rcc$lvl | tr '\\n' ' ')\" = '2 1 ' ]"
+    check "Rc::count: the globals' handles plus the call's own (-O$lvl)" sh -c \
+        "$LUMA -O$lvl $OUT/rcc.luma -o $OUT/rcc$lvl && [ \"\$($OUT/rcc$lvl | tr '\\n' ' ')\" = '3 2 ' ]"
 done
+# The prelude (std/prelude.luma): built in, overridable, compiled only as far as used.
+check "hello world compiles none of the prelude" sh -c \
+    "$LUMA examples/hello.luma -S -o $OUT/hp && ! grep -q 'Arena\\|Rc' $OUT/hp.s"
+printf 'struct Q { x: int }\nimpl Q {\n  fun f(self) { return self.x + "a"; }\n}\n' > "$OUT/badprelude.luma"
+printf 'var q = Q { x: 1 };\n' > "$OUT/useq.luma"
+check "an error inside the prelude is reported at <prelude>:LINE" sh -c \
+    "! LUMA_PRELUDE=$OUT/badprelude.luma $LUMA $OUT/useq.luma -o $OUT/uq 2>$OUT/e && grep -q '^<prelude>:3:' $OUT/e"
+check "LUMA_PRELUDE replaces the prelude (and a missing file is an error)" sh -c \
+    "! LUMA_PRELUDE=$OUT/nonexistent.luma $LUMA examples/hello.luma -o $OUT/h2 2>$OUT/e && grep -q nonexistent $OUT/e"
 check "--mm=rc points to Rc::new" sh -c "! $LUMA --mm=rc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'use Rc::new' $OUT/e"
 
 # ---------------------------------------------------------- C FFI

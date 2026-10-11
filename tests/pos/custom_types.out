@@ -1,0 +1,5 @@
+root root! Owned(root)
+Ticket#12 Ticket#12
+Pair { a: Ticket#3, b: Plain { x: 5 } }
+4
+0

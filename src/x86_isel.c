@@ -328,20 +328,16 @@ static void emit_structs(const IrModule *m, Buf *out) {
         buf_printf(out, "    .quad %d    # methods\n", st->nmethods);
         if (st->nmethods) buf_printf(out, "    .quad .Lsmeth.%d\n", i);
         else buf_printf(out, "    .quad 0\n");
-        buf_printf(out, "    .quad %d    # kind: %s\n", (int)st->kind,
-                   st->kind == IR_STRUCT_RC ? "Rc" : st->kind == IR_STRUCT_ARENA ? "Arena" : "user");
-        /* a user struct's Rc<S> box, for Rc::new of a value known only at run time */
-        char rcname[300];
-        snprintf(rcname, sizeof rcname, "Rc.%s", st->name);
-        int rc = st->kind == IR_STRUCT_USER ? ir_find_struct(m, rcname) : -1;
-        if (rc >= 0) buf_printf(out, "    .quad .Lstruct.%d    # Rc<%s>\n", rc, st->name);
-        else buf_printf(out, "    .quad 0\n");
         /* drop: the method named drop (called when an instance dies), or 0 */
         int drop = -1;
         for (int k = 0; k < st->nmethods; k++)
             if (strcmp(st->mnames[k], "drop") == 0) drop = st->mglobals[k];
         if (drop >= 0) buf_printf(out, "    .quad %s    # drop\n", m->globals[drop].name);
         else buf_printf(out, "    .quad 0    # no drop\n");
+        /* show: a method show(self): str (how print shows an instance), or 0 */
+        int show = ir_struct_show(m, i);
+        if (show >= 0) buf_printf(out, "    .quad %s    # show\n", m->globals[show].name);
+        else buf_printf(out, "    .quad 0    # no show\n");
         buf_printf(out, "    .quad %d    # flags%s\n", st->shared ? 1 : 0, st->shared ? ": shared" : "");
         if (st->nfields) {
             buf_printf(out, ".Lsfields.%d:\n", i);
@@ -361,7 +357,7 @@ static void emit_structs(const IrModule *m, Buf *out) {
     for (int i = 0; i < m->nstructs; i++) {
         const IrStruct *st = &m->structs[i];
         char disp[300];
-        ir_struct_display(st->name, disp, sizeof disp); /* the name in messages: Rc<Point> */
+        ir_struct_display(st->name, disp, sizeof disp); /* the name in messages */
         buf_printf(out, ".Lsname.%d:\n", i);
         x86_emit_ascii(out, disp, strlen(disp));
         buf_printf(out, "    .byte 0\n");

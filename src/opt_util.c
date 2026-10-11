@@ -50,11 +50,26 @@ static bool has_method(const IrModule *m, const char *name) {
     return false;
 }
 
+static bool module_has_show(const IrModule *m) {
+    for (int s = 0; s < m->nstructs; s++)
+        if (ir_struct_show(m, s) >= 0) return true;
+    return false;
+}
+
 bool opt_module_has_drop(const IrModule *m) { return has_method(m, "drop"); }
+
+bool opt_is_print_call(const IrModule *m, const IrInstr *in) {
+    if (in->op != IR_CALL || m->globals[in->global].kind != IRG_EXTERN) return false;
+    static const char *const P[] = {"luma_write", "luma_print", "luma_show"};
+    for (size_t i = 0; i < sizeof P / sizeof *P; i++)
+        if (strcmp(m->globals[in->global].name, P[i]) == 0) return true;
+    return false;
+}
 
 bool opt_runs_code(const IrModule *m, const IrInstr *in) {
     if (in->op == IR_CALLM) return true;
-    if (in->op == IR_CALL) return m->globals[in->global].kind == IRG_FUNC;
+    if (in->op == IR_CALL)
+        return m->globals[in->global].kind == IRG_FUNC || (opt_is_print_call(m, in) && module_has_show(m));
     if ((in->op == IR_GETFIELD || in->op == IR_SETFIELD) && in->sid < 0) return has_method(m, "deref");
     return false;
 }

@@ -11,8 +11,8 @@
  *                       allocation whose instances provably never leave the
  *                       function's local values (never stored, returned,
  *                       passed to free() or to a parameter that escapes) is
- *                       reference counted, i.e. freed automatically; Rc
- *                       boxes and arena handles always are;
+ *                       reference counted, i.e. freed automatically;
+ *                       instances of shared structs always are;
  *                    2. ownership: inserts `retain` / `release` so that every
  *                       counted reference held by a vreg, a field or a global
  *                       is released exactly once, at the vreg's last use

@@ -1,1 +1,1 @@
-luma: runtime error: Rc::get expects an Rc, got int.
+luma: runtime error: Only struct instances have methods, got int.

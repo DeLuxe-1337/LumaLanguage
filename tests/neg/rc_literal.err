@@ -1,1 +1,1 @@
-'Rc' is a builtin type; create one with Rc::new(...)
+struct 'Rc' has no field 'value'

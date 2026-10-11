@@ -33,7 +33,9 @@ fun counts() {
 }
 counts();
 
-// an Rc from a value whose struct is known only at run time
+// an Rc of a value whose struct is known only at run time is an Rc<any>;
+// fields and methods still reach the value (dynamically). Printing a box
+// runs Rc.show() (std/prelude.luma), which builds its text as strings.
 var r = Rc::new(dyn(Point { x: 1, y: 1, label: nil }));
 print(r, r.len2());
 var s: Rc<any>? = Rc::new(cat("shared ", "text"));

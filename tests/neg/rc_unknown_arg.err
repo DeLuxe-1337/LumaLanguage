@@ -1,1 +1,1 @@
-unknown type 'Q' in Rc<Q>
+unknown type 'Q' (Luma types: int, str, bool, nil, any, or a struct)

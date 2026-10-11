@@ -1,0 +1,56 @@
+// The same hooks Rc and Arena are written with (std/prelude.luma), used by
+// a program's own types.
+
+// A unique owner: freeing the owner frees what it holds; fields and methods
+// go through to the value.
+struct Node { label: str, next: Node? }
+impl Node { fun shout(self): str { return self.label + "!"; } }
+
+struct Owned<T> { value: T }
+impl Owned<T> {
+  fun new(move v: T): Owned<T> { return Owned { value: v }; }
+  fun deref(self): T { return self.value; }
+  fun drop(self) { dispose(self.value); }
+  fun show(self): str { return "Owned(" + self.value.label + ")"; }
+}
+
+var tree = Owned::new(Node { label: "root", next: nil });
+print(tree.label, tree.shout(), tree);
+free(tree);   // drop frees the Node too
+
+// A counted handle with its own drop (what it logs depends on the memory
+// mode, so tests/mem/drop.luma checks that; here it only runs).
+var log = "";
+shared struct Ticket { id: int }
+impl Ticket {
+  fun drop(self) { log = log + "closed " + str_of(self.id) + "; "; }
+  fun show(self): str { return "Ticket#" + str_of(self.id); }
+}
+fun str_of(n: int): str {
+  if (n < 10) return digit(n);
+  return str_of(n / 10) + digit(n - n / 10 * 10);
+}
+fun digit(d: int): str {
+  if (d == 0) return "0"; if (d == 1) return "1"; if (d == 2) return "2"; if (d == 3) return "3";
+  if (d == 4) return "4"; if (d == 5) return "5"; if (d == 6) return "6"; if (d == 7) return "7";
+  if (d == 8) return "8"; return "9";
+}
+fun issue() { var t = Ticket { id: 12 }; var u = t; print(t, u); }
+issue();
+
+// show() is used wherever an instance is printed, nested ones included;
+// a method named show without `: str` is an ordinary method.
+struct Pair { a, b }
+struct Plain { x: int }
+impl Plain { fun show(self) { return 1; } }
+print(Pair { a: Ticket { id: 3 }, b: Plain { x: 5 } });
+
+// A scope: with calls enter() and leave().
+var depth = 0;
+struct Indent { by: int }
+impl Indent {
+  fun enter(self) { depth = depth + self.by; }
+  fun leave(self) { depth = depth - self.by; }
+}
+with Indent { by: 4 } { print(depth); }
+print(depth);

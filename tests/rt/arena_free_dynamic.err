@@ -1,1 +1,1 @@
-luma: runtime error: free() expects a struct instance, got Arena (an arena frees everything in it when its last reference goes away).
+luma: runtime error: 'Arena' is a shared struct; it is freed when its last reference goes away.

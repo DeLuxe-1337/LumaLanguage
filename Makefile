@@ -20,8 +20,8 @@ BUILD   ?= build
 
 CORE_SRC  := src/util.c src/lexer.c src/parser.c src/lower.c src/ir.c src/ir_types.c src/ir_parse.c src/ir_verify.c \
              src/cfg.c src/opt.c src/opt_util.c src/opt_cfg.c src/opt_ssa.c src/opt_passes.c src/opt_objects.c src/mem.c \
-             src/x86_isel.c src/x86_gen.c src/obj.c src/asm.c src/elf_writer.c
-CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o)
+             src/x86_isel.c src/x86_gen.c src/obj.c src/asm.c src/elf_writer.c src/prelude.c
+CORE_OBJ  := $(CORE_SRC:src/%.c=$(BUILD)/obj/%.o) $(BUILD)/obj/prelude_src.o
 HEADERS   := $(wildcard src/*.h)
 
 .PHONY: all clean test unit e2e difftest selftest hello inspect bench
@@ -38,6 +38,15 @@ $(BUILD)/libluma_rt.a: $(BUILD)/obj/luma_rt.o
 	ar rcs $@ $^
 
 $(BUILD)/obj/%.o: src/%.c $(HEADERS) | $(BUILD)/obj
+	$(CC) $(CFLAGS) $(DEFS) -c $< -o $@
+
+# The prelude (std/prelude.luma) is built into luma as a C string.
+$(BUILD)/obj/prelude_src.c: std/prelude.luma | $(BUILD)/obj
+	{ printf 'const char luma_prelude_src[] =\n'; \
+	  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/    "/' -e 's/$$/\\n"/' $<; \
+	  printf '    "";\n'; } > $@
+
+$(BUILD)/obj/prelude_src.o: $(BUILD)/obj/prelude_src.c
 	$(CC) $(CFLAGS) $(DEFS) -c $< -o $@
 
 $(BUILD)/luma: $(BUILD)/obj/main.o $(CORE_OBJ)

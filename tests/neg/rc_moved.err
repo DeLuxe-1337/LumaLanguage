@@ -1,1 +1,1 @@
-'p' was moved into an Rc on line 4; use the Rc instead
+'p' is used after it was moved into Rc::new() on line 4

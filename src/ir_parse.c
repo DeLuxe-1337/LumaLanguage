@@ -365,7 +365,7 @@ static bool take_field_ref(P *p, IrInstr *in) {
     }
     char sname[256];
     snprintf(sname, sizeof sname, "%s", p->tok.text);
-    char *dot = strrchr(sname, '.'); /* (builtin struct names contain dots: Rc.Point.value) */
+    char *dot = strrchr(sname, '.'); /* Struct.field: the field name follows the last dot */
     *dot = '\0';
     int sid = ir_find_struct(p->m, sname);
     if (sid < 0) {
@@ -749,15 +749,15 @@ static bool prescan_structs(P *p) {
             }
             memcpy(name, p->src + j, k - j);
             name[k - j] = '\0';
-            /* dots only inside type arguments, or in the builtin Rc.S */
+            /* no dots outside type arguments */
             int depth = 0;
             bool dot = false;
-            for (const char *c = strncmp(name, "Rc.", 3) == 0 ? name + 3 : name; *c; c++) {
+            for (const char *c = name; *c; c++) {
                 depth += *c == '<' ? 1 : *c == '>' ? -1 : 0;
                 dot |= *c == '.' && depth == 0;
             }
             if (dot) {
-                perr(p, line, "struct names cannot contain '.' (except the builtin Rc.S)");
+                perr(p, line, "struct names cannot contain '.'");
                 return false;
             }
             if (ir_find_struct(p->m, name) >= 0) {

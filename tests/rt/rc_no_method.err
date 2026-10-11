@@ -1,1 +1,1 @@
-luma: runtime error: Struct 'P' has no method 'len'.
+luma: runtime error: Struct 'Rc<P>' has no method 'len' (nor does 'P', through deref).

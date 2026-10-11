@@ -1,1 +1,1 @@
-'Arena' is a builtin type; it cannot have an impl block
+'Arena' is defined by the prelude; it cannot have another impl block

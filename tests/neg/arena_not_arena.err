@@ -1,1 +1,1 @@
-arena n { ... } needs an Arena, got int
+with needs a struct instance with enter() and leave() methods, got int

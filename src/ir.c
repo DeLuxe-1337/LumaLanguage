@@ -44,7 +44,7 @@ void ir_ty_describe(const IrModule *m, IrTy t, const char *sep, char *buf, size_
     const char *sname = c == -1 ? "struct"
                       : (c >= 0 && m && c < m->nstructs) ? m->structs[c].name : c >= 0 ? "?struct" : NULL;
     char disp[300];
-    if (c >= 0 && sname && strcmp(sep, "|") != 0) { /* messages use Rc<Point>, the text form Rc.Point */
+    if (c >= 0 && sname && strcmp(sep, "|") != 0) { /* messages: Pair<int, str> */
         ir_struct_display(sname, disp, sizeof disp);
         sname = disp;
     }
@@ -112,24 +112,23 @@ bool ir_ty_parse(const IrModule *m, const char *s, IrTy *out) {
 
 /* ---- structs ---- */
 
-IrStructKind ir_struct_kind_of(const char *name) {
-    if (strcmp(name, "Rc") == 0 || strncmp(name, "Rc.", 3) == 0) return IR_STRUCT_RC;
-    if (strcmp(name, "Arena") == 0) return IR_STRUCT_ARENA;
-    return IR_STRUCT_USER;
+void ir_struct_display(const char *name, char *buf, size_t n) {
+    /* generic instances: Pair<int,str> reads Pair<int, str> */
+    size_t o = 0;
+    for (const char *c = name; *c && o + 2 < n; c++) {
+        buf[o++] = *c;
+        if (*c == ',') buf[o++] = ' ';
+    }
+    buf[o] = '\0';
 }
 
-void ir_struct_display(const char *name, char *buf, size_t n) {
-    if (strcmp(name, "Rc") == 0) snprintf(buf, n, "Rc<any>");
-    else if (strncmp(name, "Rc.", 3) == 0) snprintf(buf, n, "Rc<%s>", name + 3);
-    else {
-        /* generic instances: Pair<int,str> reads Pair<int, str> */
-        size_t o = 0;
-        for (const char *c = name; *c && o + 2 < n; c++) {
-            buf[o++] = *c;
-            if (*c == ',') buf[o++] = ' ';
-        }
-        buf[o] = '\0';
+int ir_struct_show(const IrModule *m, int sid) {
+    const IrStruct *st = &m->structs[sid];
+    for (int k = 0; k < st->nmethods; k++) {
+        const IrGlobal *g = &m->globals[st->mglobals[k]];
+        if (strcmp(st->mnames[k], "show") == 0 && g->arity == 1 && g->ty == TY_STR) return st->mglobals[k];
     }
+    return -1;
 }
 
 int ir_add_struct(IrModule *m, const char *name) {
@@ -137,7 +136,6 @@ int ir_add_struct(IrModule *m, const char *name) {
     IrStruct *st = &m->structs[m->nstructs];
     memset(st, 0, sizeof *st);
     st->name = xstrdup(name);
-    st->kind = ir_struct_kind_of(name);
     return m->nstructs++;
 }
 

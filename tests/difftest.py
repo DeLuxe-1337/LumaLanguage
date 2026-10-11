@@ -100,7 +100,10 @@ class Obj:
 
 
 class RcBox:
-    """Rc::new(value): a shared box; fields and methods go to its value."""
+    """Rc::new(value) (std/prelude.luma): a shared box; fields and methods it
+    lacks go to its value (deref). The generator never gives a boxed struct
+    members named like Rc's own (get, count, show, ...), which would shadow
+    them."""
 
     def __init__(self, value):
         self.value = value
@@ -359,8 +362,7 @@ class Interp:
         if k == "call" and e[1] == "free":
             v = self.ev(e[2][0])
             if isinstance(v, RcBox):
-                raise LumaError("free() expects a struct instance, got %s (an Rc frees its value when its last "
-                                "reference goes away)." % rc_name(v))
+                raise LumaError("'%s' is a shared struct; it is freed when its last reference goes away." % rc_name(v))
             if v is not None and not isinstance(v, Obj):
                 raise LumaError("free() expects a struct instance, got %s%s." %
                                 (type_of(v), " (strings are freed automatically)" if isinstance(v, str) else ""))

@@ -20,9 +20,12 @@ IrTy *opt_value_types(const IrModule *m, const IrFunc *f);
  * fields, so loads are not forwarded across instructions. */
 bool opt_module_has_drop(const IrModule *m);
 /* Can `in` run Luma code (which may write globals and fields)? Calls of
- * Luma functions and methods, and dynamic field accesses when some struct
- * has a deref method (the runtime calls it on a miss). */
+ * Luma functions and methods, dynamic field accesses when some struct has a
+ * deref method (the runtime calls it on a miss), and printing when some
+ * struct has a show method. */
 bool opt_runs_code(const IrModule *m, const IrInstr *in);
+/* A runtime call that prints a value (and calls show() methods). */
+bool opt_is_print_call(const IrModule *m, const IrInstr *in);
 bool opt_has_effect(const IrModule *m, const IrInstr *in, const IrTy *vty);
 /* May `in` raise a runtime error? */
 bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty);

@@ -1,4 +1,5 @@
 #include "lower.h"
+#include "prelude.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -64,7 +65,7 @@ typedef struct {
 } FnInfo;
 
 typedef struct {
-    const char *name;   /* "Point"; builtins: "Rc.Point", "Rc", "Arena" (the IR's names) */
+    const char *name;   /* "Point", "Box<int>" (the IR's name) */
     int sid;            /* index of the IR struct */
     const Stmt *decl;   /* NULL for builtins */
     int *fns;           /* indices into L.fns of the impl's functions */
@@ -110,9 +111,8 @@ typedef struct {
     int nscope, cap_scope;
     int depth;
     int ntemps, nlabels;
-    /* Blocks entered at this point, innermost last, left before a return:
-     * v = -1 for an arena block, else the subject of a `with` (left with
-     * its leave() method). */
+    /* The subjects of the `with` blocks entered at this point, innermost
+     * last, left (with their leave() method) before a return. */
     struct { int v; Ty ty; } *exits;
     int nexits, cap_exits;
     int info;     /* index into L.fns; -1 for luma_main */
@@ -143,8 +143,7 @@ typedef struct {
     int nstrings;
     int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
     int dispose_fn, refcount_fn;
-    int rc_new_fn, rc_get_fn, rc_count_fn, arena_enter_fn, arena_leave_fn;
-    bool uses_rc, uses_arena; /* builtin structs are added only when used */
+    int intrinsic_fn[8]; /* runtime externs of the prelude's intrinsics (INTRINSICS) */
     Fn *f;
     bool failed;
     int col; /* column of the expression being lowered (IrInstr.col, for diagnostics after lowering) */
@@ -189,7 +188,7 @@ static void lerr(L *l, int line, int col, const char *fmt, ...) {
     if (l->failed) return;
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "%s:%d:%d: error: ", l->path, line, col);
+    fprintf(stderr, "%s:%d:%d: error: ", prelude_path(l->path, line), prelude_line(line), col);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
@@ -324,16 +323,6 @@ static Ty flow(L *l, Val v, Ty slot, const char *what, int line, int col) {
     return ir_ty_inter(v.ty, slot);
 }
 
-/* The builtin struct named n (the IR's name), or -1. */
-static int builtin_sid(L *l, const char *n) {
-    int si = find_struct(l, n);
-    return si >= 0 && !l->structs[si].decl ? l->structs[si].sid : -1;
-}
-
-static bool is_base_type(const char *n) {
-    return strcmp(n, "int") == 0 || strcmp(n, "str") == 0 || strcmp(n, "bool") == 0 || strcmp(n, "nil") == 0 ||
-           strcmp(n, "any") == 0;
-}
 
 static int instantiate(L *l, int gi, const Ty *targs, int line, int col);
 
@@ -376,25 +365,6 @@ static Ty resolve_type(L *l, const TypeRef *t) {
         }
         return ta->ty == T_ANY ? T_ANY : ir_ty_union(ta->ty, nil);
     }
-    if (strcmp(t->name, "Rc") == 0) {
-        if (t->nargs != 1) {
-            lerr(l, t->line, t->col, "Rc needs a type argument: Rc<Point>, or Rc<any> for a value that is not a struct");
-            return T_ANY;
-        }
-        const TypeRef *a = &t->args[0];
-        char n[300];
-        if (!a->nargs && !tenv_find(l, a->name) && !is_base_type(a->name) && find_struct(l, a->name) < 0 &&
-            find_generic(l, a->name) < 0) {
-            lerr(l, t->line, t->col, "unknown type '%s' in Rc<%s>", a->name, a->name);
-            return T_ANY;
-        }
-        Ty at = resolve_type(l, a);
-        int si = static_struct_of(l, at);
-        if (si >= 0 && l->structs[si].decl && l->structs[si].generic < 0 && !(at & T_NIL)) snprintf(n, sizeof n, "Rc.%s", l->structs[si].name);
-        else snprintf(n, sizeof n, "Rc");
-        int sid = builtin_sid(l, n);
-        return sid >= 0 ? ty_struct_of(sid) | nil : T_ANY;
-    }
     int gi = find_generic(l, t->name);
     if (gi >= 0) {
         const Stmt *d = l->generics[gi].decl;
@@ -412,10 +382,6 @@ static Ty resolve_type(L *l, const TypeRef *t) {
     if (t->nargs) {
         lerr(l, t->line, t->col, "'%s' takes no type arguments (it is not a generic struct)", t->name);
         return T_ANY;
-    }
-    if (strcmp(t->name, "Arena") == 0) {
-        int sid = builtin_sid(l, "Arena");
-        return sid >= 0 ? ty_struct_of(sid) | nil : T_ANY;
     }
     static const struct { const char *name; Ty ty; } N[] = {
         {"int", T_INT}, {"str", T_STR}, {"bool", T_BOOL}, {"nil", T_NIL}, {"any", T_ANY}};
@@ -698,9 +664,50 @@ static Val result(L *l, int hint, int *d) {
     return (Val){*d, T_ANY};
 }
 
-static IrStructKind static_kind(L *l, Ty t);
+/* The prelude's intrinsics: runtime entry points named __name, callable only
+ * from prelude code (docs/DESIGN.md "The prelude"). */
+static const struct {
+    const char *name, *symbol;
+    int arity;
+    Ty ret;
+} INTRINSICS[] = {
+    {"__arena_create", "luma_arena_create", 0, T_ANY}, /* (results of runtime calls are any in the IR) */
+    {"__arena_push", "luma_arena_enter", 1, T_NIL},
+    {"__arena_pop", "luma_arena_leave", 0, T_NIL},
+    {"__arena_destroy", "luma_arena_destroy", 1, T_NIL},
+    {"__show", "luma_show", 1, T_ANY},
+};
+
+static bool in_prelude(L *l) {
+    const FnInfo *fi = cur_info(l);
+    return fi && fi->decl->line >= LUMA_PRELUDE_LINE;
+}
+
+static Val lower_intrinsic(L *l, const Expr *e, int hint) {
+    size_t k = 0;
+    while (k < sizeof INTRINSICS / sizeof *INTRINSICS && strcmp(INTRINSICS[k].name, e->name) != 0) k++;
+    if (!in_prelude(l) || k == sizeof INTRINSICS / sizeof *INTRINSICS) {
+        lerr(l, e->line, e->col, "'%s' is internal to the prelude (names starting with __ are reserved)", e->name);
+        return NO_VAL;
+    }
+    if ((int)e->nargs != INTRINSICS[k].arity) {
+        lerr(l, e->line, e->col, "'%s' expects %d argument%s, got %zu", e->name, INTRINSICS[k].arity,
+             INTRINSICS[k].arity == 1 ? "" : "s", e->nargs);
+        return NO_VAL;
+    }
+    Val v[1];
+    if (!lower_operands(l, e->args, e->nargs, v)) return NO_VAL;
+    int d = hint >= 0 ? hint : -1;
+    Val r = result(l, hint, &d);
+    int g = runtime_extern(l, &l->intrinsic_fn[k], INTRINSICS[k].symbol, INTRINSICS[k].arity);
+    int arg = e->nargs ? v[0].v : -1;
+    emit_call(l, hint == DISCARD ? IR_NONE : d, g, e->nargs ? &arg : NULL, (int)e->nargs, e->line);
+    r.ty = INTRINSICS[k].ret;
+    return r;
+}
 
 static Val lower_call(L *l, const Expr *e, int hint) {
+    if (strncmp(e->name, "__", 2) == 0) return lower_intrinsic(l, e, hint);
     Name n = lookup(l, e->name);
     if (n.kind == NAME_LOCAL || n.kind == NAME_GLOBAL) {
         lerr(l, e->line, e->col, "'%s' is a variable, not a function", e->name);
@@ -750,15 +757,6 @@ static Val lower_call(L *l, const Expr *e, int hint) {
             lerr(l, e->args[0]->line, e->args[0]->col, "'%s' is a shared struct; it is freed when its last reference goes away", tn);
             goto done;
         }
-        IrStructKind k = static_kind(l, vals[0].ty);
-        if (k != IR_STRUCT_USER) {
-            char tn[300];
-            ty_name(l, vals[0].ty, tn, sizeof tn);
-            lerr(l, e->args[0]->line, e->args[0]->col, "free() expects a struct instance, got %s (%s)", tn,
-                 k == IR_STRUCT_RC ? "an Rc frees its value when its last reference goes away"
-                                   : "an arena frees everything in it when its last reference goes away");
-            goto done;
-        }
         emit_call(l, IR_NONE, runtime_extern(l, &l->free_fn, "luma_free", 1), args, 1, e->line);
         if (hint != DISCARD) {
             r = result(l, hint, &d);
@@ -785,7 +783,7 @@ static Val lower_call(L *l, const Expr *e, int hint) {
         } else {
             r = result(l, hint, &d);
             emit_call(l, hint == DISCARD ? IR_NONE : d, runtime_extern(l, &l->refcount_fn, "luma_refcount", 1), args, 1, e->line);
-            r.ty = T_INT;
+            r.ty = T_ANY; /* (a runtime call: an int, checked where it must be) */
         }
         goto done;
     }
@@ -881,19 +879,9 @@ static bool not_an_instance(L *l, Ty t, const char *what, int line, int col) {
     return true;
 }
 
-/* The builtin kind of a value's static type when it is exactly one builtin
- * struct (IR_STRUCT_USER otherwise). */
-static IrStructKind static_kind(L *l, Ty t) {
-    int si = static_struct(l, t);
-    return si >= 0 ? l->m->structs[l->structs[si].sid].kind : IR_STRUCT_USER;
-}
-
-/* Field accesses and method calls go through an Rc to its value: a value
- * statically known to be an Rc box is replaced by `getfield %box, Rc.S.value`
- * (the runtime does the same for values known only at run time). An Arena
- * has neither. Returns NO_VAL after an error. The value lives only as long
- * as its box, so the boxes passed through are recorded in boxes[] (up to 4)
- * and the caller ends the access with `keep %box` (keep_boxes). */
+/* The owners an access went through by deref (deref_member): the value
+ * read lives only as long as its owner, so the caller ends the access with
+ * `keep %owner` (keep_boxes). */
 typedef struct {
     int v[16];
     int n;
@@ -967,87 +955,8 @@ static Val deref_member(L *l, Val v, const char *name, bool method, int line, in
     }
 }
 
-static Val deref_rc(L *l, Val v, const char *what, int line, int col, Boxes *boxes) {
-    boxes->n = 0;
-    while (v.v >= 0) {
-        IrStructKind k = static_kind(l, v.ty);
-        if (k == IR_STRUCT_ARENA) {
-            lerr(l, line, col, "an Arena has no %s", what);
-            return NO_VAL;
-        }
-        if (k != IR_STRUCT_RC) return v;
-        if (boxes->n < 4) boxes->v[boxes->n++] = v.v;
-        int sid = l->structs[static_struct(l, v.ty)].sid;
-        int d = temp(l);
-        IrInstr *in = emit(l, IR_GETFIELD, line);
-        in->dst = d;
-        in->a = v.v;
-        in->sid = sid;
-        in->field = 0;
-        v = (Val){d, l->m->structs[sid].ftys[0]};
-    }
-    return v;
-}
-
-static int runtime_fn(L *l, int *slot, const char *name, int arity) { return runtime_extern(l, slot, name, arity); }
 
 static void lower_stmt(L *l, const Stmt *s);
-
-/* Rc::new(v), Rc::get(r), Rc::count(r) */
-static Val lower_rc_call(L *l, const Expr *e, int hint) {
-    bool is_new = strcmp(e->str, "new") == 0, is_get = strcmp(e->str, "get") == 0, is_count = strcmp(e->str, "count") == 0;
-    if (!is_new && !is_get && !is_count) {
-        lerr(l, e->line, e->col, "Rc has no function '%s' (Rc::new, Rc::get and Rc::count)", e->str);
-        return NO_VAL;
-    }
-    if (e->nargs != 1) {
-        lerr(l, e->line, e->col, "'Rc::%s' expects 1 argument, got %zu", e->str, e->nargs);
-        return NO_VAL;
-    }
-    Val v = lower_expr(l, e->args[0], -1);
-    if (v.v < 0) return NO_VAL;
-    int d = hint >= 0 ? hint : temp(l);
-    if (is_new) {
-        int si = static_struct(l, v.ty);
-        int box = -1;
-        if (si >= 0 && l->structs[si].decl) {
-            char n[300];
-            snprintf(n, sizeof n, "Rc.%s", l->structs[si].name);
-            box = builtin_sid(l, n);
-        } else if (!(v.ty & TY_STRUCT)) {
-            box = builtin_sid(l, "Rc");
-        }
-        if (box >= 0) { /* the box's struct is known: new Rc.S(%v) */
-            IrInstr *in = emit(l, IR_NEW, e->line);
-            in->dst = d;
-            in->sid = box;
-            in->nargs = 1;
-            in->args = xmalloc(sizeof(int));
-            in->args[0] = v.v;
-            return (Val){d, ty_struct_of(box)};
-        }
-        emit_call(l, d, runtime_fn(l, &l->rc_new_fn, "luma_rc_new", 1), &v.v, 1, e->line);
-        return (Val){d, T_ANY};
-    }
-    if (!(v.ty & TY_STRUCT)) {
-        char tn[300];
-        ty_name(l, v.ty, tn, sizeof tn);
-        lerr(l, e->args[0]->line, e->args[0]->col, "'Rc::%s' expects an Rc, got %s", e->str, tn);
-        return NO_VAL;
-    }
-    if (is_get && static_kind(l, v.ty) == IR_STRUCT_RC) {
-        int sid = l->structs[static_struct(l, v.ty)].sid;
-        IrInstr *in = emit(l, IR_GETFIELD, e->line);
-        in->dst = d;
-        in->a = v.v;
-        in->sid = sid;
-        in->field = 0;
-        return (Val){d, l->m->structs[sid].ftys[0]};
-    }
-    if (is_get) emit_call(l, d, runtime_fn(l, &l->rc_get_fn, "luma_rc_get", 1), &v.v, 1, e->line);
-    else emit_call(l, d, runtime_fn(l, &l->rc_count_fn, "luma_rc_count", 1), &v.v, 1, e->line);
-    return (Val){d, T_ANY};
-}
 
 static void push_exit(L *l, int v, Ty ty) {
     Fn *f = l->f;
@@ -1085,12 +994,8 @@ static bool call_hook(L *l, Val subj, const char *name, int line, int col) {
 
 /* Leaves the blocks entered since exit index `from` (innermost first). */
 static void leave_exits(L *l, int from, int line) {
-    for (int i = l->f->nexits; i-- > from && !l->failed;) {
-        if (l->f->exits[i].v < 0)
-            emit_call(l, IR_NONE, runtime_fn(l, &l->arena_leave_fn, "luma_arena_leave", 0), NULL, 0, line);
-        else
-            call_hook(l, (Val){l->f->exits[i].v, l->f->exits[i].ty}, "leave", line, 0);
-    }
+    for (int i = l->f->nexits; i-- > from && !l->failed;)
+        call_hook(l, (Val){l->f->exits[i].v, l->f->exits[i].ty}, "leave", line, 0);
 }
 
 /* with SUBJECT { body }: subject.enter(), the body, subject.leave() on every
@@ -1125,51 +1030,23 @@ static Val lower_with(L *l, const Expr *e, int hint) {
  * the body (and in what it calls) goes into the arena. Its value is the
  * arena (a new one: freed when its last reference goes away). */
 static Val lower_arena(L *l, const Expr *e, int hint) {
-    int a = temp(l);
-    Ty ty;
+    /* sugar: arena { B } is with Arena::new() { B }; arena a { B } is with a { B } */
+    Expr subj = {0};
+    subj.line = e->line;
+    subj.col = e->col;
     if (e->name) {
-        Expr var = {0};
-        var.kind = EXPR_VAR;
-        var.line = e->line;
-        var.col = e->col;
-        var.name = e->name;
-        Val v = lower_expr(l, &var, -1);
-        if (v.v < 0) return NO_VAL;
-        if (!(v.ty & TY_STRUCT)) {
-            char tn[300];
-            ty_name(l, v.ty, tn, sizeof tn);
-            lerr(l, e->line, e->col, "arena %s { ... } needs an Arena, got %s", e->name, tn);
-            return NO_VAL;
-        }
-        emit_mov(l, a, v.v, e->line); /* (reassigning the variable inside the block changes nothing) */
-        ty = v.ty;
+        subj.kind = EXPR_VAR;
+        subj.name = e->name;
     } else {
-        int z = temp(l);
-        IrInstr *in = emit(l, IR_CONST_INT, e->line);
-        in->dst = z;
-        in->imm = 0;
-        int sid = builtin_sid(l, "Arena");
-        in = emit(l, IR_NEW, e->line);
-        in->dst = a;
-        in->sid = sid;
-        in->nargs = 1;
-        in->args = xmalloc(sizeof(int));
-        in->args[0] = z;
-        ty = ty_struct_of(sid);
+        subj.kind = EXPR_ASSOC;
+        subj.name = (char *)"Arena";
+        subj.str = (char *)"new";
     }
-    emit_call(l, IR_NONE, runtime_fn(l, &l->arena_enter_fn, "luma_arena_enter", 1), &a, 1, e->line);
-    push_exit(l, -1, 0);
-    lower_stmt(l, e->body);
-    l->f->nexits--;
-    if (l->failed) return NO_VAL;
-    if (!ir_block_terminated(&fn(l)->blocks[l->f->cur]))
-        emit_call(l, IR_NONE, runtime_fn(l, &l->arena_leave_fn, "luma_arena_leave", 0), NULL, 0, e->line);
-    if (hint == DISCARD) return NO_VAL;
-    if (hint >= 0) {
-        emit_mov(l, hint, a, e->line);
-        return (Val){hint, ty};
-    }
-    return (Val){a, ty};
+    Expr w = *e;
+    w.kind = EXPR_WITH;
+    w.left = &subj;
+    w.name = NULL;
+    return lower_with(l, &w, hint);
 }
 
 /* The instance of generic gi whose type arguments are inferred from (in this
@@ -1214,11 +1091,6 @@ static int infer_instance(L *l, int gi, Ty expect, const char *const *names, con
 static Val lower_struct_literal(L *l, const Expr *e, int hint, Ty expect) {
     int si = find_struct(l, e->name);
     int gi = si < 0 ? find_generic(l, e->name) : -1;
-    if ((si >= 0 && !l->structs[si].decl) || strcmp(e->name, "Rc") == 0 || strcmp(e->name, "Arena") == 0) {
-        lerr(l, e->line, e->col, "'%s' is a builtin type; create one with %s", e->name,
-             strcmp(e->name, "Arena") == 0 ? "arena { ... }" : "Rc::new(...)");
-        return NO_VAL;
-    }
     if (si < 0 && gi < 0) {
         lerr(l, e->line, e->col, "unknown struct '%s'", e->name);
         return NO_VAL;
@@ -1308,9 +1180,7 @@ static Val lower_field(L *l, const Expr *e, int hint) {
     if (!lower_operands(l, ops, set ? 2 : 1, v)) return NO_VAL;
     if (not_an_instance(l, v[0].ty, "fields", e->line, e->col)) return NO_VAL;
     hold_temp(l, e->left, v[0]);
-    Boxes boxes;
-    v[0] = deref_rc(l, v[0], "fields", e->line, e->col, &boxes);
-    if (v[0].v < 0 || not_an_instance(l, v[0].ty, "fields", e->line, e->col)) return NO_VAL;
+    Boxes boxes = {{0}, 0};
     int first;
     v[0] = deref_member(l, v[0], e->name, false, e->line, e->col, &boxes, &first);
     if (v[0].v < 0) return NO_VAL;
@@ -1376,9 +1246,7 @@ static Val lower_method_call(L *l, const Expr *e, int hint) {
     if (!lower_operands(l, ops, n, vals)) goto done;
     if (not_an_instance(l, vals[0].ty, "methods", e->line, e->col)) goto done;
     for (size_t i = 0; i < n; i++) hold_temp(l, ops[i], vals[i]);
-    Boxes boxes;
-    vals[0] = deref_rc(l, vals[0], "methods", e->line, e->col, &boxes);
-    if (vals[0].v < 0 || not_an_instance(l, vals[0].ty, "methods", e->line, e->col)) goto done;
+    Boxes boxes = {{0}, 0};
     if (strcmp(e->name, "drop") == 0) {
         lerr(l, e->line, e->col, "drop() runs by itself when an instance is freed; call free(x) or dispose(x) instead");
         goto done;
@@ -1448,11 +1316,6 @@ done:
 
 /* Struct::name(args) */
 static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
-    if (strcmp(e->name, "Rc") == 0) return lower_rc_call(l, e, hint);
-    if (strcmp(e->name, "Arena") == 0) {
-        lerr(l, e->line, e->col, "Arena has no functions; create an arena with arena { ... }");
-        return NO_VAL;
-    }
     int si = find_struct(l, e->name);
     int gi = si < 0 ? find_generic(l, e->name) : -1;
     if (si < 0 && gi < 0) {
@@ -2026,7 +1889,7 @@ static bool name_taken(L *l, const Stmt *s) {
 }
 
 static bool is_type_name(const char *n) {
-    static const char *const T[] = {"int", "str", "bool", "nil", "any", "struct", "self", "Rc", "Arena"};
+    static const char *const T[] = {"int", "str", "bool", "nil", "any", "struct", "self"};
     for (size_t i = 0; i < sizeof T / sizeof *T; i++)
         if (strcmp(n, T[i]) == 0) return true;
     return false;
@@ -2084,33 +1947,9 @@ static void collect_structs(L *l, const Program *prog) {
         g->impls = xrealloc(g->impls, (size_t)(g->nimpls + 1) * sizeof *g->impls);
         g->impls[g->nimpls++] = s;
     }
-    /* builtin structs (docs/DESIGN.md "Memory"): an Rc box per user struct
-     * (Rc.S, written Rc<S>) plus Rc for other values, and Arena handles */
-    int nuser = l->nstructs;
-    char name[300];
-    for (int k = -1; l->uses_rc && k < nuser; k++) {
-        if (k < 0) snprintf(name, sizeof name, "Rc");
-        else snprintf(name, sizeof name, "Rc.%s", l->structs[k].name);
-        int sid = ir_add_struct(l->m, name);
-        l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
-        l->structs[l->nstructs++] = (StructInfo){l->m->structs[sid].name, sid, NULL, NULL, 0, -1, NULL};
-    }
-    if (l->uses_arena) {
-        int sid = ir_add_struct(l->m, "Arena");
-        l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
-        l->structs[l->nstructs++] = (StructInfo){l->m->structs[sid].name, sid, NULL, NULL, 0, -1, NULL};
-    }
     int nfixed = l->nstructs; /* (instances created while resolving fields set their own) */
     for (int si = 0; si < nfixed && !l->failed; si++) {
         const Stmt *s = l->structs[si].decl;
-        if (!s) { /* builtin: Rc.S {value: S}, Rc {value}, Arena {state: int} */
-            const IrStruct *ir = &l->m->structs[l->structs[si].sid];
-            const char *fname = ir->kind == IR_STRUCT_ARENA ? "state" : "value";
-            Ty fty = ir->kind == IR_STRUCT_ARENA ? T_INT : T_ANY;
-            if (ir->kind == IR_STRUCT_RC && strcmp(ir->name, "Rc") != 0) fty = ty_struct_of(l->structs[find_struct(l, ir->name + 3)].sid);
-            ir_struct_set_fields(l->m, l->structs[si].sid, 1, &fname, &fty);
-            continue;
-        }
         Ty *tys = xmalloc((s->nparams ? s->nparams : 1) * sizeof *tys);
         for (size_t k = 0; k < s->nparams; k++) {
             for (size_t j = 0; j < k; j++)
@@ -2283,10 +2122,6 @@ static void collect_impl_fns(L *l, const Stmt *s, int si, const TArg *tenv, int 
 static void collect_impl(L *l, const Stmt *s) {
     if (find_generic(l, s->name) >= 0) return; /* registered with its generic struct */
     int si = find_struct(l, s->name);
-    if ((si >= 0 && !l->structs[si].decl) || strcmp(s->name, "Rc") == 0 || strcmp(s->name, "Arena") == 0) {
-        lerr(l, s->line, s->col, "'%s' is a builtin type; it cannot have an impl block", s->name);
-        return;
-    }
     if (si < 0) {
         lerr(l, s->line, s->col, "impl for unknown struct '%s'", s->name);
         return;
@@ -2423,89 +2258,8 @@ static int dynamic_entry(L *l, const FnInfo *fi) {
 
 /* ---- which builtins the program uses (their structs are added only then) ---- */
 
-static void scan_type(L *l, const TypeRef *t) {
-    if (!t->name) return;
-    if (strcmp(t->name, "Rc") == 0) l->uses_rc = true;
-    if (strcmp(t->name, "Arena") == 0) l->uses_arena = true;
-    for (size_t i = 0; i < t->nargs; i++) scan_type(l, &t->args[i]);
-}
-
-static void scan_stmt(L *l, const Stmt *s);
-
-static void scan_expr(L *l, const Expr *e) {
-    if (!e) return;
-    if (e->kind == EXPR_ASSOC && strcmp(e->name, "Rc") == 0) l->uses_rc = true;
-    if (e->kind == EXPR_ARENA) l->uses_arena = true;
-    scan_expr(l, e->left);
-    scan_expr(l, e->right);
-    for (size_t i = 0; i < e->nargs; i++) scan_expr(l, e->args[i]);
-    if (e->body) scan_stmt(l, e->body);
-}
-
-static void scan_stmt(L *l, const Stmt *s) {
-    if (!s) return;
-    scan_expr(l, s->expr);
-    scan_type(l, &s->type);
-    for (size_t i = 0; s->param_types && i < s->nparams; i++) scan_type(l, &s->param_types[i]);
-    for (size_t i = 0; i < s->n; i++) scan_stmt(l, s->stmts[i]);
-    scan_stmt(l, s->then_branch);
-    scan_stmt(l, s->else_branch);
-    scan_stmt(l, s->body);
-}
-
-/* The methods of S, reached through an Rc<S> by dynamic calls (callm on a
- * value whose type is unknown at compile time): one forwarding function per
- * method in Rc.S's table,
- *   fn @m.Rc.S.f(%self: Rc.S, %a) { entry: %v = getfield %self, Rc.S.value
- *                                   %r = call @<S's entry for f>(%v, %a)  ret %r } */
-static void rc_method_tables(L *l) {
-    for (int si = 0; si < l->nstructs; si++) {
-        const IrStruct *box = &l->m->structs[l->structs[si].sid];
-        if (box->kind != IR_STRUCT_RC || strcmp(box->name, "Rc") == 0) continue;
-        int boxsid = l->structs[si].sid;
-        int usid = l->structs[find_struct(l, box->name + 3)].sid;
-        int nm = l->m->structs[usid].nmethods;
-        for (int k = 0; k < nm; k++) {
-            const IrStruct *u = &l->m->structs[usid];
-            int target = u->mglobals[k];
-            int arity = l->m->globals[target].arity;
-            char sym[700];
-            snprintf(sym, sizeof sym, "m.%s.%s", l->m->structs[boxsid].name, u->mnames[k]);
-            int wf = ir_add_func(l->m, sym, arity);
-            IrFunc *f = &l->m->funcs[wf];
-            IrGlobal *g = &l->m->globals[f->global];
-            g->ptys = xmalloc((size_t)arity * sizeof *g->ptys);
-            for (int p = 0; p < arity; p++) {
-                g->ptys[p] = p == 0 ? ty_struct_of(boxsid) : T_ANY;
-                char pn[32];
-                snprintf(pn, sizeof pn, p == 0 ? "self" : "a%d", p);
-                ir_func_new_vreg(f, pn);
-            }
-            int b = ir_func_block(f, "entry");
-            int v = ir_func_new_vreg(f, "value");
-            IrInstr *in = ir_emit(f, b, IR_GETFIELD);
-            in->dst = v;
-            in->a = 0;
-            in->sid = boxsid;
-            in->field = 0;
-            int r = ir_func_new_vreg(f, "r");
-            in = ir_emit(f, b, IR_CALL);
-            in->dst = r;
-            in->global = target;
-            in->nargs = arity;
-            in->args = xmalloc((size_t)arity * sizeof(int));
-            in->args[0] = v;
-            for (int p = 1; p < arity; p++) in->args[p] = p;
-            in = ir_emit(f, b, IR_RET);
-            in->a = r;
-            ir_struct_add_method(l->m, boxsid, l->m->structs[usid].mnames[k], f->global);
-        }
-    }
-}
-
 /* Collects top-level functions, externs and variables, checking conflicts. */
 static void collect_declarations(L *l, const Program *prog) {
-    for (size_t i = 0; i < prog->len; i++) scan_stmt(l, prog->stmts[i]);
     collect_structs(l, prog);
     for (size_t i = 0; i < prog->len && !l->failed; i++) {
         const Stmt *s = prog->stmts[i];
@@ -2607,7 +2361,6 @@ static void collect_declarations(L *l, const Program *prog) {
             ir_struct_add_method(l->m, l->fns[i].sid, l->fns[i].decl->name, g);
         }
     }
-    if (!l->failed) rc_method_tables(l);
     for (int i = 0; i < l->ngvars && !l->failed; i++) {
         int f = find_fn(l, l->gvars[i].name);
         const Stmt *d = f >= 0 ? l->fns[f].decl : NULL;
@@ -2617,21 +2370,127 @@ static void collect_declarations(L *l, const Program *prog) {
     }
 }
 
-bool lower_program(const Program *prog, IrModule *out) {
-    ir_module_init(out, prog->source_path);
+/* ---- the prelude ---- */
+
+typedef struct {
+    const char **v;
+    size_t n, cap;
+} Names;
+
+static bool names_has(const Names *s, const char *n) {
+    for (size_t i = 0; i < s->n; i++)
+        if (strcmp(s->v[i], n) == 0) return true;
+    return false;
+}
+
+static void names_add(Names *s, const char *n) {
+    if (!n || names_has(s, n)) return;
+    if (s->n == s->cap) {
+        s->cap = s->cap ? 2 * s->cap : 16;
+        s->v = xrealloc(s->v, s->cap * sizeof *s->v);
+    }
+    s->v[s->n++] = n;
+}
+
+/* The struct names a piece of code mentions (types, literals, X::f calls;
+ * an arena block mentions Arena). */
+static void mention_stmt(const Stmt *s, Names *out);
+
+static void mention_type(const TypeRef *t, Names *out) {
+    if (!t->name) return;
+    names_add(out, t->name);
+    for (size_t i = 0; i < t->nargs; i++) mention_type(&t->args[i], out);
+}
+
+static void mention_expr(const Expr *e, Names *out) {
+    if (!e) return;
+    if (e->kind == EXPR_ASSOC || e->kind == EXPR_STRUCT) names_add(out, e->name);
+    if (e->kind == EXPR_ARENA) names_add(out, "Arena");
+    mention_expr(e->left, out);
+    mention_expr(e->right, out);
+    for (size_t i = 0; i < e->nargs; i++) mention_expr(e->args[i], out);
+    mention_stmt(e->body, out);
+}
+
+static void mention_stmt(const Stmt *s, Names *out) {
+    if (!s) return;
+    mention_expr(s->expr, out);
+    mention_type(&s->type, out);
+    for (size_t i = 0; s->param_types && i < s->nparams; i++) mention_type(&s->param_types[i], out);
+    for (size_t i = 0; i < s->n; i++) mention_stmt(s->stmts[i], out);
+    mention_stmt(s->then_branch, out);
+    mention_stmt(s->else_branch, out);
+    mention_stmt(s->body, out);
+}
+
+/* The program followed by the prelude's declarations it uses (into all,
+ * which borrows the statements of both). False after an error: a name the
+ * prelude defines or reserves is declared again. */
+static bool with_prelude(const char *path, const Program *prog, const Program *pre, Program *all) {
+    bool ok = true;
+    for (size_t i = 0; i < prog->len; i++) {
+        const Stmt *s = prog->stmts[i];
+        if (s->kind != STMT_STRUCT && s->kind != STMT_FUN && s->kind != STMT_VAR && s->kind != STMT_EXTERN &&
+            s->kind != STMT_IMPL)
+            continue;
+        bool taken = strncmp(s->name, "__", 2) == 0;
+        for (size_t k = 0; k < pre->len && !taken; k++)
+            taken = pre->stmts[k]->kind == STMT_STRUCT && strcmp(pre->stmts[k]->name, s->name) == 0;
+        if (taken) {
+            fprintf(stderr, "%s:%d:%d: error: '%s' is %s%s\n", path, s->line, s->col, s->name,
+                    strncmp(s->name, "__", 2) == 0 ? "reserved (names starting with __ belong to the prelude)"
+                                                   : "defined by the prelude",
+                    s->kind == STMT_IMPL && strncmp(s->name, "__", 2) != 0 ? "; it cannot have another impl block" : "");
+            ok = false;
+        }
+    }
+    if (!ok) return false;
+    Names used = {0};
+    for (size_t i = 0; i < prog->len; i++) mention_stmt(prog->stmts[i], &used);
+    bool *keep = xcalloc(pre->len ? pre->len : 1, sizeof *keep);
+    for (bool changed = true; changed;) { /* (prelude code may mention more prelude structs) */
+        changed = false;
+        for (size_t k = 0; k < pre->len; k++)
+            if (!keep[k] && names_has(&used, pre->stmts[k]->name)) {
+                keep[k] = changed = true;
+                mention_stmt(pre->stmts[k], &used);
+            }
+    }
+    all->source_path = prog->source_path;
+    all->cap = pre->len + prog->len + 1;
+    all->stmts = xmalloc(all->cap * sizeof *all->stmts);
+    all->len = 0;
+    /* the program's structs first: struct ids, and memcheck's lists, are in this order */
+    for (size_t i = 0; i < prog->len; i++) all->stmts[all->len++] = prog->stmts[i];
+    for (size_t k = 0; k < pre->len; k++)
+        if (keep[k]) all->stmts[all->len++] = pre->stmts[k];
+    free(keep);
+    free(used.v);
+    return true;
+}
+
+bool lower_program(const Program *user, IrModule *out) {
+    ir_module_init(out, user->source_path);
+    Program pre = {0}, merged = {0};
+    if (!prelude_load(&pre) || !with_prelude(user->source_path, user, &pre, &merged)) {
+        program_free(&pre);
+        ir_module_free(out);
+        return false;
+    }
+    const Program *prog = &merged;
     L l = {0};
     l.path = prog->source_path;
     l.m = out;
     l.write_fn = l.space_fn = l.newline_fn = l.free_fn = -1;
     l.dispose_fn = l.refcount_fn = -1;
-    l.rc_new_fn = l.rc_get_fn = l.rc_count_fn = l.arena_enter_fn = l.arena_leave_fn = -1;
+    for (int i = 0; i < 8; i++) l.intrinsic_fn[i] = -1;
     Fn main_fn;
     int main_fi = ir_add_func(out, "luma_main", 0);
     collect_declarations(&l, prog);
 
     if (!l.failed) {
         begin_function(&l, &main_fn, main_fi, -1);
-        for (size_t i = 0; i < prog->len && !l.failed; i++) lower_stmt(&l, prog->stmts[i]);
+        for (size_t i = 0; i < user->len && !l.failed; i++) lower_stmt(&l, user->stmts[i]);
         end_function(&l, 0, 0);
     }
     for (int i = 0; i < l.nfns && !l.failed; i++) lower_function(&l, i); /* (instances may add more) */
@@ -2653,6 +2512,8 @@ bool lower_program(const Program *prog, IrModule *out) {
     free(l.fns);
     free(l.exts);
     free(l.gvars);
+    free(merged.stmts); /* (the statements belong to the prelude and the program) */
+    program_free(&pre);
     if (l.failed) {
         ir_module_free(out);
         return false;
