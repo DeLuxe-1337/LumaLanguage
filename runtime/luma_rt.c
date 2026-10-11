@@ -9,11 +9,14 @@
  *   luma: runtime error: <message>
  * to stderr and exit with status 1. Messages follow Lox wording.
  *
- * Memory: strings created at runtime (concatenation) and struct instances
- * are allocated through luma_alloc (malloc) and never freed: there is no
- * collector yet. Every allocation goes through luma_alloc, and every object
- * header names its layout, so a collector can be added behind them. */
-#define _XOPEN_SOURCE 700 /* sigaction, sigaltstack, SA_ONSTACK (XSI) */
+ * Memory (see the "memory" section and docs/DESIGN.md): the compiler emits
+ * luma_mm, the program's memory-management mode. Objects are reference
+ * counted (count in header bits 32-63) unless their count is 0 ("not
+ * counted"); the compiler inserts the retain/release operations. In
+ * --mm=manual, struct instances that reach free() are not counted and are
+ * freed by luma_free. LUMA_MEMCHECK=1 turns on leak reports and
+ * use-after-free / double-free detection. */
+#define _XOPEN_SOURCE 700 /* sigaction, sigaltstack, SA_ONSTACK, SA_SIGINFO (XSI) */
 #include <inttypes.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -58,6 +61,8 @@ typedef struct {
 } LumaStruct;
 
 extern const uintptr_t luma_structs[]; /* emitted into every program: [count, desc...] */
+extern const int64_t luma_mm;           /* emitted into every program: LUMA_MM_* */
+extern const uintptr_t luma_globals[];  /* emitted into every program: [count, &slot...] */
 
 LumaValue luma_main(void);
 
@@ -70,11 +75,15 @@ static _Noreturn void luma_panic(const char *msg) {
 static bool is_fixnum(LumaValue v) { return v & 1; }
 static int64_t fixnum_val(LumaValue v) { return (int64_t)v >> 1; }
 
+static bool is_object(LumaValue v) { return v != 0 && (v & 7) == 0; }
+
+static uint64_t header_of(LumaValue v) { return *(const uint64_t *)(uintptr_t)v; }
+
 static void check_valid(LumaValue v) {
     if (v == 0) luma_panic("invalid value (uninitialized slot)");
+    /* a field of a freed object (LUMA_MEMCHECK), or the freed object itself */
+    if ((v & 7) == 4 || (is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FREED)) luma_panic("Use after free.");
 }
-
-static bool is_object(LumaValue v) { return v != 0 && (v & 7) == 0; }
 
 static bool is_string(LumaValue v) {
     return is_object(v) && (((const LumaString *)(uintptr_t)v)->header & 0xff) == LUMA_TYPE_STRING;
@@ -88,11 +97,162 @@ static bool is_struct(LumaValue v) {
 
 static LumaStruct *as_struct(LumaValue v) { return (LumaStruct *)(uintptr_t)v; }
 
-/* Every heap allocation of the runtime: 8-aligned, never NULL. */
-static void *luma_alloc(size_t size) {
+/* ---- memory --------------------------------------------------------------
+ * Every object is allocated by alloc_object and released by free_object.
+ *
+ *   counted objects    the count lives in header bits 32-63 (> 0 while the
+ *                      object is alive). Compiled code retains and releases
+ *                      them; at 0 the object is destroyed: its fields are
+ *                      released (iteratively, so long lists cannot overflow
+ *                      the C stack) and its memory is returned to malloc.
+ *   uncounted objects  count 0: string literals (static), everything under
+ *                      --mm=none (never freed), and in --mm=manual the struct
+ *                      instances the program frees with free(). Their memory
+ *                      comes from a per-size pool and is never returned to
+ *                      malloc, so a stale reference still reads a header with
+ *                      count 0 and retain/release on it stay no-ops.
+ *
+ * LUMA_MEMCHECK=1 (read at startup): freed memory is never reused; a freed
+ * object's header says LUMA_TYPE_FREED and its fields read as LUMA_POISON, so
+ * a later use is reported as "Use after free." At exit, objects still
+ * allocated are listed as leaked or as reachable from global variables. */
+
+static bool memcheck;
+static uint64_t n_allocated, n_freed;
+
+typedef struct {
+    void **items;
+    size_t n, cap;
+} PtrVec;
+
+static void vec_push(PtrVec *v, void *p) {
+    if (v->n == v->cap) {
+        size_t cap = v->cap ? v->cap * 2 : 256;
+        void **items = realloc(v->items, cap * sizeof *items);
+        if (!items) luma_panic("Out of memory.");
+        v->items = items;
+        v->cap = cap;
+    }
+    v->items[v->n++] = p;
+}
+
+static PtrVec live; /* memcheck: every allocated object; its index is stored in the word before it */
+
+static uint32_t *rc_word(const void *o) { return (uint32_t *)((char *)(uintptr_t)o + LUMA_RC_OFFSET); }
+
+/* 8-aligned, never NULL. */
+static void *alloc_object(size_t size) {
+    n_allocated++;
+    if (memcheck) {
+        uint64_t *p = malloc(size + 8);
+        if (!p) luma_panic("Out of memory.");
+        p[0] = live.n;
+        vec_push(&live, p + 1);
+        return p + 1;
+    }
     void *p = malloc(size ? size : 1);
     if (!p) luma_panic("Out of memory.");
     return p;
+}
+
+/* Uncounted struct instances of --mm=manual: free lists by field count. The
+ * descriptor word of a freed instance links the list. */
+static void **pool;
+static int64_t npool;
+
+static void *pool_get(int64_t nfields, size_t size) {
+    if (nfields < npool && pool[nfields]) {
+        LumaStruct *o = pool[nfields];
+        pool[nfields] = (void *)(uintptr_t)o->desc;
+        n_allocated++;
+        return o;
+    }
+    return alloc_object(size);
+}
+
+static void pool_put(LumaStruct *o, int64_t nfields) {
+    if (nfields >= npool) {
+        int64_t n = nfields + 16;
+        void **p = realloc(pool, (size_t)n * sizeof *p);
+        if (!p) luma_panic("Out of memory.");
+        for (int64_t i = npool; i < n; i++) p[i] = NULL;
+        pool = p;
+        npool = n;
+    }
+    o->desc = (const LumaStructDesc *)pool[nfields];
+    pool[nfields] = o;
+}
+
+/* Marks o freed. Under memcheck the memory is kept (quarantined), poisoned,
+ * and leaves the live set; otherwise it goes back to malloc or the pool. */
+static void free_object(void *o, bool to_pool, int64_t nfields) {
+    n_freed++;
+    uint64_t *h = o;
+    if (memcheck) {
+        size_t i = (size_t)((uint64_t *)o)[-1];
+        void *last = live.items[--live.n];
+        if (last != o) {
+            live.items[i] = last;
+            ((uint64_t *)last)[-1] = i;
+        }
+        if ((*h & 0xff) == LUMA_TYPE_STRUCT)
+            for (int64_t k = 0; k < nfields; k++) ((LumaStruct *)o)->fields[k] = LUMA_POISON;
+        *h = LUMA_TYPE_FREED;
+        return;
+    }
+    *h = LUMA_TYPE_FREED; /* count 0 */
+    if (to_pool) pool_put(o, nfields);
+    else free(o);
+}
+
+/* Objects whose count reached 0, waiting to be destroyed. */
+static PtrVec dying;
+static bool draining;
+
+/* Drops one counted reference held by a field or slot that is going away. */
+static void drop(LumaValue v) {
+    if (!is_object(v)) return;
+    uint32_t *c = rc_word((void *)(uintptr_t)v);
+    if (*c != 0 && --*c == 0) vec_push(&dying, (void *)(uintptr_t)v);
+}
+
+/* Destroys every object in `dying`, and those their fields release in turn. */
+static void drain(void) {
+    if (draining) return;
+    draining = true;
+    while (dying.n > 0) {
+        void *o = dying.items[--dying.n];
+        if ((*(uint64_t *)o & 0xff) == LUMA_TYPE_STRUCT) {
+            LumaStruct *s = o;
+            int64_t n = s->desc->nfields;
+            for (int64_t k = 0; k < n; k++) drop(s->fields[k]);
+            free_object(o, false, n);
+        } else {
+            free_object(o, false, 0);
+        }
+    }
+    draining = false;
+}
+
+/* Compiled code: the inline retain/release handle counted objects with
+ * count > 1 themselves and call luma_rc_free for the last reference;
+ * luma_retain / luma_release do the whole job (-O0 and hand-written LIR). */
+void luma_retain(LumaValue v) {
+    if (!is_object(v)) return;
+    uint32_t *c = rc_word((void *)(uintptr_t)v);
+    if (*c != 0) ++*c;
+}
+
+void luma_release(LumaValue v) {
+    drop(v);
+    drain();
+}
+
+/* The last reference to the counted object v is gone. */
+void luma_rc_free(LumaValue v) {
+    *rc_word((void *)(uintptr_t)v) = 0;
+    vec_push(&dying, (void *)(uintptr_t)v);
+    drain();
 }
 
 static LumaValue make_fixnum_checked(int64_t n) {
@@ -273,12 +433,19 @@ LumaValue luma_ffi_ret_ptr(uint64_t r, const char *c) {
 
 LumaValue luma_ffi_ret_bool(uint64_t r, const char *c) { (void)c; return make_bool((r & 0xff) != 0); }
 
+/* A new string of n bytes (plus NUL), counted unless --mm=none. */
+static LumaString *new_string(size_t n) {
+    LumaString *s = alloc_object((sizeof *s + n + 1 + 7) & ~(size_t)7);
+    s->header = LUMA_TYPE_STRING | LUMA_STRING_HEAP | ((uint64_t)(luma_mm != LUMA_MM_NONE) << 32);
+    s->len = n;
+    s->bytes[n] = '\0';
+    return s;
+}
+
 static LumaValue string_from_c(const char *p) {
     size_t n = strlen(p);
-    LumaString *s = luma_alloc((sizeof *s + n + 1 + 7) & ~(size_t)7);
-    s->header = LUMA_TYPE_STRING;
-    s->len = n;
-    memcpy(s->bytes, p, n + 1);
+    LumaString *s = new_string(n);
+    memcpy(s->bytes, p, n);
     return (LumaValue)(uintptr_t)s;
 }
 
@@ -384,9 +551,13 @@ _Noreturn void luma_undefined_variable(const char *name) {
  * accesses whose struct is known statically are plain loads and stores. The
  * functions below serve values whose struct is not known at compile time. */
 
-LumaValue luma_new_struct(const LumaStructDesc *d) {
-    LumaStruct *o = luma_alloc(sizeof *o + (size_t)d->nfields * sizeof(LumaValue));
-    o->header = LUMA_TYPE_STRUCT | ((uint64_t)d->id << LUMA_STRUCT_ID_SHIFT);
+/* `counted` is decided by the compiler: always in --mm=rc, never in
+ * --mm=none, and in --mm=manual for instances its escape analysis proves are
+ * never freed by the program (the rest come from the manual pool). */
+LumaValue luma_new_struct(const LumaStructDesc *d, int64_t counted) {
+    size_t size = sizeof(LumaStruct) + (size_t)d->nfields * sizeof(LumaValue);
+    LumaStruct *o = !counted && luma_mm == LUMA_MM_MANUAL && !memcheck ? pool_get(d->nfields, size) : alloc_object(size);
+    o->header = LUMA_TYPE_STRUCT | ((uint64_t)d->id << LUMA_STRUCT_ID_SHIFT) | ((uint64_t)(counted != 0) << 32);
     o->desc = d;
     for (int64_t i = 0; i < d->nfields; i++) o->fields[i] = LUMA_NIL;
     return (LumaValue)(uintptr_t)o;
@@ -419,8 +590,30 @@ LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
         describe_mask(m, want, sizeof want);
         panicf("field '%s' of '%s' expects %s, got %s.", name, s->desc->name, want, value_type_name(v));
     }
-    s->fields[k] = v;
-    return v;
+    LumaValue old = s->fields[k];
+    s->fields[k] = v; /* the field takes over the caller's reference to v */
+    luma_release(old);
+    return LUMA_NIL;
+}
+
+/* free(v): in --mm=manual, frees a struct instance and releases the values
+ * in its fields; in the other modes it only checks its argument (the object
+ * is reclaimed automatically, or never). free(nil) does nothing. */
+LumaValue luma_free(LumaValue v) {
+    if (is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FREED) luma_panic("Double free: this object was already freed.");
+    check_valid(v);
+    if (v == LUMA_NIL) return LUMA_NIL;
+    if (is_string(v)) luma_panic("free() expects a struct instance, got str (strings are freed automatically).");
+    if (!is_struct(v)) panicf("free() expects a struct instance, got %s.", value_type_name(v));
+    if (luma_mm != LUMA_MM_MANUAL) return LUMA_NIL;
+    LumaStruct *o = as_struct(v);
+    if (*rc_word(o) != 0) /* the compiler only counts instances that never reach free() */
+        panicf("internal error: free() of an automatically managed %s.", o->desc->name);
+    int64_t n = o->desc->nfields;
+    for (int64_t k = 0; k < n; k++) drop(o->fields[k]);
+    free_object(o, true, n);
+    drain();
+    return LUMA_NIL;
 }
 
 /* The code of method `name` of o's struct, for a call with nargs arguments
@@ -451,13 +644,9 @@ LumaValue luma_add(LumaValue a, LumaValue b) {
     if (is_string(a) && is_string(b)) {
         const LumaString *x = as_string(a), *y = as_string(b);
         if (x->len > SIZE_MAX / 2 || y->len > SIZE_MAX / 2) luma_panic("String too long.");
-        size_t n = x->len + y->len;
-        LumaString *s = luma_alloc((sizeof *s + n + 1 + 7) & ~(size_t)7);
-        s->header = LUMA_TYPE_STRING;
-        s->len = n;
+        LumaString *s = new_string(x->len + y->len); /* a new object: the caller owns it */
         memcpy(s->bytes, x->bytes, x->len);
         memcpy(s->bytes + x->len, y->bytes, y->len);
-        s->bytes[n] = '\0';
         return (LumaValue)(uintptr_t)s;
     }
     luma_panic("Operands must be two numbers or two strings.");
@@ -538,11 +727,17 @@ LumaValue luma_ge(LumaValue a, LumaValue b) { need_numbers(a, b); return make_bo
  * globals and runtime objects, so the stack is by far the likely cause. */
 static char alt_stack[64 * 1024];
 
-static void on_segv(int sig) {
+static void on_segv(int sig, siginfo_t *si, void *ctx) {
     (void)sig;
-    static const char msg[] = "luma: runtime error: Stack overflow.\n";
-    fflush(stdout); /* best effort: keep output printed before the overflow */
-    ssize_t r = write(2, msg, sizeof msg - 1);
+    (void)ctx;
+    static const char overflow[] = "luma: runtime error: Stack overflow.\n";
+    static const char freed[] = "luma: runtime error: Use after free.\n";
+    /* under LUMA_MEMCHECK, a field of a freed object holds LUMA_POISON; code
+     * that trusts its static type and dereferences it faults near it */
+    uintptr_t a = (uintptr_t)si->si_addr;
+    bool poison = a >= (uintptr_t)LUMA_POISON - 4 && a < (uintptr_t)LUMA_POISON + 0x100000;
+    fflush(stdout); /* best effort: keep output printed before the fault */
+    ssize_t r = poison ? write(2, freed, sizeof freed - 1) : write(2, overflow, sizeof overflow - 1);
     (void)r;
     _exit(1);
 }
@@ -555,15 +750,88 @@ static void install_stack_guard(void) {
     if (sigaltstack(&ss, NULL) != 0) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_segv;
-    sa.sa_flags = SA_ONSTACK;
+    sa.sa_sigaction = on_segv;
+    sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
 }
 
+/* ---- LUMA_MEMCHECK report ----------------------------------------------- */
+
+static const char *mm_name(void) {
+    return luma_mm == LUMA_MM_RC ? "rc" : luma_mm == LUMA_MM_MANUAL ? "manual" : "none";
+}
+
+/* Live objects reachable from the global variables get marked[index] = 1. */
+static void mark_from(LumaValue v, unsigned char *marked, PtrVec *stack) {
+    if (!is_object(v)) return;
+    vec_push(stack, (void *)(uintptr_t)v);
+    while (stack->n > 0) {
+        void *o = stack->items[--stack->n];
+        if ((*(uint64_t *)o & 0xff) == LUMA_TYPE_FREED) continue;
+        /* string literals are static: only allocated objects carry an index */
+        uint64_t h = *(uint64_t *)o;
+        if ((h & 0xff) == LUMA_TYPE_STRING && !(h & LUMA_STRING_HEAP)) continue;
+        uint64_t i = ((uint64_t *)o)[-1];
+        if (i >= live.n || live.items[i] != o || marked[i]) continue;
+        marked[i] = 1;
+        if ((h & 0xff) == LUMA_TYPE_STRUCT) {
+            const LumaStruct *s = o;
+            for (int64_t k = 0; k < s->desc->nfields; k++)
+                if (is_object(s->fields[k])) vec_push(stack, (void *)(uintptr_t)s->fields[k]);
+        }
+    }
+}
+
+/* "2 Node, 1 str" for the live objects whose mark equals `which`. */
+static void describe_objects(const unsigned char *marked, unsigned char which, char *buf, size_t n) {
+    uint64_t nstructs = luma_structs[0];
+    uint64_t *counts = calloc(nstructs + 2, sizeof *counts);
+    if (!counts) luma_panic("Out of memory.");
+    for (size_t i = 0; i < live.n; i++) {
+        if (marked[i] != which) continue;
+        const uint64_t *h = live.items[i];
+        if ((*h & 0xff) == LUMA_TYPE_STRUCT) counts[((const LumaStruct *)h)->desc->id]++;
+        else counts[nstructs + 1]++;
+    }
+    buf[0] = '\0';
+    for (uint64_t id = 1; id <= nstructs + 1; id++) {
+        if (!counts[id]) continue;
+        size_t len = strlen(buf);
+        snprintf(buf + len, n - len, "%s%" PRIu64 " %s", len ? ", " : "", counts[id], id <= nstructs ? struct_name((unsigned)id) : "str");
+    }
+    free(counts);
+}
+
+static void memcheck_report(void) {
+    unsigned char *marked = calloc(live.n + 1, 1);
+    PtrVec stack = {0};
+    if (!marked) luma_panic("Out of memory.");
+    for (uint64_t g = 1; g <= luma_globals[0]; g++) mark_from(*(const LumaValue *)luma_globals[g], marked, &stack);
+    free(stack.items);
+    size_t reachable = 0;
+    for (size_t i = 0; i < live.n; i++) reachable += marked[i];
+    size_t leaked = live.n - reachable;
+    fprintf(stderr, "luma: memcheck: --mm=%s, %" PRIu64 " allocated, %" PRIu64 " freed, %zu leaked, %zu reachable from globals\n",
+            mm_name(), n_allocated, n_freed, leaked, reachable);
+    char buf[4096];
+    if (leaked) {
+        describe_objects(marked, 0, buf, sizeof buf);
+        fprintf(stderr, "luma: memcheck: leaked: %s\n", buf);
+    }
+    if (reachable) {
+        describe_objects(marked, 1, buf, sizeof buf);
+        fprintf(stderr, "luma: memcheck: reachable from globals: %s\n", buf);
+    }
+    free(marked);
+}
+
 int main(void) {
     install_stack_guard();
+    const char *mc = getenv("LUMA_MEMCHECK");
+    memcheck = mc && *mc && strcmp(mc, "0") != 0;
     luma_main();
     if (fflush(stdout) != 0) return 1; /* e.g. writing to a closed pipe/full disk */
+    if (memcheck) memcheck_report();
     return 0;
 }

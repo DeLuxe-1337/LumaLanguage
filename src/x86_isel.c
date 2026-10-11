@@ -165,6 +165,7 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         break;
     case IR_NEW: {
         buf_printf(out, "    lea rdi, [rip + .Lstruct.%d]\n", in->sid);
+        buf_printf(out, "    mov esi, %d    # %s\n", in->imm ? 1 : 0, in->imm ? "reference counted" : "not counted");
         buf_printf(out, "    call luma_new_struct@PLT\n");
         for (int i = 0; i < in->nargs; i++) {
             load(out, "rcx", in->args[i]);
@@ -186,9 +187,12 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         break;
     case IR_SETFIELD:
         if (in->sid >= 0) {
+            int off = LUMA_STRUCT_FIELDS_OFFSET + 8 * in->field;
             load(out, "rax", in->a);
             load(out, "rcx", in->b);
-            buf_printf(out, "    mov [rax + %d], rcx\n", LUMA_STRUCT_FIELDS_OFFSET + 8 * in->field);
+            if (in->imm) buf_printf(out, "    mov rdi, [rax + %d]    # the old value\n", off);
+            buf_printf(out, "    mov [rax + %d], rcx\n", off);
+            if (in->imm) buf_printf(out, "    call luma_release@PLT\n");
         } else {
             load(out, "rdi", in->a);
             buf_printf(out, "    lea rsi, [rip + .Lname.%s]\n", in->name);
@@ -214,7 +218,14 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         break; /* never reach the backend (the verifier rejects them) */
     case IR_STORE:
         load(out, "rax", in->a);
+        if (in->imm) buf_printf(out, "    mov rdi, [rip + .Lvar.%s]    # the old value (0 if unassigned)\n", m->globals[in->global].name);
         buf_printf(out, "    mov [rip + .Lvar.%s], rax\n", m->globals[in->global].name);
+        if (in->imm) buf_printf(out, "    call luma_release@PLT\n");
+        break;
+    case IR_RETAIN:
+    case IR_RELEASE:
+        load(out, "rdi", in->a);
+        buf_printf(out, "    call %s@PLT\n", in->op == IR_RETAIN ? "luma_retain" : "luma_release");
         break;
     case IR_JMP:
         if (in->target[0] != b + 1) jump(out, "jmp", m, f, in->target[0]);
@@ -346,8 +357,23 @@ static void emit_structs(const IrModule *m, Buf *out) {
     free(names);
 }
 
+/* luma_mm (the memory-management mode) and luma_globals, the table of global
+ * variable slots that LUMA_MEMCHECK scans for reachable objects. */
+static void emit_memory_data(const IrModule *m, Buf *out) {
+    buf_printf(out, "\n    .data\n    .p2align 3\n    .globl luma_mm\n    .type luma_mm, @object\n");
+    buf_printf(out, "luma_mm:\n    .quad %d    # --mm=%s\n    .size luma_mm, .-luma_mm\n", (int)m->mm, ir_mm_name(m->mm));
+    int nvars = 0;
+    for (int i = 0; i < m->nglobals; i++) nvars += m->globals[i].kind == IRG_VAR;
+    buf_printf(out, "    .globl luma_globals\n    .type luma_globals, @object\n");
+    buf_printf(out, "luma_globals:    # global variable count, then their slots\n    .quad %d\n", nvars);
+    for (int i = 0; i < m->nglobals; i++)
+        if (m->globals[i].kind == IRG_VAR) buf_printf(out, "    .quad .Lvar.%s\n", m->globals[i].name);
+    buf_printf(out, "    .size luma_globals, .-luma_globals\n");
+}
+
 void x86_emit_data(const IrModule *m, Buf *out) {
     emit_structs(m, out);
+    emit_memory_data(m, out);
     bool any_data = false;
     for (int i = 0; i < m->nglobals; i++) {
         const IrGlobal *g = &m->globals[i];

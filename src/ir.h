@@ -72,6 +72,8 @@ typedef enum {
                        or dynamic (sid < 0: looked up by `name` at run time) (v0.5) */
     IR_SETFIELD,    /* a.field = b   (no dst; static or dynamic as for getfield) (v0.5) */
     IR_CALLM,       /* [dst =] method `name` of a's struct, called with (a, args...) (v0.5) */
+    IR_RETAIN,      /* reference count of a += 1 if a is a counted object (no dst; v0.6, inserted by mem.c) */
+    IR_RELEASE,     /* reference count of a -= 1 if a is a counted object; frees it at 0 (no dst; v0.6) */
     IR_PHI,         /* dst = args[k] when entered from block phi_blocks[k] (SSA form; optimizer-internal) */
     IR_NOP,         /* deleted instruction (optimizer-internal; removed before output) */
     /* terminators */
@@ -86,7 +88,7 @@ typedef struct {
     IrOp op;
     int dst;        /* vreg or IR_NONE */
     int a, b;       /* operand vregs or IR_NONE */
-    int64_t imm;    /* IR_CONST_INT */
+    int64_t imm;    /* IR_CONST_INT; IR_NEW: 1 = the instance is reference counted (set by mem.c) */
     int global;     /* IR_CONST_DATA / IR_CALL / IR_LOAD / IR_STORE: index into module globals */
     int *args;      /* IR_CALL / IR_PHI: vregs (owned) */
     int nargs;
@@ -159,8 +161,15 @@ typedef struct {
     int line;
 } IrStruct;
 
+/* Memory-management mode (v0.6; `memory none|manual|rc` in the text form;
+ * docs/IR.md section 19). The values match the runtime's LUMA_MM_*. */
+typedef enum { IR_MM_NONE = 0, IR_MM_MANUAL = 1, IR_MM_RC = 2 } IrMemMode;
+const char *ir_mm_name(IrMemMode mm);
+
 typedef struct IrModule {
     char *source;     /* "module" string */
+    IrMemMode mm;     /* v0.6 */
+    bool mem_lowered; /* retain/release inserted (mem_lower): only then may they appear */
     IrGlobal *globals;
     int nglobals;
     IrFunc *funcs;

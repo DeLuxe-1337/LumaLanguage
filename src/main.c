@@ -8,7 +8,10 @@
  *   1. lex + parse INPUT.luma        -> AST          (--dump-tokens, --dump-ast)
  *   2. lower                         -> LIR          -> OUT.lir  (stop: --emit-ir)
  *      (or: parse INPUT.lir directly, skipping 1-2)
- *   3. verify LIR
+ *   3. verify LIR; compile-time free() checks (mem.c)
+ *   3b. optimize (-O2)               -> OUT.opt.lir
+ *   3c. memory lowering (mem.c: escape analysis, retain/release)
+ *                                    -> OUT.mem.lir  (--mm=manual or rc)
  *   4. x86-64 instruction selection  -> OUT.s        (stop: -S)
  *   5. Luma assembler reads OUT.s    -> ObjFile
  *   6. Luma ELF writer               -> OUT.o        (stop: -c)
@@ -32,6 +35,7 @@
 #include "ir.h"
 #include "lexer.h"
 #include "lower.h"
+#include "mem.h"
 #include "opt.h"
 #include "parser.h"
 #include "util.h"
@@ -53,12 +57,19 @@ static void usage(FILE *f) {
             "  --dump-ir       print the LIR module\n"
             "  --dump-opt-ir   print the optimized LIR module\n"
             "  -O0, -O1, -O2   optimization level (default -O2; see docs/DESIGN.md)\n"
+            "  --mm=MODE       memory management: manual (default; free() for structs,\n"
+            "                  everything else automatic), rc (reference counting) or\n"
+            "                  none (never free); a .lir input keeps its `memory` line\n"
+            "                  unless --mm is given. The memory pass writes OUT.mem.lir\n"
+            "  --dump-mem-ir   print the LIR after the memory pass\n"
             "  -v              print each stage and the link command\n"
             "  -l LIB, -L DIR  link with libLIB / search DIR (for extern fun)\n"
             "  EXTRA.o/.a/.so  additional objects or libraries passed to the linker\n"
             "environment:\n"
             "  LUMA_CC         linker driver to use (default: cc)\n"
-            "  LUMA_RUNTIME    path to libluma_rt.a (default: next to the luma binary)\n");
+            "  LUMA_RUNTIME    path to libluma_rt.a (default: next to the luma binary)\n"
+            "  LUMA_MEMCHECK=1 (when running a compiled program) report leaks at exit and\n"
+            "                  turn use-after-free / double free into runtime errors\n");
 }
 
 static char *with_ext(const char *base, const char *ext) {
@@ -155,8 +166,9 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
 int main(int argc, char **argv) {
     const char *input = NULL, *out = "a.out";
     bool stop_ir = false, stop_s = false, stop_c = false;
-    bool dump_tokens = false, dump_ast = false, dump_ir = false, dump_opt_ir = false, verbose = false;
+    bool dump_tokens = false, dump_ast = false, dump_ir = false, dump_opt_ir = false, dump_mem_ir = false, verbose = false;
     int opt_level = 2;
+    int mm = -1; /* -1: not given (manual for .luma input, the file's own mode for .lir) */
     StrList extra = {0}, libs = {0};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -184,6 +196,13 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--dump-ast") == 0) dump_ast = true;
         else if (strcmp(a, "--dump-ir") == 0) dump_ir = true;
         else if (strcmp(a, "--dump-opt-ir") == 0) dump_opt_ir = true;
+        else if (strcmp(a, "--dump-mem-ir") == 0) dump_mem_ir = true;
+        else if (strncmp(a, "--mm=", 5) == 0) {
+            if (strcmp(a + 5, "manual") == 0) mm = IR_MM_MANUAL;
+            else if (strcmp(a + 5, "rc") == 0) mm = IR_MM_RC;
+            else if (strcmp(a + 5, "none") == 0) mm = IR_MM_NONE;
+            else { fprintf(stderr, "luma: error: unknown memory mode '%s' (manual, rc or none)\n", a + 5); return 2; }
+        }
         else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '2' && !a[3]) opt_level = a[2] - '0';
         else if (strcmp(a, "-v") == 0) verbose = true;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(stdout); return 0; }
@@ -198,7 +217,8 @@ int main(int argc, char **argv) {
     int rc = 1;
     char *ir_path = with_ext(out, ".lir");
     char *opt_path = with_ext(out, ".opt.lir");
-    Buf opt_buf = {0};
+    char *mem_path = with_ext(out, ".mem.lir");
+    Buf opt_buf = {0}, mem_buf = {0};
     char *asm_path = with_ext(out, ".s");
     char *obj_path = with_ext(out, ".o");
     size_t src_len = 0, asm_len = 0;
@@ -227,7 +247,9 @@ int main(int argc, char **argv) {
         /* 2. lowering */
         if (!lower_program(&prog, &ir)) goto done;
         have_ir = true;
+        ir.mm = IR_MM_MANUAL;
     }
+    if (mm >= 0) ir.mm = (IrMemMode)mm;
     ir_print_module(&ir, &ir_buf);
     if (dump_ir) fwrite(ir_buf.data, 1, ir_buf.len, stdout);
     if (!from_ir) {
@@ -237,6 +259,8 @@ int main(int argc, char **argv) {
     /* 3. verify (always, including IR we produced ourselves) */
     /* (line numbers refer to INPUT: .lir lines, or .luma lines for lowered IR) */
     if (!ir_verify(&ir, input)) goto done;
+    /* 3a. free(x) followed by a use of x on every path is a compile error (all modes) */
+    if (!mem_check_frees(&ir, input)) goto done;
 
     /* 3b. optimize (-O2): the result is written to OUT.opt.lir and must verify */
     if (opt_level >= 2) {
@@ -255,6 +279,19 @@ int main(int argc, char **argv) {
         if (from_ir) { fprintf(stderr, "luma: error: --emit-ir needs a .luma input\n"); goto done; }
         rc = 0;
         goto done;
+    }
+
+    /* 3c. memory: which allocations are counted, and retain/release (docs/DESIGN.md "Memory") */
+    mem_lower(&ir);
+    if (ir.mm != IR_MM_NONE) {
+        ir_print_module(&ir, &mem_buf);
+        if (dump_mem_ir) fwrite(mem_buf.data, 1, mem_buf.len, stdout);
+        if (!write_file(mem_path, mem_buf.data, mem_buf.len)) goto done;
+        if (verbose) fprintf(stderr, "luma: wrote memory-lowered IR %s (--mm=%s)\n", mem_path, ir_mm_name(ir.mm));
+        if (!ir_verify(&ir, mem_path)) {
+            fprintf(stderr, "luma: internal error: the memory pass produced invalid IR (%s)\n", mem_path);
+            goto done;
+        }
     }
 
     /* 4. instruction selection */
@@ -290,7 +327,9 @@ done:
     obj_free(&obj);
     free(ir_path);
     free(opt_path);
+    free(mem_path);
     buf_free(&opt_buf);
+    buf_free(&mem_buf);
     free(asm_path);
     free(obj_path);
     strlist_free(&extra);

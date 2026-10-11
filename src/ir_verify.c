@@ -40,6 +40,7 @@ static bool vreg_ok(const IrFunc *f, int r) { return r >= 0 && r < f->nvregs; }
 static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) {
     switch (in->op) {
     case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
+    case IR_RETAIN: case IR_RELEASE:
         fn(ctx, in->a);
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
@@ -68,7 +69,8 @@ static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) 
 }
 
 static bool op_has_dst(IrOp op) {
-    return !ir_op_is_terminator(op) && op != IR_CALL && op != IR_STORE && op != IR_SETFIELD && op != IR_CALLM;
+    return !ir_op_is_terminator(op) && op != IR_CALL && op != IR_STORE && op != IR_SETFIELD && op != IR_CALLM &&
+           op != IR_RETAIN && op != IR_RELEASE;
 }
 
 static bool ty_valid(const IrModule *m, IrTy t) {
@@ -95,7 +97,8 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
         verr(v, f, b, in, "call has an invalid destination register");
     if ((in->op == IR_CALL || in->op == IR_CALLM) && in->dst != IR_NONE && !vreg_ok(f, in->dst))
         verr(v, f, b, in, "'%s' has an invalid destination register", ir_op_name(in->op));
-    if ((ir_op_is_terminator(in->op) || in->op == IR_STORE || in->op == IR_SETFIELD) && in->dst != IR_NONE)
+    if ((ir_op_is_terminator(in->op) || in->op == IR_STORE || in->op == IR_SETFIELD || in->op == IR_RETAIN ||
+         in->op == IR_RELEASE) && in->dst != IR_NONE)
         verr(v, f, b, in, "'%s' cannot have a destination", ir_op_name(in->op));
     UseCtx c = {v, f, b, in};
     for_each_use(in, check_use_index, &c);
@@ -136,6 +139,13 @@ static void check_instr(V *v, const IrFunc *f, int b, const IrInstr *in) {
     case IR_PHI:
     case IR_NOP:
         verr(v, f, b, in, "'%s' instructions only exist inside the optimizer", ir_op_name(in->op));
+        break;
+    case IR_RETAIN:
+    case IR_RELEASE:
+        if (!m->mem_lowered)
+            verr(v, f, b, in, "'%s' instructions are inserted by the compiler's memory pass, not written in LIR", ir_op_name(in->op));
+        else if (m->mm == IR_MM_NONE)
+            verr(v, f, b, in, "'%s' needs a memory mode other than none", ir_op_name(in->op));
         break;
     case IR_LOAD: case IR_STORE:
         if (in->global < 0 || in->global >= m->nglobals) verr(v, f, b, in, "'%s' references an undefined global", ir_op_name(in->op));

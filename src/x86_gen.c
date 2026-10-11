@@ -858,6 +858,67 @@ static void emit_fused_br(G *g, int b, int idx, const IrInstr *br) {
     }
 }
 
+/* ---- reference counting (docs/DESIGN.md "Memory") ----
+ * The count is the dword at [obj + 4]; 0 means "not counted". Values that are
+ * not objects (fixnums, nil, booleans: low 3 bits nonzero) are skipped. */
+
+/* Can a value of type t be a non-object (so the tag test is needed)? */
+static bool may_be_immediate(IrTy t) { return t == 0 || (t & (TY_INT | TY_BOOL | TY_NIL)); }
+
+static void emit_retain(G *g, int idx, const IrInstr *in) {
+    Loc L = g->loc[in->a];
+    if (L.kind == LOC_IMM || L.kind == LOC_DATA) return; /* constants are never counted */
+    int r = use_r(g, in->a, R11), done = new_label();
+    if (may_be_immediate(g->tya[idx])) {
+        E(g, "    test %s, 7", R8B[r]);
+        E(g, "    jnz .Lk%d", done);
+    }
+    E(g, "    cmp dword ptr [%s + %d], 0", R64[r], LUMA_RC_OFFSET);
+    E(g, "    je .Lk%d", done);
+    E(g, "    add dword ptr [%s + %d], 1", R64[r], LUMA_RC_OFFSET);
+    E(g, ".Lk%d:", done);
+}
+
+/* Releases the value in register r (which must hold it until the end).
+ * maybe_zero: r may be 0 (a global slot never assigned). The last reference
+ * goes to luma_rc_free in an out-of-line stub that keeps the live registers. */
+static void emit_release_reg(G *g, int idx, int r, IrTy ty, bool maybe_zero) {
+    int done = new_label(), last = new_label();
+    if (maybe_zero) {
+        E(g, "    test %s, %s", R64[r], R64[r]);
+        E(g, "    jz .Lk%d", done);
+    }
+    if (may_be_immediate(ty)) {
+        E(g, "    test %s, 7", R8B[r]);
+        E(g, "    jnz .Lk%d", done);
+    }
+    E(g, "    cmp dword ptr [%s + %d], 1", R64[r], LUMA_RC_OFFSET);
+    E(g, "    jb .Lk%d", done);   /* 0: not counted */
+    E(g, "    je .Lk%d", last);   /* 1: the last reference */
+    E(g, "    sub dword ptr [%s + %d], 1", R64[r], LUMA_RC_OFFSET);
+    E(g, ".Lk%d:", done);
+    Lines *save = g->cur;
+    g->cur = &g->stubs;
+    E(g, ".Lk%d:", last);
+    int saved[NREGS];
+    int ns = live_caller(g, 2 * idx, 2 * idx + 2, -1, saved);
+    Loc arg = loc_reg(r);
+    preserving_call(g, saved, ns, "luma_rc_free", &arg, 1);
+    E(g, "    jmp .Lk%d", done);
+    g->cur = save;
+}
+
+static void emit_release(G *g, int idx, const IrInstr *in) {
+    Loc L = g->loc[in->a];
+    if (L.kind == LOC_IMM || L.kind == LOC_DATA) return;
+    if (L.kind == LOC_REG) {
+        emit_release_reg(g, idx, L.reg, g->tya[idx], false);
+    } else {
+        load_loc(g, R10, L);
+        emit_release_reg(g, idx, R10, g->tya[idx], false);
+    }
+}
+
 static void emit_check(G *g, int idx, const IrInstr *in) {
     IrTy ta = g->tya[idx];
     if (ta != 0 && ir_ty_sub(ta, in->ty)) {
@@ -881,12 +942,12 @@ static void emit_check(G *g, int idx, const IrInstr *in) {
         E(g, "    je .Lk%d", ok);
     }
     if (ty_sid(in->ty) >= 0 && ir_ty_inter(ta, in->ty) & TY_STRUCT) {
-        /* an instance of exactly this struct: an object whose header is
-         * LUMA_TYPE_STRUCT | id << 8 */
+        /* an instance of exactly this struct: an object whose header's low
+         * half is LUMA_TYPE_STRUCT | id << 8 (the high half is the count) */
         int no = new_label();
         E(g, "    test %s, 7", R8B[ra]);
         E(g, "    jnz .Lk%d", no);
-        E(g, "    cmp qword ptr [%s], %d", R64[ra], LUMA_TYPE_STRUCT | ((ty_sid(in->ty) + 1) << LUMA_STRUCT_ID_SHIFT));
+        E(g, "    cmp dword ptr [%s], %d", R64[ra], LUMA_TYPE_STRUCT | ((ty_sid(in->ty) + 1) << LUMA_STRUCT_ID_SHIFT));
         E(g, "    je .Lk%d", ok);
         E(g, ".Lk%d:", no);
     }
@@ -1004,15 +1065,20 @@ static void emit_instr(G *g, int b, int idx, const IrInstr *in) {
     case IR_STORE: {
         const char *name = m->globals[in->global].name;
         Loc A = g->loc[in->a];
+        if (in->imm) E(g, "    mov r10, qword ptr [rip + .Lvar.%s]    # the old value", name);
         if (A.kind == LOC_IMM && fits32(A.imm)) E(g, "    mov qword ptr [rip + .Lvar.%s], %" PRId64, name, A.imm);
         else E(g, "    mov qword ptr [rip + .Lvar.%s], %s", name, R64[use_r(g, in->a, R11)]);
+        if (in->imm) emit_release_reg(g, idx, R10, g->m->globals[in->global].ty, true);
         break;
     }
+    case IR_RETAIN: emit_retain(g, idx, in); break;
+    case IR_RELEASE: emit_release(g, idx, in); break;
     case IR_CHECK: emit_check(g, idx, in); break;
     case IR_NEW: {
         /* allocate (a call: the field values live across it in callee-saved
          * registers or slots), then store the fields */
         E(g, "    lea rdi, [rip + .Lstruct.%d]", in->sid);
+        E(g, "    mov esi, %d    # %s", in->imm ? 1 : 0, in->imm ? "reference counted" : "not counted");
         E(g, "    call luma_new_struct@PLT");
         for (int i = 0; i < in->nargs; i++) {
             Loc A = g->loc[in->args[i]];
@@ -1040,12 +1106,23 @@ static void emit_instr(G *g, int b, int idx, const IrInstr *in) {
                 store_reg(g, d, T);
             } else {
                 Loc B = g->loc[in->b];
+                bool spill_old = false;
+                if (in->imm) { /* keep the old value in r10 to release it afterwards */
+                    E(g, "    mov r10, %s    # the old value", mem);
+                    spill_old = !(B.kind == LOC_REG || (B.kind == LOC_IMM && fits32(B.imm))) && ro == R11;
+                    if (spill_old) E(g, "    push r10"); /* both scratch registers are taken */
+                }
                 if (B.kind == LOC_REG) E(g, "    mov %s, %s", mem, R64[B.reg]);
                 else if (B.kind == LOC_IMM && fits32(B.imm)) E(g, "    mov %s, %s", mem, num_text(B.imm));
-                else {
+                else if (!in->imm || spill_old) {
                     load_loc(g, R10, B);
                     E(g, "    mov %s, r10", mem);
+                } else {
+                    load_loc(g, R11, B); /* ro is not r11 here (else spill_old) */
+                    E(g, "    mov %s, r11", mem);
                 }
+                if (spill_old) E(g, "    pop r10");
+                if (in->imm) emit_release_reg(g, idx, R10, g->m->structs[in->sid].ftys[in->field], false);
             }
             break;
         }
@@ -1218,14 +1295,18 @@ static void analyze(G *g) {
         if (c < 0 || uses[c] != 1 || g->loc[c].kind != LOC_NONE) continue;
         int j = bl->n - 2;
         while (j >= 0 && bl->instrs[j].dst != c &&
-               (bl->instrs[j].op == IR_MOV || is_const_op(bl->instrs[j].op)))
+               (bl->instrs[j].op == IR_MOV || is_const_op(bl->instrs[j].op) || bl->instrs[j].op == IR_RETAIN ||
+                bl->instrs[j].op == IR_RELEASE))
             j--;
         if (j < 0 || bl->instrs[j].dst != c) continue;
         const IrInstr *in = &bl->instrs[j];
         bool clobbered = false;
         for (int q = j + 1; q < bl->n - 1; q++) {
-            int dq = bl->instrs[q].dst;
+            const IrInstr *iq = &bl->instrs[q];
+            int dq = iq->dst;
             if (dq >= 0 && (dq == in->a || dq == in->b)) clobbered = true;
+            /* the compare reads its operands at the br: they must not be freed in between */
+            if (iq->op == IR_RELEASE && (iq->a == in->a || iq->a == in->b)) clobbered = true;
         }
         if (clobbered || in->a == c || in->b == c) continue;
         int idx = g->first[b] + j;

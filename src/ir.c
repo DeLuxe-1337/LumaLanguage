@@ -186,6 +186,7 @@ int ir_instr_uses(IrInstr *in, int **ptrs) {
     int n = 0;
     switch (in->op) {
     case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
+    case IR_RETAIN: case IR_RELEASE:
         ptrs[n++] = &in->a;
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
@@ -497,6 +498,8 @@ bool ir_block_terminated(const IrBlock *b) { return b->n > 0 && ir_op_is_termina
 bool ir_op_is_binary(IrOp op) { return op >= IR_ADD && op <= IR_GE; }
 bool ir_op_is_unary(IrOp op) { return op == IR_NEG || op == IR_NOT; }
 
+const char *ir_mm_name(IrMemMode mm) { return mm == IR_MM_RC ? "rc" : mm == IR_MM_MANUAL ? "manual" : "none"; }
+
 const char *ir_op_name(IrOp op) {
     switch (op) {
     case IR_CONST_INT: case IR_CONST_NIL: case IR_CONST_TRUE: case IR_CONST_FALSE: case IR_CONST_DATA:
@@ -523,6 +526,8 @@ const char *ir_op_name(IrOp op) {
     case IR_GETFIELD: return "getfield";
     case IR_SETFIELD: return "setfield";
     case IR_CALLM: return "callm";
+    case IR_RETAIN: return "retain";
+    case IR_RELEASE: return "release";
     case IR_PHI: return "phi";
     case IR_NOP: return "nop";
     case IR_JMP: return "jmp";
@@ -582,7 +587,7 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
     case IR_CONST_TRUE: buf_printf(out, "const true"); break;
     case IR_CONST_FALSE: buf_printf(out, "const false"); break;
     case IR_CONST_DATA: buf_printf(out, "const @%s", gname(m, in->global)); break;
-    case IR_MOV: case IR_NEG: case IR_NOT:
+    case IR_MOV: case IR_NEG: case IR_NOT: case IR_RETAIN: case IR_RELEASE:
         buf_printf(out, "%s %%%s", ir_op_name(in->op), vname(f, in->a));
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
@@ -606,6 +611,7 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
         buf_printf(out, "new %s(", sname(m, in->sid));
         for (int i = 0; i < in->nargs; i++) buf_printf(out, "%s%%%s", i ? ", " : "", vname(f, in->args[i]));
         buf_printf(out, ")");
+        if (m->mem_lowered && in->imm) buf_printf(out, "    ; counted");
         break;
     case IR_GETFIELD:
     case IR_SETFIELD:
@@ -665,6 +671,7 @@ void ir_print_module(const IrModule *m, Buf *out) {
     buf_printf(out, "module ");
     print_string(out, m->source, strlen(m->source));
     buf_byte(out, '\n');
+    if (m->mm != IR_MM_NONE) buf_printf(out, "memory %s\n", ir_mm_name(m->mm));
     /* Canonical order: structs, then externs and data (in declaration order),
      * then functions. */
     if (m->nstructs) buf_byte(out, '\n');

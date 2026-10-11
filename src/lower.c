@@ -105,7 +105,7 @@ typedef struct {
     StructInfo *structs;
     int nstructs;
     int nstrings;
-    int write_fn, space_fn, newline_fn; /* runtime externs, created on first use */
+    int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
     Fn *f;
     bool failed;
 } L;
@@ -343,7 +343,13 @@ static int find_gvar(L *l, const char *name) {
     return -1;
 }
 
-static bool is_builtin(const char *name) { return strcmp(name, "print") == 0; }
+enum { BUILTIN_PRINT, BUILTIN_FREE };
+static int builtin_index(const char *name) {
+    if (strcmp(name, "print") == 0) return BUILTIN_PRINT;
+    if (strcmp(name, "free") == 0) return BUILTIN_FREE;
+    return -1;
+}
+static bool is_builtin(const char *name) { return builtin_index(name) >= 0; }
 
 static Name lookup(L *l, const char *name) {
     Fn *f = l->f;
@@ -358,7 +364,7 @@ static Name lookup(L *l, const char *name) {
     if (fi >= 0) return (Name){NAME_FUNCTION, fi, false, T_ANY};
     int ei = find_ext(l, name);
     if (ei >= 0) return (Name){NAME_EXTERN, ei, false, T_ANY};
-    if (is_builtin(name)) return (Name){NAME_BUILTIN, 0, false, T_ANY};
+    if (is_builtin(name)) return (Name){NAME_BUILTIN, builtin_index(name), false, T_ANY};
     return (Name){NAME_NONE, 0, false, T_ANY};
 }
 
@@ -532,6 +538,28 @@ static Val lower_call(L *l, const Expr *e, int hint) {
     for (size_t i = 0; i < e->nargs; i++) args[i] = vals[i].v;
     int d = hint >= 0 ? hint : -1;
 
+    if (n.kind == NAME_BUILTIN && n.index == BUILTIN_FREE) {
+        /* free(x): releases a struct instance in --mm=manual (docs/DESIGN.md
+         * "Memory"); the same program compiles in every mode */
+        if (e->nargs != 1) {
+            lerr(l, e->line, e->col, "'free' expects 1 argument, got %zu", e->nargs);
+            goto done;
+        }
+        if (!(vals[0].ty & (TY_STRUCT | T_NIL))) {
+            char tn[300];
+            ty_name(l, vals[0].ty, tn, sizeof tn);
+            lerr(l, e->args[0]->line, e->args[0]->col, "free() expects a struct instance, got %s%s", tn,
+                 vals[0].ty == T_STR ? " (strings are freed automatically)" : "");
+            goto done;
+        }
+        emit_call(l, IR_NONE, runtime_extern(l, &l->free_fn, "luma_free", 1), args, 1, e->line);
+        if (hint != DISCARD) {
+            r = result(l, hint, &d);
+            emit(l, IR_CONST_NIL, e->line)->dst = d;
+            r.ty = T_NIL;
+        }
+        goto done;
+    }
     if (n.kind == NAME_BUILTIN) { /* print(a, b, ...): all arguments are evaluated before anything is written */
         int w = runtime_extern(l, &l->write_fn, "luma_write", 1);
         for (size_t i = 0; i < e->nargs; i++) {
@@ -1492,7 +1520,7 @@ bool lower_program(const Program *prog, IrModule *out) {
     L l = {0};
     l.path = prog->source_path;
     l.m = out;
-    l.write_fn = l.space_fn = l.newline_fn = -1;
+    l.write_fn = l.space_fn = l.newline_fn = l.free_fn = -1;
     Fn main_fn;
     int main_fi = ir_add_func(out, "luma_main", 0);
     collect_declarations(&l, prog);

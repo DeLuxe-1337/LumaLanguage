@@ -25,6 +25,17 @@ Every program is compiled and run at each level in DIFFTEST_LEVELS
 (default "0 1 2": the naive backend, the optimizing backend alone, and the
 IR optimizer plus the optimizing backend).
 
+Memory: each program is compiled with one --mm mode (DIFFTEST_MM, default by
+seed: manual, rc, manual, rc, none) and run with LUMA_MEMCHECK=1, so a use
+of freed memory becomes a runtime error and shows up as a mismatch. Under
+--mm=rc and --mm=none the reference interpreter also predicts which struct
+instances are still allocated at exit (none: all of them; rc: those
+reachable from globals, plus garbage cycles and what they reference), and
+the counts per struct must equal memcheck's report. Programs call free() on
+fresh local instances (safe in every mode) and occasionally on a hidden
+non-struct (a runtime error). DIFFTEST_VALGRIND=1 also runs every
+executable under valgrind.
+
 usage: tests/difftest.py [COUNT] [SEED]      (run from the repository root)
 """
 import os
@@ -40,6 +51,12 @@ LUMA = os.environ.get("LUMA", "build/luma")
 HAVE_AS = shutil.which("as") is not None
 # optimization levels every program is compiled and run at
 LEVELS = os.environ.get("DIFFTEST_LEVELS", "0 1 2").split()
+MM_FIXED = os.environ.get("DIFFTEST_MM")
+VALGRIND = os.environ.get("DIFFTEST_VALGRIND") == "1"
+
+
+def mm_for(seed):
+    return MM_FIXED or ("manual", "rc", "manual", "rc", "none")[seed % 5]
 
 
 class LumaError(Exception):
@@ -221,6 +238,7 @@ class Interp:
                 for m in f[2]:
                     self.methods[(f[1], m[1])] = ("fun", "%s::%s" % (f[1], m[1])) + m[2:]
         self.depth = 0
+        self.objects = []   # every struct instance created, for the memory oracle
 
     def guard(self, value, annotation, what):
         if annotation and type_of(value) != annotation:
@@ -263,7 +281,9 @@ class Interp:
             for f, _, a in self.structs[e[1]]:          # then each field's guard, in declaration order
                 self.guard(vals[f], a, "field '%s' of '%s'" % (f, e[1]))
                 fields[f] = vals[f]
-            return Obj(e[1], fields)
+            o = Obj(e[1], fields)
+            self.objects.append(o)
+            return o
         if k == "get":
             o = self.ev(e[1])
             if not isinstance(o, Obj):
@@ -285,6 +305,12 @@ class Interp:
                 raise LumaError("Only struct instances have methods, got %s." % type_of(o))
             fn = self.methods[(o.sname, e[2])]
             return self.invoke(fn, [o] + args, self_ann=o.sname)
+        if k == "call" and e[1] == "free":
+            v = self.ev(e[2][0])
+            if v is not None and not isinstance(v, Obj):
+                raise LumaError("free() expects a struct instance, got %s%s." %
+                                (type_of(v), " (strings are freed automatically)" if isinstance(v, str) else ""))
+            return None
         if k == "call":
             fn = self.funs[e[1]]
             args = [self.ev(a) for a in e[2]]      # all arguments, left to right
@@ -469,7 +495,7 @@ class Gen:
                 S, f, a = r.choice(gets)
                 obj = self.expr(S, depth - 1, exclude)
                 if r.random() < 0.15:   # an assignment to the field, used as a value
-                    return ("set", obj, f, self.slot_expr(t, a, depth - 1, exclude))
+                    return ("set", obj, f, self.field_value(S, f, t, a, depth - 1, exclude))
                 return ("get", obj, f)
         cands = [f for f in self.funs[:self.callable] if f[2] == t]
         if cands and r.random() < 0.15:
@@ -510,6 +536,16 @@ class Gen:
             wrong = self.r.choice([x for x in TYPES if x != t])
             return ("call", "dyn", [self.expr(wrong, depth - 1, exclude)])
         return self.expr(t, depth, exclude)
+
+    def field_value(self, S, f, t, annotation, depth, exclude=()):
+        """A value to store into field f. An untyped nil field sometimes gets a
+        struct instance instead: the field is `any` to the compiler, and reads
+        of it still behave like nil for the generator's purposes (printing,
+        equality, truthiness). This builds object graphs, including cycles,
+        for the memory oracle."""
+        if t == "nil" and annotation is None and self.structs and self.r.random() < 0.5:
+            return self.expr(self.r.choice(sorted(self.structs)), depth, exclude)
+        return self.slot_expr(t, annotation, depth, exclude)
 
     def ann_of(self, name):
         for sc in reversed(self.scopes):
@@ -565,7 +601,20 @@ class Gen:
             S = r.choice(sorted(self.structs))
             if self.structs[S]["fields"]:
                 f, ft, fa = r.choice(self.structs[S]["fields"])
-                return ("expr", ("set", self.expr(S, 2), f, self.slot_expr(ft, fa, 2)))
+                return ("expr", ("set", self.expr(S, 2), f, self.field_value(S, f, ft, fa, 2)))
+        if c < 0.655 and self.structs:   # a fresh local instance, read, then freed
+            S = r.choice(sorted(self.structs))
+            t = self.fresh("t")
+            fields = list(self.structs[S]["fields"])
+            r.shuffle(fields)
+            new = ("new", S, [(f, self.slot_expr(ft, fa, 2)) for f, ft, fa in fields])
+            body = [("var", t, new, S if r.random() < 0.5 else None)]
+            if self.structs[S]["fields"]:
+                body.append(("print", [("get", ("var", t), f) for f, _, _ in self.structs[S]["fields"]]))
+            body.append(("expr", ("call", "free", [("var", t)])))
+            return ("block", body)
+        if c < 0.66 and r.random() < 0.1:   # free() of something that is not a struct instance
+            return ("expr", ("call", "free", [("call", "dyn", [self.literal(r.choice(("int", "str", "bool")))])]))
         if c < 0.67:
             return ("expr", self.expr(self.any_type(), 2))
         if c < 0.71 and self.funs[:self.callable]:
@@ -610,6 +659,8 @@ class Gen:
         for _ in range(self.r.choice((0, 1, 2, 2, 3, 3))):
             t = self.r.choice(("int", "int", "str", "bool", "nil"))
             fields.append((self.fresh("x"), t, self.annotation(t)))
+        if self.r.random() < 0.6:   # an untyped link field: may hold instances (see field_value)
+            fields.append((self.fresh("x"), "nil", None))
         self.structs[name] = {"fields": fields, "methods": []}
         return ("struct", name, fields)
 
@@ -650,6 +701,59 @@ def generate(seed):
     return structs + impls + [DYN] + funs, prog
 
 
+def live_at_exit(it, mm):
+    """Struct instances still allocated when the program ends, by struct name."""
+    objs = it.objects
+    if mm == "none":
+        live = objs
+    else:
+        def succ(o, allowed):
+            return [v for v in o.fields.values() if isinstance(v, Obj) and id(v) in allowed]
+        everything = {id(o) for o in objs}
+        reach, stack = set(), [c[0] for c in it.scopes[0].values() if isinstance(c[0], Obj)]
+        while stack:
+            o = stack.pop()
+            if id(o) not in reach:
+                reach.add(id(o))
+                stack.extend(succ(o, everything))
+        garbage = [o for o in objs if id(o) not in reach]
+        gids = {id(o) for o in garbage}
+        def on_cycle(o):   # does o reach itself through garbage?
+            seen, stack = set(), list(succ(o, gids))
+            while stack:
+                x = stack.pop()
+                if x is o:
+                    return True
+                if id(x) not in seen:
+                    seen.add(id(x))
+                    stack.extend(succ(x, gids))
+            return False
+        surv, stack = set(), [o for o in garbage if on_cycle(o)]
+        while stack:
+            o = stack.pop()
+            if id(o) not in surv:
+                surv.add(id(o))
+                stack.extend(succ(o, gids))
+        live = [o for o in objs if id(o) in reach or id(o) in surv]
+    counts = {}
+    for o in live:
+        counts[o.sname] = counts.get(o.sname, 0) + 1
+    return counts
+
+
+def memcheck_counts(lines):
+    """Struct counts from memcheck's 'leaked:' and 'reachable from globals:' lines."""
+    counts = {}
+    for line in lines:
+        for tag in ("luma: memcheck: leaked: ", "luma: memcheck: reachable from globals: "):
+            if line.startswith(tag):
+                for part in line[len(tag):].split(", "):
+                    n, name = part.split(" ", 1)
+                    if name != "str":
+                        counts[name] = counts.get(name, 0) + int(n)
+    return counts
+
+
 def one(seed, workdir):
     funs, prog = generate(seed)
     src = "".join(render_s(f) for f in funs) + "".join(render_s(s) for s in prog)
@@ -664,21 +768,23 @@ def one(seed, workdir):
     want_out = "".join(line + "\n" for line in it.out)
     want_err = "" if err is None else "luma: runtime error: %s\n" % err
     want_rc = 0 if err is None else 1
+    mm = mm_for(seed)
+    want_live = live_at_exit(it, mm) if err is None and mm != "manual" else None
 
     path = os.path.join(workdir, "p.luma")
     with open(path, "w") as f:
         f.write(src)
     for level in LEVELS:
-        bad = compile_and_run(src, path, workdir, level, want_out, want_err, want_rc)
+        bad = compile_and_run(src, path, workdir, level, mm, want_out, want_err, want_rc, want_live)
         if bad:
-            return src, "at -O%s: %s" % (level, bad)
+            return src, "at -O%s --mm=%s: %s" % (level, mm, bad)
     return None
 
 
-def compile_and_run(src, path, workdir, level, want_out, want_err, want_rc):
+def compile_and_run(src, path, workdir, level, mm, want_out, want_err, want_rc, want_live):
     opt = "-O" + level
     exe = os.path.join(workdir, "p")
-    c = subprocess.run([LUMA, opt, path, "-o", exe], capture_output=True, text=True)
+    c = subprocess.run([LUMA, opt, "--mm=" + mm, path, "-o", exe], capture_output=True, text=True)
     if c.returncode != 0:
         return "compile failed:\n" + c.stderr
     # The emitted IR, compiled on its own, must give identical assembly.
@@ -701,11 +807,18 @@ def compile_and_run(src, path, workdir, level, want_out, want_err, want_rc):
             with open(g + ".l", "rb") as a, open(g + ".g", "rb") as b:
                 if a.read() != b.read():
                     return "section %s differs from GNU as" % sec
-    r = subprocess.run([exe], capture_output=True, timeout=30)
+    env = dict(os.environ, LUMA_MEMCHECK="1")
+    cmd = ["valgrind", "-q", "--error-exitcode=99", exe] if VALGRIND else [exe]
+    r = subprocess.run(cmd, capture_output=True, timeout=300 if VALGRIND else 30, env=env)
     got_out, got_err = r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+    lines = got_err.splitlines(True)
+    mc = [l.rstrip("\n") for l in lines if l.startswith("luma: memcheck:")]
+    got_err = "".join(l for l in lines if not l.startswith("luma: memcheck:"))
     if (got_out, got_err, r.returncode) != (want_out, want_err, want_rc):
         return ("expected rc=%d out=%r err=%r\n     got rc=%d out=%r err=%r"
                 % (want_rc, want_out, want_err, r.returncode, got_out, got_err))
+    if want_live is not None and memcheck_counts(mc) != want_live:
+        return "struct instances alive at exit: expected %r, memcheck reports %r\n%s" % (want_live, memcheck_counts(mc), "\n".join(mc))
     return None
 
 

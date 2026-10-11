@@ -521,6 +521,11 @@ static bool parse_instr(P *p, int fi, int bi) {
         next(p);
         return parse_callm_tail(p, fi, bi, IR_NONE, line);
     }
+    if (is_ident(p, "retain") || is_ident(p, "release")) {
+        perr(p, line, "'%s' is inserted by the compiler's memory pass and cannot be written in LIR "
+                      "(declare `memory manual` or `memory rc` instead)", p->tok.text);
+        return false;
+    }
     if (is_ident(p, "store")) {
         next(p);
         IrInstr *in = ir_emit(f, bi, IR_STORE);
@@ -807,6 +812,16 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
     out->source = xstrdup((char *)p.tok.str.data);
     next(&p);
     if (!expect_nl(&p)) goto fail;
+    skip_nl(&p);
+    if (is_ident(&p, "memory")) { /* memory none|manual|rc (v0.6) */
+        next(&p);
+        if (is_ident(&p, "none")) out->mm = IR_MM_NONE;
+        else if (is_ident(&p, "manual")) out->mm = IR_MM_MANUAL;
+        else if (is_ident(&p, "rc")) out->mm = IR_MM_RC;
+        else { perr(&p, p.tok.line, "expected a memory mode (none, manual or rc)"); goto fail; }
+        next(&p);
+        if (!expect_nl(&p)) goto fail;
+    }
     for (;;) {
         skip_nl(&p);
         if (p.failed) goto fail;
