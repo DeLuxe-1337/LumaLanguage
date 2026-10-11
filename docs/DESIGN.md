@@ -21,7 +21,7 @@ The intermediate representation (LIR) has its own specification in
 INPUT.luma
    │  src/lexer.c        bytes → tokens (Lox token set)
    │  src/parser.c       tokens → AST (src/ast.h); `for` is desugared to `while`
-   │  src/prelude.c      + the prelude's AST (std/prelude.luma, built in), as far as used
+   │  src/prelude.c      + the prelude and std library ASTs (std/*.luma, built in), as far as used
    ▼
    │  src/lower.c        AST → LIR: static scoping, short-circuit logic   ──► OUT.lir
    ▼           (INPUT.lir enters here: src/ir_parse.c)
@@ -133,7 +133,7 @@ Differences from reference Lox:
 | Types | none | optional gradual annotations (see below); doomed operations such as `1 + "a"` are compile errors |
 | C interop | none | `extern fun` with C types (see below) |
 | Undefined names | runtime errors | compile errors; a global read before its declaration executes is a runtime error |
-| Strings | multi-line, no escapes | single line; `\"` `\\` `\n` `\t` |
+| Strings | multi-line, no escapes | single line; `\"` `\\` `\n` `\r` `\t` |
 | Objects | `class`, `this`, `super`, inheritance | `struct` + `impl` (see below); `class` is rejected with a hint to use them; no inheritance |
 | Float literals | yes | rejected ("not supported yet") |
 
@@ -480,6 +480,73 @@ What changed for programs, compared with the built-in `Rc` of milestone 8:
 | `print(r)` | `Rc(…)` from C | `Rc(…)` from `Rc.show`, which builds its text as strings |
 | errors | Rc-specific messages | the general ones (`shared struct`, `move`, `has no field … through deref`) |
 
+## The standard library (milestone 10)
+
+`std/` holds the prelude (`prelude.luma`: `Rc`, `Arena`) and the library
+modules `math`, `str`, `list`, `file`, `sys`, `random` and `c`, all
+ordinary Luma. The README lists what each has; this section is how it is
+put together.
+
+**Built in, merged as used.** The Makefile turns every file into a C
+string (`build/obj/prelude_src.c`, prelude first, then `STD_MODULES` in
+order), so `luma` needs nothing at run time and compiled programs need only
+`libluma_rt.a`. `prelude_load` parses them all, shifting each file's line
+numbers by 1,000,000 × (its index + 1); diagnostics print such a line as
+`<prelude>:L:C` or `<std/str.luma>:L:C`. `with_prelude` (lower.c) then
+appends to the program only the library declarations it reaches:
+
+1. Names the program mentions: struct names in types, literals and `X::f`
+   calls, called functions, and `Arena` for an arena block. Names the
+   program defines itself don't count.
+2. A library struct (with its `impl`s), function or `extern fun` with a
+   mentioned name is included, and what *it* mentions is added; repeat
+   until nothing changes.
+3. If a name the library needs is also the program's own, that is a
+   compile error (`'List' is defined by the program and by the standard
+   library (<std/list.luma>), which needs its own`). The prelude's names,
+   and every name starting with `__`, are reserved outright.
+
+Hello world mentions only `print`, so it compiles exactly as before.
+
+**Namespaces.** Without modules, each library module is a struct with no
+fields and associated functions (`struct Math {}`, `Math::gcd`). Types
+(`List<T>`, `File`, `Date`, `Random`) are structs with methods.
+
+**Shared types.** The library's types are `shared` structs: freed
+automatically, like strings. That suits values a program passes around
+freely (a list of lines, a date) and keeps manual memory for the program's
+own data. A `List` holds references to its items and doesn't own them.
+`File` releases its `FILE*` and its buffer in `drop`.
+
+**Primitives.** A few things can't be written in Luma yet: there are no
+arrays, no byte access to strings, and no way to reach `argv`. The runtime
+provides them as intrinsics that only `std/` code may call (`__name(…)`,
+the same mechanism as the prelude's arena functions):
+
+| Intrinsic | Runtime | Does |
+|---|---|---|
+| `__array_new(n)`, `__array_len`, `__array_get`, `__array_set`, `__array_sort` | `luma_array_*` | A counted array object (`LUMA_TYPE_ARRAY`: header, length, items). It holds references, is released item by item, and memcheck walks it. `List<T>` is built on it |
+| `__str_len`, `__str_byte`, `__str_char`, `__str_slice`, `__str_find`, `__str_cmp`, `__str_case`, `__str_join` | `luma_str_*` | Byte-level string operations; `join` builds a string from an array in one pass |
+| `__str_from_int`, `__str_to_int` | | Decimal conversion (`to_int` gives nil for anything but an optional sign and digits) |
+| `__argc`, `__argv(i)` | `luma_argc`, `luma_argv` | The command line (`main` keeps `argc`/`argv`) |
+| `__mem_string(p, n)`, `__mem_write(p, s)` | | Copies between C memory and Luma strings |
+| `__type(v)`, `__show(v)`, `__fail(msg)` | | A value's type name, its printed form, a runtime error |
+
+Every other C call goes through `extern fun`, with `__` names bound to the C
+symbols (`extern "fopen" fun __fopen(...)`), so a program's own `fopen`
+declaration, with any signature, never collides with the library's. The
+read-only primitives are on the list of runtime calls that free nothing
+(`opt_runtime_frees_nothing`). So the memory pass's borrowed reads and the
+optimizer's field forwarding work across them, and `list.get(i)` in a loop
+costs no reference counting for the list.
+
+**Testing.** `tests/pos/std_text`, `std_file` and `std_sys` run every
+module at each level in both memory modes, with the same output (files are
+closed explicitly, since `--mm=none` runs no `drop`). `tests/rt/std_*` cover
+the error messages, and `neg/std_*` the name rules. The difftest calls
+`Math::abs/min/max`, `Str::len/upper/from_int` inside generated
+expressions, modelled in its interpreter (byte lengths, ASCII-only case).
+
 ## Memory (milestones 7 to 9)
 
 Memory is manual by default, with two tools for the cases where manual
@@ -794,8 +861,10 @@ puts("hi");
 and `.so` arguments are passed to the linker, and libc needs no flags.
 `extern` declarations go at top level, every parameter must be typed, and a
 return type is required (`void` for none). The C symbol has the same name as
-the Luma function. Names starting with `luma_` are reserved, and at most 6
-parameters are allowed for now.
+the Luma function, unless written before `fun`: `extern "free" fun
+c_free(p: ptr): void;` (for C names that clash with Luma's, or two
+declarations of one C function). Names starting with `luma_` are reserved,
+and at most 6 C parameters are allowed for now.
 
 | C type | Luma type | Argument conversion | Result conversion |
 |---|---|---|---|
@@ -821,8 +890,64 @@ to a `cstr`. Everything else is checked by the converters at runtime. Values
 are never truncated silently: narrowing happens only when C itself returns a
 narrow type.
 
-Not supported yet: `f32`/`f64` (Luma has no floats), structs, callbacks,
-variadic declarations, and more than 6 parameters.
+### C structs (milestone 10)
+
+```js
+extern struct timespec { tv_sec: i64, tv_nsec: i64 }
+extern struct div_t { quot: i32, rem: i32 }
+extern fun clock_gettime(clock: i32, ts: *timespec): i32;
+extern fun div(n: i32, d: i32): div_t;
+```
+
+**Layout.** System V x86-64: each field (`i8`…`u64`, `bool`, `ptr`, `cstr`,
+`cstr?`) is aligned to its size, and the struct's size is rounded up to its
+largest field. `ir_cstruct_set_fields` computes it, so a `.lir` file
+describes the same layout (`cstruct S {a: i64, ...}`). The descriptor
+points to a `LumaCLayout` (size, names, C types, offsets) and has the flag
+`LUMA_STRUCT_C`.
+
+**Values.** A C struct value is a counted struct instance with two hidden
+fields: `__ptr`, the address of its C memory as a Luma int, and `__owned`.
+Counting it makes it automatic, like a string; it holds no Luma
+references.
+- `S { … }` lowers to `new S(0, 0)`, `luma_cs_init` (calloc, rounded up to
+  16 bytes, owned), and `luma_cs_set` for each given field. Fields not given
+  are zero.
+- Owned memory is freed with the instance (in the release worklist). Views
+  (`*S` results, `S::at`) have `__owned` = 0 and are never freed by Luma.
+- `s.f` lowers to `luma_cs_get(s, k)` plus a `check` to the field's Luma
+  type, and `s.f = v` to `luma_cs_set(s, k, v)`. The runtime converts with
+  the FFI argument and result converters, so ranges are checked the same way
+  (`field 'small' of S: 300 does not fit in i8.`). Untyped access goes
+  through `luma_getfield`/`luma_setfield`, which look up C fields by name.
+  `cstr` fields are read-only: writing a pointer to a Luma string into C
+  memory would dangle.
+- `S::size()`, `S::addr(s)` and `S::at(address)` are available unless the
+  struct's `impl` defines those names.
+
+**Calls.**
+
+| In the signature | Passed / returned as | Lowering |
+|---|---|---|
+| `*S`, `*S?` parameter | the address (`ptr`); `nil` → NULL for `*S?` | `luma_cs_addr(s)`, then `keep %s` after the call: the address alone does not keep the value alive, and its memory would be freed before C reads it |
+| `S` parameter (≤ 16 bytes) | one or two eightbytes in integer registers | the C parameter list gets `cs0` (and `cs1`) entries, both taking the struct value; the converters `luma_ffi_arg_cs0/cs1` read its words |
+| `*S`, `*S?` result | a view of C's memory; NULL → `nil` for `*S?`, else a runtime error | `new S(addr, 0)`, then `luma_cs_view` |
+| `S` result (≤ 16 bytes) | `rax`:`rdx` | the C global's result type is `struct S`; the backends call `luma_ffi_ret_cs(rax, rdx, ctx, &descriptor)`, which boxes a new owned value |
+
+Only integer fields exist (there are no floats), so every struct of up to 16
+bytes is passed in INTEGER registers, and larger ones would go in memory.
+Larger by-value structs are a compile error that suggests `*S`. An argument
+in two registers counts twice toward the 6-register limit.
+
+`tests/ffi/structs.luma` checks the ABI against C helpers in
+`ffi_helper.c`: one- and two-eightbyte structs both ways, a struct between
+other arguments, padding (`{u8 r, g, b; u16 w}` is 6 bytes with `w` at 4),
+writes through a pointer, a view of a C static, and NULL. The library's
+`Sys::time` and `Sys::date` use `clock_gettime` and `gmtime_r`.
+
+Not supported yet: `f32`/`f64` (Luma has no floats), nested structs, arrays
+and unions in C structs, by-value structs over 16 bytes, callbacks, variadic
+declarations, and more than 6 parameters.
 
 ## Runtime (`runtime/luma_rt.c` → `build/libluma_rt.a`)
 

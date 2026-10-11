@@ -1,4 +1,4 @@
-# LIR: the Luma intermediate representation (spec v0.8)
+# LIR: the Luma intermediate representation (spec v0.9)
 
 **Status:** implemented in milestone 2 and extended since: section 15 (v0.2,
 milestone 3), section 16 (v0.3, milestone 4), section 17 (v0.4, milestone
@@ -8,7 +8,8 @@ milestone 3), section 16 (v0.3, milestone 4), section 17 (v0.4, milestone
 milestone 8: `Rc` and `Arena` builtin structs, `keep`, `memory rc`
 removed) and section 21 (v0.8, milestone 9: generic instances, shared
 structs, `move` parameters, `drop`/`show` hooks; the builtin structs of
-section 20 removed). The decisions
+section 20 removed) and section 22 (v0.9, milestone 10: C structs, C
+symbol names, the standard library's runtime functions). The decisions
 in section 13 are resolved, and the places where the implementation refined
 the original draft are listed in section 14.
 **Scope:** this spec covers:
@@ -1050,4 +1051,70 @@ compile error. The flag changes no code.
 `luma_method` may return a trampoline for a receiver that lacks the method
 but has `deref`; compiled code calls it at once with the receiver and the
 arguments, as it would the method.
+
+## 22. v0.9 additions (milestone 10)
+
+### C structs
+
+```
+cstruct timespec {tv_sec: i64, tv_nsec: i64}
+cstruct Mixed {r: u8, g: u8, b: u8, w: u16}
+```
+
+- A `cstruct` is declared with C field types (`i8`…`u64`, `bool`, `ptr`,
+  `cstr`, `cstr?`). Its layout follows from them (System V: each field
+  aligned to its size; the size rounded to the largest), so it is not
+  written: `Mixed` has `w` at offset 4 and size 6.
+- Its *Luma* fields are implicit: `__ptr: int` (the address of its C
+  memory) and `__owned: int` (1 when the value frees that memory). It is
+  shared (every `new` is counted). `getfield %s, timespec.__ptr` reads the
+  address.
+- The C fields are not IR fields: lowering reaches them through runtime
+  calls with the field's index (below).
+
+### C functions: symbols and structs
+
+```
+extern c fn @__fopen(path: cstr, mode: cstr): ptr symbol "fopen"
+extern c fn @pair64_sum(p: cs0, p: cs1): i64
+extern c fn @div(n: i32, d: i32): struct div_t
+```
+
+- `symbol "S"`: the C symbol called, when it differs from the global's name.
+  Several globals may call one symbol.
+- `cs0`, `cs1`: the first and second eightbyte of a C struct passed by
+  value. Lowering passes the struct value for each, after a `check` of its
+  type; the converters `luma_ffi_arg_cs0/cs1` read its words.
+- `struct S` as the result: a C struct returned by value (at most 16
+  bytes). The backends pass `rax`, `rdx`, the context string and S's
+  descriptor to `luma_ffi_ret_cs`, which returns a new owned value; the
+  result's IR type is `any` (lowering checks it to `S`).
+- `*S` parameters and results are plain `ptr` here. Lowering converts with
+  the runtime functions below and ends each `*S` argument's lifetime after
+  the call with `keep`.
+
+### Struct descriptors
+
+```
+.Lstruct.K:    .quad K+1, .Lsname.K, <nfields>, .Lsfields.K, .Lsftys.K, <nmethods>, .Lsmeth.K, <drop>, <show>, <flags>, <c layout>
+.Lscl.K:       .quad <size>, <nfields>, .Lscln.K, .Lsclt.K, .Lsclo.K      ; C field names, C types, offsets
+```
+
+`<flags>` gains bit 1 (`LUMA_STRUCT_C`); `<c layout>` is 0 for other
+structs. C types are numbered as in `CType` (`i8` = 0 … `ptr` = 11; the
+runtime's `LUMA_CT_*`).
+
+### Runtime functions
+
+| Function | Called for |
+|---|---|
+| `luma_cs_init(s)` | a C struct literal, after `new S(0, 0)`: zeroed, owned C memory |
+| `luma_cs_get(s, k)`, `luma_cs_set(s, k, v)` | C field k of s (k a constant int) |
+| `luma_cs_addr(s)` | a `*S` argument, `S::addr(s)`: the address (0 for nil) |
+| `luma_cs_view(o, nullable, context)` | a `*S` result or `S::at(p)`, after `new S(address, 0)`: o, or nil / an error for NULL |
+| `luma_array_*`, `luma_str_*`, `luma_argc`, `luma_argv`, `luma_mem_*`, `luma_type_name`, `luma_fail` | the standard library's intrinsics (docs/DESIGN.md) |
+
+The runtime adds a third object type, `LUMA_TYPE_ARRAY` (3): header (type,
+count at offset 4), length, items. Arrays are counted like strings, hold
+references to their items, and are reached only through these functions.
 
