@@ -346,6 +346,9 @@ Refinements:
 - A call whose result is discarded still gets its result released.
 - The operands of a compare that the backend fuses with the following `br`
   are released on the branch's edges instead, so the fusion survives.
+- An operand that dies at an operation that only succeeds on fixnums (`sub`,
+  `mul`, `div`, `mod`, `neg`, ordered compares) needs no release: if
+  execution gets past it, the value was a fixnum.
 
 **Which vregs need operations at all.** Only vregs that may hold a counted
 object get any. That excludes:
@@ -438,17 +441,23 @@ runs exactly the old instructions. Struct type checks compare only the low
 high half. At `-O0`, every operation is a call to `luma_retain` or
 `luma_release`.
 
-Benchmarks at `-O2` (wall time, best of 5):
+Benchmarks at `-O2` (wall time, best of 5; differences of about 10% are
+within run-to-run noise on the build machine):
 
 | Benchmark | `none` | `manual` | `rc` |
 |---|---|---|---|
-| fib(37), untyped | 0.11 s | 0.11 s | 0.11 s |
-| fib(37), typed | 0.11 s | 0.11 s | 0.11 s |
+| collatz | 0.33 s | 0.32 s | 0.32 s |
+| fib(37), untyped | 0.10 s | 0.12 s | 0.13 s |
+| fib(37), typed | 0.12 s | 0.11 s | 0.11 s |
+| loop_sum | 0.11 s | 0.11 s | 0.11 s |
+| primes | 0.58 s | 0.53 s | 0.58 s |
 | strings (3M concatenations) | 0.007 s | 0.008 s | 0.008 s |
-| structs (20M method calls, list walks) | 0.14 s | 0.10 s | 0.10 s |
+| structs (20M method calls, list walks) | 0.10 s | 0.11 s | 0.11 s |
 
-(The structs benchmark got faster than before this milestone because
-devirtualized calls now skip the checking `.dyn` wrapper.)
+The structs benchmark got faster than before this milestone (0.14 s),
+because devirtualized calls now skip the checking `.dyn` wrapper. The
+runtime's generic operations now test for two fixnums before anything else,
+which made the `-O0` column faster too (e.g. loop_sum 1.00 s → 0.69 s).
 
 ### Limits and next steps
 

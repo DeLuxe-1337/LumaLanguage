@@ -210,17 +210,21 @@ make bench       # benchmarks at -O0 and -O2
 ```
 
 Every test program runs at `-O0`, `-O1` and `-O2`. Benchmarks on the build
-machine (`make bench`, wall time):
+machine (`make bench`, best of 5, wall time):
 
 | Benchmark | `-O0` | `-O2` | Speedup |
 |---|---|---|---|
-| collatz (1M starts) | 2.41 s | 0.38 s | 6.4× |
-| fib(37), untyped | 0.35 s | 0.11 s | 3.1× |
-| fib(37), typed | 0.34 s | 0.12 s | 2.9× |
-| loop_sum (100M iterations) | 1.02 s | 0.12 s | 8.8× |
-| primes (to 2M) | 1.97 s | 0.61 s | 3.2× |
-| strings (3M concatenations) | 0.15 s | 0.007 s | 20.6×* |
-| structs (20M method calls, list walks) | 2.07 s | 0.18 s | 11.5× |
+| collatz (1M starts) | 1.74 s | 0.32 s | 5.5× |
+| fib(37), untyped | 0.38 s | 0.12 s | 3.1× |
+| fib(37), typed | 0.32 s | 0.11 s | 3.0× |
+| loop_sum (100M iterations) | 0.69 s | 0.11 s | 6.2× |
+| primes (to 2M) | 1.51 s | 0.53 s | 2.9× |
+| strings (3M concatenations) | 0.09 s | 0.008 s | 11.7×* |
+| structs (20M method calls, list walks) | 1.52 s | 0.11 s | 14.3× |
+
+These are in the default `--mm=manual`. At `-O2` the three memory modes are
+within a few percent of each other on every benchmark (`docs/DESIGN.md`,
+"Memory").
 
 \* The loop's `"x" + "y"` is loop-invariant, so `-O2` computes it once.
 Strings are immutable and compared by content, so this is not observable.
