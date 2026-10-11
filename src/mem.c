@@ -329,6 +329,16 @@ static int collect_uses(const IrInstr *in, UseCount *u) {
 
 static bool result_borrowed(IrOp op) { return op == IR_LOAD || op == IR_GETFIELD; }
 
+/* Operations that fail (a runtime error) unless every operand is a fixnum:
+ * after them an operand that dies needs no release. */
+static bool int_only_op(IrOp op) {
+    switch (op) {
+    case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD: case IR_NEG:
+    case IR_LT: case IR_LE: case IR_GT: case IR_GE: return true;
+    default: return false;
+    }
+}
+
 /* Runtime functions that return nil. */
 static bool extern_returns_nil(const char *name) { return extern_borrows(name) || strcmp(name, "luma_free") == 0; }
 
@@ -534,7 +544,7 @@ static void lower_func(Mem *mm, IrFunc *f) {
         int line = term.line;
         if (term.op == IR_BR) {
             if (term.a >= 0) bit_set(live, term.a);
-            if (fj >= 0) {
+            if (fj >= 0 && !int_only_op(bl->instrs[fj].op)) { /* (an ordered compare's operands are ints after it) */
                 const IrInstr *c = &bl->instrs[fj];
                 if (c->a >= 0) bit_set(live, c->a);
                 if (c->b >= 0) bit_set(live, c->b);
@@ -597,7 +607,8 @@ static void lower_func(Mem *mm, IrFunc *f) {
                 int v = uc[i].v;
                 if (!managed[v]) continue;
                 bool dies = v == d || !bit_get(live, v);
-                if (k == fj) dies = false; /* released on the br's edges instead */
+                if (k == fj && !int_only_op(in.op)) dies = false; /* released on the br's edges instead */
+                if (int_only_op(in.op) && uc[i].consume == 0) dies = false; /* a fixnum if we get past it */
                 int retains = uc[i].consume;
                 if (!borrowed[v] && dies) {
                     if (uc[i].consume > 0) {

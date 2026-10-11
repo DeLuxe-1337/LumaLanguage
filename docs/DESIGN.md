@@ -1,10 +1,11 @@
-# Luma bootstrap compiler: design notes (milestone 6)
+# Luma bootstrap compiler: design notes (milestone 7)
 
 This document describes how the Luma toolchain is built. Its sections cover:
 
 - the pipeline and its modules
 - the language subset accepted today
 - optional types, structs and `impl` blocks, and the C FFI
+- memory management: manual, reference counting, and the analyses behind them
 - the C runtime
 - the optimizer and the two code generators
 - the x86-64 assembler (encodings, relaxation, relocations)
@@ -27,6 +28,8 @@ INPUT.luma
    ▼           (src/ir_types.c: type inference, shared with the stages below)
    │  src/opt*.c         -O2: SSA optimizer (src/cfg.c analyses)          ──► OUT.opt.lir
    │  src/ir_verify.c    the optimized IR must verify too
+   ▼
+   │  src/mem.c          --mm=manual|rc: escape analysis, retain/release      ──► OUT.mem.lir
    ▼
    │  src/x86_gen.c      -O1/-O2: LIR → x86-64, register allocated        ──► OUT.s
    │  src/x86_isel.c     -O0: LIR → x86-64, one stack slot per vreg
@@ -55,6 +58,7 @@ Every stage can be inspected or tested on its own:
 | lexer, parser | `--dump-tokens` / `--dump-ast` |
 | lowering | the `.lir` file |
 | optimizer | `OUT.opt.lir` (`--dump-opt-ir`); `-O1` skips it, `-O0` also uses the naive backend |
+| memory pass | `OUT.mem.lir` (`--dump-mem-ir`): which allocations are counted, every retain and release |
 | backend | `.lir` files are accepted as input |
 | assembler | the `lasm` command and `tests/unit/test_asm.c` |
 | ELF writer | `tests/unit/test_elf.c`, which builds an `ObjFile` by hand |
@@ -268,11 +272,195 @@ The optimizer often turns dynamic accesses into static ones: after
 `@m.P.name` (shown as `P::name` in messages). Struct descriptors are emitted
 as `.Lstruct.K`, field and method names as `.Lname.NAME`.
 
-**Memory.** Instances are allocated by `luma_alloc` and never freed, like
-runtime strings; there is no GC yet. Every heap allocation in the runtime goes
-through that one function, and every object begins with a header word that
-identifies its layout, so a collector can be added without changing the
-object format (the memory-management plan is a separate document).
+**Memory.** How instances are freed depends on the memory mode: `free()`
+in `--mm=manual` (or automatically for instances that never leave their
+function), reference counting in `--mm=rc`. See "Memory" below.
+
+## Memory (milestone 7)
+
+Every compilation chooses one memory-management mode with `--mm`:
+
+| Mode | Struct instances | Strings | `free(x)` |
+|---|---|---|---|
+| `manual` (default) | yours: freed by `free(x)`; the compiler also frees instances it can prove never leave their function | freed automatically at their last use | frees `x` and releases the strings in its fields |
+| `rc` | reference counted: freed when the last reference goes away; cycles leak | reference counted | checks its argument, frees nothing |
+| `none` | never freed | never freed | checks its argument, frees nothing |
+
+The same program compiles in every mode, and its output never depends on
+the mode. `--mm=none` is the old behaviour and the fastest choice for
+short-lived programs. Programs written for `manual` run unchanged under `rc`,
+which is a way to find out whether they free everything.
+
+**`free(x)`** is a builtin, like `print`.
+- `x` must be a struct instance or `nil`. `free(nil)` does nothing.
+- `free("text")` and `free(1)` are compile errors when the type is known. At
+  run time they are errors in every mode:
+  `free() expects a struct instance, got str (strings are freed automatically).`
+- After `free(x)`, using `x` (or freeing it again) is an error in every mode:
+  - A compile error when it happens on every path, checked on the lowered IR
+    before optimization: `'p' is used after free(p) on line 4`.
+  - Through an alias it is undefined behaviour in `manual` mode, as in C.
+    `LUMA_MEMCHECK=1` turns it into a runtime error (below).
+
+### Ownership and reference counts
+
+A counted object's count is the number of **references** that hold it. A
+reference is held by:
+- a vreg (a local value);
+- a struct field;
+- a global variable.
+
+The compiler inserts the operations that keep the count exact, in a pass
+over the final IR (`src/mem.c`, `mem_lower`, after the optimizer). It works
+from three rules:
+
+- **Operands are consumed or borrowed.**
+  - Consumed: the instruction takes over the reference. This is the case for
+    `mov`/`check` (the result holds it), `store` and the value of `setfield`
+    (the slot holds it), the arguments of `new` (the fields hold them), and
+    `ret`.
+  - Borrowed: every other use, including call arguments. **Parameters are
+    borrowed**: the caller keeps its reference alive for the call, so passing
+    an object costs nothing.
+- **Results are owned.** New objects, call results, `mov` and the like are
+  owned. `load` and `getfield` are the exceptions: they return the slot's
+  reference, so they are followed by a `retain`.
+- **Every owned reference is released exactly once, where liveness says it
+  dies.**
+  - A consumed operand that dies at that use is *moved* (no operation); one
+    that is still live is retained first.
+  - A borrowed operand that dies is released right after the instruction.
+  - An unused result is released immediately.
+  - A value that is live out of a block but not into one of its successors
+    is released on that edge. The release goes at the start of the
+    successor, or in a new block when the edge is critical.
+  - Overwriting a global or a field releases the old value: `store` and
+    static `setfield` carry a flag the backends act on, and dynamic
+    `setfield` is handled by the runtime.
+
+Refinements:
+- A parameter the function reassigns is retained on entry, so it owns its
+  value from then on.
+- A `mov` or `check` copy of a borrowed value that is never handed on stays
+  borrowed (the `.dyn` method wrappers need no operations at all).
+- A call whose result is discarded still gets its result released.
+- The operands of a compare that the backend fuses with the following `br`
+  are released on the branch's edges instead, so the fusion survives.
+
+**Which vregs need operations at all.** Only vregs that may hold a counted
+object get any. That excludes:
+- ints, booleans and nil, by flow-insensitive type inference over every
+  definition;
+- vregs that only ever hold string literals (static, never counted);
+- in `manual` mode, struct types that never have counted instances.
+
+Typed integer code is therefore unchanged: `fib(n: int)` has no reference
+counting at all.
+
+**Escape analysis (`manual` mode).** An allocation site's instances are
+counted, and so freed automatically, when they provably never leave the
+local values of their function. The analysis is interprocedural and works as
+follows:
+- Vregs connected by `mov`/`check` form a class (union-find).
+- A class escapes when one of its vregs is:
+  - stored (`store`, a `setfield` value, a `new` argument);
+  - returned;
+  - passed to `free`;
+  - passed to a parameter that escapes, or to an unknown external function.
+- A parameter escapes when its class does. This is a least fixpoint over
+  all functions.
+- A dynamic `callm` can only reach a method of that name and arity in some
+  struct's table, so it escapes only if one of those methods' parameters
+  does.
+
+Everything else stays manual: no count, never touched by retain/release, and
+the program's to free.
+
+```js
+fun dist2(a: int, b: int): int {
+  var p = Point { x: a, y: b };   // never stored, returned or freed:
+  return p.len2();                // counted, freed after the call
+}
+```
+
+### Runtime
+
+- **Header.** Bits 32–63 of the header word are the count, at offset 4. A
+  count of 0 means *not counted*: string literals, everything in `none`, and
+  manual struct instances.
+- **Allocation.** Strings created at run time are counted unless the mode is
+  `none`. `luma_new_struct(desc, counted)` gets `counted` from the compiler.
+- **Freeing.** At count 0 the object is destroyed: its fields are released,
+  and objects whose count reaches 0 in turn go on a worklist. Destruction is
+  iterative, so dropping the head of a million-node list frees the whole
+  chain without deep C recursion.
+- **The manual pool.** Manual struct instances come from per-size free
+  lists, and their memory is never returned to `malloc`. So a stale
+  reference still reads a header with count 0, and the compiler's own
+  retain/release on it stays a no-op instead of corrupting another object.
+- **Functions:** `luma_retain`, `luma_release` (-O0), `luma_rc_free` (the
+  last reference; called by the inline fast paths), `luma_free`.
+- **Double free.** A freed object's header type becomes `LUMA_TYPE_FREED`.
+  `free` of such an object reports `Double free: this object was already
+  freed.`, and any runtime operation on it reports `Use after free.`
+
+**`LUMA_MEMCHECK=1`** (an environment variable for the compiled program):
+- Freed memory is never reused.
+- Fields of freed instances read as `LUMA_POISON`, a value with the unused
+  tag `100`. The next runtime operation on it reports `Use after free.`, as
+  does a fault at its address (when typed code dereferences it).
+- At exit, the objects still allocated are reported. Those reachable from a
+  global variable (via the `luma_globals` table the compiler emits) are
+  listed separately from those lost:
+
+```
+luma: memcheck: --mm=rc, 1016 allocated, 1009 freed, 3 leaked, 4 reachable from globals
+luma: memcheck: leaked: 3 Pair
+luma: memcheck: reachable from globals: 1 Node, 3 Pair
+```
+
+### Code generation
+
+| Operation | `-O1`/`-O2` |
+|---|---|
+| `retain %v` | `test v, 7; jnz done` (not an object); `cmp dword ptr [v + 4], 0; je done` (not counted); `add dword ptr [v + 4], 1` |
+| `release %v` | `test v, 7; jnz done`; `cmp dword ptr [v + 4], 1; jb done` (0: not counted); `je last`; `sub dword ptr [v + 4], 1`. `last:` is an out-of-line stub calling `luma_rc_free` that keeps the live registers |
+| `store` / static `setfield` releasing | the old value goes to `r10` before the write, then the release sequence (plus a zero test for a never-assigned global) |
+| `new` | `mov esi, 0/1` (counted) before `call luma_new_struct` |
+
+The backend skips the tag test when the value cannot be an immediate, and
+skips the operation entirely when its flow-sensitive types prove the value
+is not an object. One more trick: the releases of an `add`'s operands right
+after it are emitted only on the add's slow path, because on the inline
+fast path both operands were fixnums. So untyped `fib(n - 1) + fib(n - 2)`
+runs exactly the old instructions. Struct type checks compare only the low
+32 bits of the header (`cmp dword ptr [r], HDR`), since the count is in the
+high half. At `-O0`, every operation is a call to `luma_retain` or
+`luma_release`.
+
+Benchmarks at `-O2` (wall time, best of 5):
+
+| Benchmark | `none` | `manual` | `rc` |
+|---|---|---|---|
+| fib(37), untyped | 0.11 s | 0.11 s | 0.11 s |
+| fib(37), typed | 0.11 s | 0.11 s | 0.11 s |
+| strings (3M concatenations) | 0.007 s | 0.008 s | 0.008 s |
+| structs (20M method calls, list walks) | 0.14 s | 0.10 s | 0.10 s |
+
+(The structs benchmark got faster than before this milestone because
+devirtualized calls now skip the checking `.dyn` wrapper.)
+
+### Limits and next steps
+
+- Reference cycles leak in `rc` mode; memcheck lists them. Planned options:
+  weak fields, or a cycle collector over counted objects (trial deletion).
+- The escape analysis only follows values through vregs. An instance stored
+  in a field of another local instance counts as escaping.
+- The ownership pass is per function and does not remove retain/release
+  pairs across instructions (beyond moves on last use); there is no
+  "borrow" of field values across code that cannot write them.
+- Strings and counted objects are allocated with `malloc` directly; a size-
+  class allocator would make the frequent small allocations cheaper.
 
 ## C FFI (`extern fun`)
 
@@ -331,14 +519,15 @@ which calls `luma_main()`, flushes stdout, and exits with status 0.
 | `luma_check_type(v, mask, context)` | the runtime guard at typed boundaries (returns `v`) |
 | `luma_int_overflow()`, `luma_div_zero()` | noreturn error exits of the inline fast paths |
 | `luma_ffi_arg_<ctype>`, `luma_ffi_ret_<ctype>` | FFI converters, with range and type checks |
-| `luma_new_struct(desc)` | allocates an instance with every field `nil`; the compiled code then stores the initializers |
-| `luma_getfield(o, name)`, `luma_setfield(o, name, v)` | dynamic field access; `setfield` checks `v` against the field's declared type |
+| `luma_new_struct(desc, counted)` | allocates an instance with every field `nil` (counted or not, see "Memory"); the compiled code then stores the initializers |
+| `luma_getfield(o, name)`, `luma_setfield(o, name, v)` | dynamic field access; `setfield` checks `v` against the field's declared type and releases the old value |
+| `luma_retain`, `luma_release`, `luma_rc_free`, `luma_free` | reference counting and `free()` (see "Memory") |
 | `luma_method(o, name, nargs)` | returns the code of `o`'s method `name` after checking the arity (`LumaFn`, called with the real arguments) |
 
 **Struct instances** (`src/value.h`):
 
 ```
-+0   header   LUMA_TYPE_STRUCT (2) | (struct index + 1) << 8   (bits 32+ reserved for a GC)
++0   header   LUMA_TYPE_STRUCT (2) | (struct index + 1) << 8 | count << 32
 +8   descriptor pointer
 +16  field 0, field 1, …   (8 bytes each, declaration order)
 ```
@@ -348,7 +537,8 @@ The compiler emits one **descriptor** per struct into `.data`
 where each method is `{name, code, arity including self}`), plus a global
 table `luma_structs = [count, desc…]` that the runtime uses to name struct
 types in error messages (`expects Point, got int`). Every program defines
-`luma_structs`, with count 0 if it declares no structs. The descriptors hold
+`luma_structs` (count 0 if it declares no structs), `luma_mm` (its memory
+mode) and `luma_globals` (`[count, &slot…]`, for memcheck). The descriptors hold
 absolute addresses, so they use `R_X86_64_64` relocations (`.quad SYMBOL`),
 which the linker turns into `R_X86_64_RELATIVE` dynamic relocations in the
 PIE.
@@ -358,9 +548,9 @@ The generic operations behave as follows:
 - Arithmetic on fixnums is checked for overflow.
 - `/` and `mod` floor their results.
 - `+` concatenates two strings.
-- Strings and struct instances created at run time are allocated by
-  `luma_alloc` (8-aligned, out-of-memory is a runtime error) and never freed,
-  because there is no GC yet.
+- Strings and struct instances created at run time are allocated by the
+  runtime's memory layer and freed according to the memory mode (see
+  "Memory"). Out of memory is a runtime error.
 
 A runtime error flushes stdout, prints `luma: runtime error: <Lox-style
 message>` to stderr, and exits with status 1.
@@ -670,7 +860,7 @@ tests.
 | `make difftest` (`tests/difftest.py`) | random programs with functions, globals, multi-argument `print`, random **type annotations**, and random **structs** with `impl` methods, literals, field reads and writes and method calls (typed and through `dyn()`), compared including printed structs and runtime errors. Wrong-typed values are hidden behind an untyped `dyn()` so they reach runtime errors and the **runtime guards**, which the reference interpreter models with exact messages. Each program is compiled natively at `-O0`, `-O1` and `-O2` (`DIFFTEST_LEVELS`) and compared with an independent Python reference interpreter, plus the IR round-trip and GNU `as` checks |
 | `make selftest` | `examples/selftest.luma`: 91 checks written in Luma itself, built on a `check()` function. It exits through `extern fun exit` |
 | e2e FFI section | `tests/ffi`: the C helper library `ffi_helper.c` (built with the system cc, test-only), round trips for every C type and boundary value, 9 runtime-error cases, and the link modes |
-| `make bench` (`bench/run.py`) | wall time of seven programs (recursion, loops, division, strings, structs) at `-O0` and `-O2`, with their output |
+| `make bench` (`bench/run.py`) | wall time of seven programs (recursion, loops, division, strings, structs) at `-O0` and `-O2`, with their output; extra luma flags (e.g. `--mm=rc`) are passed through |
 
 The optimizer and backend were also checked with ASan/UBSan builds of the
 compiler (`make BUILD=build-asan CFLAGS="-fsanitize=address,undefined …"`,
@@ -681,6 +871,31 @@ around slow paths, a missing floor fix-up, ignoring calls in allocation):
 same way: forgetting to invalidate on an aliased write, a dynamic write, a
 call, or a reassignment of the object each makes `tests/pos/struct_aliasing`
 fail.
+
+Memory management is covered by:
+- `tests/mem`: exact `LUMA_MEMCHECK` reports for every mode at every level
+  (strings, object graphs and cycles, a program that frees everything, a
+  use after free through a typed alias, a million-node list);
+- every positive program run again under `rc` and `none` with memcheck on;
+- compile errors (`tests/neg/free_*`), runtime errors (`tests/rt/free_*`,
+  `use_after_free`), and unit tests of the memory pass on hand-written LIR;
+- the difftest, which runs each program under one mode with memcheck. In
+  `rc` and `none` it compares the number of struct instances alive at exit
+  with the reference interpreter's prediction (none: all of them; rc: those
+  reachable from globals, plus garbage cycles and what they reference).
+  Programs `free()` fresh local instances and store instances in untyped
+  fields to build graphs and cycles. `DIFFTEST_VALGRIND=1` runs every
+  executable under valgrind.
+
+Planted bugs in the memory pass were each caught: no edge releases, no
+release of unused results, no retain of `getfield` results, consuming
+without retaining, no release when a global or a field is overwritten, no
+retain of reassigned parameters. The tests also found two real bugs during
+development:
+- parameters were never considered live at entry, because the CFG liveness
+  defines them there;
+- a method wrapper's argument check retained a value whose copy was
+  borrowed, which leaked one count per dynamic call.
 
 Structs are covered by `tests/pos/structs.luma` and `struct_aliasing.luma`
 (exact output at every level), 20 `tests/neg/struct_*` compile errors, 10

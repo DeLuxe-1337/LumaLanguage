@@ -10,6 +10,8 @@ The syntax started from Lox and has grown its own features:
 - `print` is a builtin function
 - types are optional and gradual
 - structs with `impl` blocks (methods and associated functions, Rust-style)
+- memory management you choose per build: manual (`free`), reference
+  counting, or none, with the compiler freeing what it can prove dead
 - C functions are called directly through `extern fun`
 
 Nothing is final before Luma bootstraps.
@@ -67,6 +69,7 @@ None of these are part of the pipeline.
 |---|---|
 | `OUT.lir` | Front end (`lexer`, `parser`) and lowering (`lower.c`). This is Luma's IR in its text form; see [docs/IR.md](docs/IR.md). |
 | `OUT.opt.lir` | The optimizer (`opt*.c`, at `-O2`, the default): constant propagation and branch folding, CSE, loop-invariant code motion, dead-code elimination and CFG cleanup on SSA form. It must pass the IR verifier again. |
+| `OUT.mem.lir` | The memory pass (`mem.c`, with `--mm=manual` or `rc`): which allocations are reference counted, and every `retain` and `release` the compiler inserted. |
 | `OUT.s` | The backend, after the IR verifier passes. At `-O1`/`-O2` this is `x86_gen.c`: linear-scan register allocation, inline integer fast paths with out-of-line runtime calls, compare/branch fusion and tail calls. At `-O0` it is the naive `x86_isel.c`, with one stack slot per value. The output is readable Intel-syntax assembly, with each LIR instruction shown as a comment. |
 | `OUT.o` | Luma's assembler (`asm.c`) and ELF writer (`elf_writer.c`). The assembler reads `OUT.s` back from disk. |
 | `OUT` | The system linker: `cc -o OUT OUT.o build/libluma_rt.a`. |
@@ -85,6 +88,8 @@ Options:
 --dump-ir       print the LIR module
 --dump-opt-ir   print the optimized LIR module
 -O0 / -O1 / -O2 naive backend / optimizing backend / optimizer + optimizing backend (default)
+--mm=MODE       memory management: manual (default), rc or none (see below)
+--dump-mem-ir   print the IR after the memory pass
 -v              print each stage and the exact link command
 -l LIB, -L DIR  link a C library / add a library search directory
 EXTRA.o|.a|.so  extra objects or libraries for the linker
@@ -94,6 +99,8 @@ Environment variables:
 
 - `LUMA_CC` replaces the `cc` command used to link.
 - `LUMA_RUNTIME` replaces the path to `libluma_rt.a`.
+- `LUMA_MEMCHECK=1`, set when running a compiled program, reports leaks at
+  exit and turns use-after-free and double free into runtime errors.
 
 The standalone assembler takes assembly directly:
 
@@ -119,7 +126,68 @@ Its input language, encodings and relocation rules are specified in
 | Operators | `= or and == != < <= > >= + - * / ! -` (unary), and `+` on two strings concatenates them |
 | Variables | Top-level variables are globals that functions can read and write. Variables in blocks and functions are local, with lexical scoping checked at compile time. |
 | Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Integer overflow, type errors, reading a global before it is assigned, and stack overflow are runtime errors (exit status 1). `/` is floor division. |
-| Not yet | first-class functions and closures, traits/interfaces, floats (including C `f32`/`f64`), C structs and callbacks, `break`, a GC (strings and struct instances are never freed; every allocation already goes through one `luma_alloc` entry point) |
+| Memory | Chosen per build with `--mm` (below). `free(x)` frees a struct instance in `manual` mode and is accepted (and does nothing) in the others, so a program compiles in every mode. Using a variable after `free` on every path is a compile error. |
+| Not yet | first-class functions and closures, traits/interfaces, floats (including C `f32`/`f64`), C structs and callbacks, `break`, collecting reference cycles |
+
+## Memory management
+
+```js
+struct Point { x: int, y: int }
+struct Node { value: int, label: str, next: Node? }
+
+impl Point {
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+}
+
+fun destroy(list: Node?) {
+  while (list != nil) {
+    var next = list.next;
+    free(list);                       // releases its label string too
+    list = next;
+  }
+}
+
+fun dist2(a: int, b: int): int {
+  var p = Point { x: a, y: b };       // never leaves the function:
+  return p.len2();                    // the compiler frees it
+}
+
+fun greet(name: str): str { return "hello, " + name; }
+
+var list: Node? = nil;
+for (var i = 0; i < 3; i = i + 1) list = Node { value: i, label: greet("node"), next: list };
+destroy(list);
+list = nil;
+print(greet("luma") + "!", dist2(3, 4));   // both strings are freed after print
+```
+
+| `--mm=` | Struct instances | Strings and temporaries |
+|---|---|---|
+| `manual` (default) | yours to `free()`; instances that provably never leave their function are freed for you | freed automatically at their last use |
+| `rc` | reference counted (ARC-style); cycles leak | reference counted |
+| `none` | never freed | never freed |
+
+The compiler inserts the retain/release operations itself, after
+optimization, using liveness and ownership:
+- Parameters are borrowed, so passing an object costs nothing.
+- A last use moves a reference instead of copying it.
+- Values whose type can't be a heap object get no operations at all: typed
+  integer code compiles exactly as before.
+
+`OUT.mem.lir` shows every decision. Run any program with `LUMA_MEMCHECK=1` to
+see what it leaves behind:
+
+```
+$ luma --mm=rc tests/mem/graphs.luma -o graphs && LUMA_MEMCHECK=1 ./graphs
+124750
+9 7
+luma: memcheck: --mm=rc, 1016 allocated, 1009 freed, 3 leaked, 4 reachable from globals
+luma: memcheck: leaked: 3 Pair
+luma: memcheck: reachable from globals: 1 Node, 3 Pair
+```
+
+The design, the analyses and the runtime are described in
+[docs/DESIGN.md](docs/DESIGN.md) ("Memory").
 
 ## Inspecting the intermediate files
 
@@ -187,21 +255,22 @@ check(-7 / 2 == -4, "-7 / 2 floors toward -infinity");
 | `tests/pos/` | Programs with their exact expected output. For each one, the suite also checks that GNU `as` builds a byte-identical object from our `.s`, and that the emitted `.lir` recompiles to identical assembly. |
 | `tests/neg/` | Compile errors, with the expected message and source location. |
 | `tests/rt/` | Runtime errors, with exact stdout, stderr and exit status. |
+| `tests/mem/` | Memory management: exact `LUMA_MEMCHECK` reports for each mode at every level. |
 | `tests/ir/` | Hand-written LIR programs: loops, six-argument calls and recursion. |
 | `tests/ffi/` | C FFI: `ffi_helper.c` plus Luma programs that round-trip every C type, and runtime FFI errors. |
 | `tests/asm/` | lasm on its own: a C program linked against an object built by `lasm`, and a coverage file compared byte for byte against GNU `as`. |
-| `tests/difftest.py` | Random programs (including structs, methods and dynamic field access) compiled natively at every optimization level and compared with an independent Python interpreter. |
+| `tests/difftest.py` | Random programs (including structs, methods, dynamic field access and `free`), each under one memory mode with memcheck on, compiled natively at every optimization level and compared with an independent Python interpreter. |
 | `bench/` | Benchmark programs and `run.py`. |
 
 ## Layout
 
 ```
 src/        lexer, parser + ast, lower (AST→LIR), ir/ir_parse/ir_verify/ir_types,
-            cfg + opt* (optimizer), x86_gen (optimizing LIR→asm), x86_isel (naive LIR→asm),
+            cfg + opt* (optimizer), mem (memory analyses), x86_gen (optimizing LIR→asm), x86_isel (naive LIR→asm),
             asm, obj (object model), elf_writer, value.h (shared value tags), main (luma), lasm
 runtime/    luma_rt.c: the C runtime linked into every program
 examples/   hello.luma, fizzbuzz.luma, ffi.luma, selftest.luma
-tests/      unit/, pos/, neg/, rt/, ir/, ffi/, asm/, run_e2e.sh, difftest.py
+tests/      unit/, pos/, neg/, rt/, mem/, ir/, ffi/, asm/, run_e2e.sh, difftest.py
 bench/      benchmark programs and run.py
 docs/       DESIGN.md: pipeline, language, runtime, optimizer, backends, assembler, ELF, linking
             IR.md:     LIR specification

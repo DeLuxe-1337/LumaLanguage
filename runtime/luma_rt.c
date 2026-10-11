@@ -79,10 +79,16 @@ static bool is_object(LumaValue v) { return v != 0 && (v & 7) == 0; }
 
 static uint64_t header_of(LumaValue v) { return *(const uint64_t *)(uintptr_t)v; }
 
-static void check_valid(LumaValue v) {
+__attribute__((noinline, cold, noreturn)) static void invalid_value(LumaValue v) {
     if (v == 0) luma_panic("invalid value (uninitialized slot)");
-    /* a field of a freed object (LUMA_MEMCHECK), or the freed object itself */
-    if ((v & 7) == 4 || (is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FREED)) luma_panic("Use after free.");
+    luma_panic("Use after free."); /* a field of a freed object (LUMA_MEMCHECK), or the freed object itself */
+}
+
+/* Called on every operand of the generic operations. Only the error report
+ * is out of line. */
+static inline void check_valid(LumaValue v) {
+    if (v & 1) return; /* fixnum */
+    if (v == 0 || (v & 7) == 4 || (is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FREED)) invalid_value(v);
 }
 
 static bool is_string(LumaValue v) {
@@ -262,10 +268,15 @@ static LumaValue make_fixnum_checked(int64_t n) {
 
 static LumaValue make_bool(bool b) { return b ? LUMA_TRUE : LUMA_FALSE; }
 
-static void need_numbers(LumaValue a, LumaValue b) {
+__attribute__((noinline, cold, noreturn)) static void not_numbers(LumaValue a, LumaValue b) {
     check_valid(a);
     check_valid(b);
-    if (!is_fixnum(a) || !is_fixnum(b)) luma_panic("Operands must be numbers.");
+    luma_panic("Operands must be numbers.");
+}
+
+/* Both operands fixnums, or a runtime error (the check stays small inline). */
+static inline void need_numbers(LumaValue a, LumaValue b) {
+    if (!(a & b & 1)) not_numbers(a, b);
 }
 
 /* ---- typed boundaries (gradual typing) ---------------------------------
@@ -633,14 +644,20 @@ LumaFn luma_method(LumaValue o, const char *name, int64_t nargs) {
 
 /* ---- arithmetic -------------------------------------------------------- */
 
+static LumaValue add_slow(LumaValue a, LumaValue b);
+
 LumaValue luma_add(LumaValue a, LumaValue b) {
-    check_valid(a);
-    check_valid(b);
-    if (is_fixnum(a) && is_fixnum(b)) {
+    if (is_fixnum(a) && is_fixnum(b)) { /* the common case stays small: no registers to save */
         int64_t r;
         if (__builtin_add_overflow(fixnum_val(a), fixnum_val(b), &r)) luma_panic("Integer overflow.");
         return make_fixnum_checked(r);
     }
+    return add_slow(a, b);
+}
+
+__attribute__((noinline)) static LumaValue add_slow(LumaValue a, LumaValue b) {
+    check_valid(a);
+    check_valid(b);
     if (is_string(a) && is_string(b)) {
         const LumaString *x = as_string(a), *y = as_string(b);
         if (x->len > SIZE_MAX / 2 || y->len > SIZE_MAX / 2) luma_panic("String too long.");
@@ -686,9 +703,13 @@ LumaValue luma_mod(LumaValue a, LumaValue b) {
     return luma_fixnum(r);
 }
 
-LumaValue luma_neg(LumaValue a) {
+__attribute__((noinline, cold, noreturn)) static void not_number(LumaValue a) {
     check_valid(a);
-    if (!is_fixnum(a)) luma_panic("Operand must be a number.");
+    luma_panic("Operand must be a number.");
+}
+
+LumaValue luma_neg(LumaValue a) {
+    if (!is_fixnum(a)) not_number(a);
     return make_fixnum_checked(-fixnum_val(a));
 }
 
@@ -699,7 +720,7 @@ LumaValue luma_not(LumaValue a) {
 
 /* ---- comparison -------------------------------------------------------- */
 
-static bool values_equal(LumaValue a, LumaValue b) {
+__attribute__((noinline)) static bool values_equal_slow(LumaValue a, LumaValue b) {
     check_valid(a);
     check_valid(b);
     if (a == b) return true;
@@ -708,6 +729,11 @@ static bool values_equal(LumaValue a, LumaValue b) {
         return x->len == y->len && memcmp(x->bytes, y->bytes, x->len) == 0;
     }
     return false;
+}
+
+static inline bool values_equal(LumaValue a, LumaValue b) {
+    if (a & b & 1) return a == b; /* two fixnums */
+    return values_equal_slow(a, b);
 }
 
 LumaValue luma_eq(LumaValue a, LumaValue b) { return make_bool(values_equal(a, b)); }

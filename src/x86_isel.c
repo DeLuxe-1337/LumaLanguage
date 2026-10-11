@@ -223,10 +223,29 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         if (in->imm) buf_printf(out, "    call luma_release@PLT\n");
         break;
     case IR_RETAIN:
-    case IR_RELEASE:
+    case IR_RELEASE: {
+        /* only objects (low 3 bits 0) with a nonzero count at [obj + 4] are
+         * counted; the last release calls luma_rc_free */
+        int n = load_labels++;
         load(out, "rdi", in->a);
-        buf_printf(out, "    call %s@PLT\n", in->op == IR_RETAIN ? "luma_retain" : "luma_release");
+        buf_printf(out, "    test dil, 7\n");
+        buf_printf(out, "    jnz .Lrc_done.%d\n", n);
+        if (in->op == IR_RETAIN) {
+            buf_printf(out, "    cmp dword ptr [rdi + %d], 0\n", LUMA_RC_OFFSET);
+            buf_printf(out, "    je .Lrc_done.%d\n", n);
+            buf_printf(out, "    add dword ptr [rdi + %d], 1\n", LUMA_RC_OFFSET);
+        } else {
+            buf_printf(out, "    cmp dword ptr [rdi + %d], 1\n", LUMA_RC_OFFSET);
+            buf_printf(out, "    jb .Lrc_done.%d\n", n);
+            buf_printf(out, "    jne .Lrc_dec.%d\n", n);
+            buf_printf(out, "    call luma_rc_free@PLT\n");
+            buf_printf(out, "    jmp .Lrc_done.%d\n", n);
+            buf_printf(out, ".Lrc_dec.%d:\n", n);
+            buf_printf(out, "    sub dword ptr [rdi + %d], 1\n", LUMA_RC_OFFSET);
+        }
+        buf_printf(out, ".Lrc_done.%d:\n", n);
         break;
+    }
     case IR_JMP:
         if (in->target[0] != b + 1) jump(out, "jmp", m, f, in->target[0]);
         break;

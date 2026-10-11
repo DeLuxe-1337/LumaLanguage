@@ -1,9 +1,10 @@
-# LIR: the Luma intermediate representation (spec v0.5)
+# LIR: the Luma intermediate representation (spec v0.6)
 
 **Status:** implemented in milestone 2 and extended since: section 15 (v0.2,
 milestone 3), section 16 (v0.3, milestone 4), section 17 (v0.4, milestone
-5: types, `check`, the optimizer and the optimizing backend) and section 18
-(v0.5, milestone 6: structs, field access and method calls). The decisions
+5: types, `check`, the optimizer and the optimizing backend), section 18
+(v0.5, milestone 6: structs, field access and method calls) and section 19
+(v0.6, milestone 7: memory modes, retain/release). The decisions
 in section 13 are resolved, and the places where the implementation refined
 the original draft are listed in section 14.
 **Scope:** this spec covers:
@@ -84,7 +85,8 @@ Rationale:
 ### Object layout (v0.1)
 
 ```
-offset 0   u64 header   bits 0–7: type id; bits 8–63: reserved (GC, flags)
+offset 0   u64 header   bits 0–7: type id; bits 8–31: struct id (structs) or flags;
+                        bits 32–63: reference count, 0 = not counted (v0.6)
 offset 8   …            type-specific
 ```
 
@@ -794,4 +796,95 @@ Every `.quad SYMBOL` is an `R_X86_64_64` relocation (LASM.md section 9).
 | dynamic `getfield`/`setfield` | `luma_getfield(o, name)` / `luma_setfield(o, name, v)` | same calls |
 | `callm %o, .m(args)` | `luma_method(o, name, nargs)` returns the code; the arguments are loaded and the call is `call r11` | arguments parallel-moved, pushed around the `luma_method` call, popped, then `call r11` |
 | `check %v, S` | `luma_check_type` | inline: not a fixnum or immediate (`test r, 7`) and header word equals S's, else the slow path |
+
+## 19. v0.6 additions (milestone 7)
+
+### The `memory` line
+
+```
+module "prog.luma"
+memory manual
+```
+
+An optional line right after `module` gives the module's memory-management
+mode: `none` (the default when the line is absent, so older LIR files keep
+their meaning), `manual` or `rc`. `luma` writes `memory manual` for a
+`.luma` input unless `--mm` says otherwise, and `--mm` overrides the line of
+a `.lir` input. The mode does not change what any instruction in the text
+form means. It decides what the memory pass inserts afterwards, and how
+`store` and `setfield` treat the value they overwrite (below).
+
+### The memory pass
+
+The text form of LIR, as written to `OUT.lir` and `OUT.opt.lir` and as
+accepted by the parser, never contains reference-counting operations. The
+memory pass (`mem.c`, docs/DESIGN.md "Memory") runs after the optimizer, on
+the final IR, when the mode is `manual` or `rc`. It:
+
+1. decides for every `new` whether its instances are counted (always in
+   `rc`; in `manual` when escape analysis proves they never leave their
+   function); and
+2. inserts `retain` and `release` so that every counted reference held by a
+   vreg, a field or a global is released exactly once.
+
+The result is written to `OUT.mem.lir` and verified again. That file is for
+reading: the parser rejects `retain`/`release`, because they would be
+inserted a second time.
+
+| Instruction | Meaning |
+|---|---|
+| `retain %v` | if `%v` is a counted object, add 1 to its count |
+| `release %v` | if `%v` is a counted object, subtract 1; at 0 the object is freed (its fields released in turn) |
+
+Neither has a destination, and both are no-ops on anything that is not a
+counted object (immediates, string literals, uncounted instances). In
+`OUT.mem.lir`, a counted `new` is followed by the comment `; counted`.
+
+**The conventions the pass implements** (the contract between functions):
+
+- A function's parameters are **borrowed**. The caller holds a reference
+  for the duration of the call, and the callee neither retains nor releases
+  them unless it stores, returns or reassigns them.
+- A function's result is **owned**: the caller receives one reference.
+- `load` and `getfield` produce the slot's reference (borrowed). The pass
+  retains them.
+- `store`, `setfield` and the arguments of `new` take over the reference to
+  their value. `mov` and `check` move or copy a reference.
+
+**Overwritten slots.** In modes `manual` and `rc`:
+- `store` and static `setfield` release the value they overwrite when the
+  pass has set their flag (`IrInstr.imm` = 1: the slot's type may hold a
+  counted object). The global's slot may be 0 (never assigned), which is
+  skipped.
+- Dynamic `setfield` always releases the old value (the runtime does it).
+
+### Verifier rules (additions to section 6)
+
+- `retain` and `release` read one vreg (definitely assigned, like any
+  read) and have no destination.
+- They may appear only after the memory pass (`IrModule.mem_lowered`) and
+  only in a module whose mode is not `none`.
+
+### Compile-time free checks
+
+On the lowered IR (before optimization, every mode), a forward must-analysis
+tracks the vregs passed to `call @luma_free(...)`. A vreg that is read
+again, or freed again, while it is freed on every path reaching that point
+(and was not reassigned) is a compile error, reported at the source
+position of the use: `'p' is used after free(p) on line 4`. Temporaries
+are not reported, only named variables. A vreg freed on some paths only is
+accepted.
+
+### Lowering to x86-64
+
+| Instruction | `-O0` | `-O1`/`-O2` |
+|---|---|---|
+| `retain %v` | `call luma_retain` | inline: tag test, `cmp dword ptr [v + 4], 0`, `add dword ptr [v + 4], 1` |
+| `release %v` | `call luma_release` | inline: tag test, `cmp dword ptr [v + 4], 1` / `jb` / `je` (stub: `luma_rc_free`), `sub dword ptr [v + 4], 1` |
+| `store` / static `setfield` with the release flag | old value to `rdi`, write, `call luma_release` | old value to `r10`, write, inline release |
+| `new S(...)` | `mov esi, counted` before `call luma_new_struct` | same |
+
+Every program also defines `luma_mm` (`.quad` mode) and `luma_globals`
+(`.quad count` followed by the address of each global variable's slot) in
+`.data`. These are `R_X86_64_64` relocations like the struct descriptors.
 
