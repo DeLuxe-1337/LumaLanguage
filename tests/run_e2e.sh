@@ -335,6 +335,10 @@ check "an error inside the prelude is reported at <prelude>:LINE" sh -c \
     "! LUMA_PRELUDE=$OUT/badprelude.luma $LUMA $OUT/useq.luma -o $OUT/uq 2>$OUT/e && grep -q '^<prelude>:3:' $OUT/e"
 check "LUMA_PRELUDE replaces the prelude (and a missing file is an error)" sh -c \
     "! LUMA_PRELUDE=$OUT/nonexistent.luma $LUMA examples/hello.luma -o $OUT/h2 2>$OUT/e && grep -q nonexistent $OUT/e"
+for lvl in 0 2; do
+    check "examples/tour.luma: every feature check passes (-O$lvl)" sh -c \
+        "$LUMA -O$lvl examples/tour.luma -o $OUT/tour$lvl && $OUT/tour$lvl | tail -1 | grep -q ' 0 failed'"
+done
 check "--mm=rc points to Rc::new" sh -c "! $LUMA --mm=rc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'use Rc::new' $OUT/e"
 
 # ---------------------------------------------------------- C FFI

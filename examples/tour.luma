@@ -1,0 +1,287 @@
+// tour.luma - a guided test suite of Luma's features.
+//
+// Each section explains a feature in comments, then checks it. Run it with:
+//     ./build/luma examples/tour.luma -o build/tour && ./build/tour
+// It prints one line per section and a summary, and exits with status 1 if
+// any check fails.
+
+var passed = 0;
+var failed = 0;
+var section_failures = 0;
+
+fun check(ok: bool, what: str) {
+  if (ok) {
+    passed = passed + 1;
+  } else {
+    failed = failed + 1;
+    section_failures = section_failures + 1;
+    print("  FAIL:", what);
+  }
+}
+
+fun section(name: str) {
+  if (section_failures == 0 and passed + failed > 0) print("  ok");
+  section_failures = 0;
+  print("==", name);
+}
+
+// ---------------------------------------------------------------------------
+section("values and literals");
+// Integers are 63-bit; strings, true/false and nil are the other built-in
+// values. print takes any number of arguments, separated by spaces.
+check(1 + 2 == 3, "integers");
+check(4611686018427387903 > 0, "the largest int literal");
+check("a" + "b" == "ab", "+ concatenates strings");
+check("tab\there" != "tab here", "escapes: \\n \\r \\t \\\" \\\\");
+check(nil == nil and true != false, "nil, true, false");
+
+// ---------------------------------------------------------------------------
+section("operators and truthiness");
+// / is floor division (rounds toward minus infinity).
+check(7 / 2 == 3 and -7 / 2 == -4, "floor division");
+check(2 + 3 * 4 == 14 and (2 + 3) * 4 == 20, "precedence");
+check(!(1 < 2) == false and 3 >= 3 and 2 <= 3, "comparisons");
+// Only nil and false are falsy (0 and "" are truthy). `and`/`or` return an
+// operand, not a bool, and stop early.
+check((0 or 5) == 0, "0 is truthy");
+check((nil or "default") == "default", "or picks the first truthy operand");
+check((1 and 2) == 2 and (false and 1) == false, "and returns an operand");
+// == compares strings by content and everything else by identity.
+check("abc" == "ab" + "c", "strings compare by content");
+
+// ---------------------------------------------------------------------------
+section("variables and scope");
+// Top-level variables are globals; variables in blocks and functions are
+// local and lexically scoped (a block can shadow an outer name).
+var shadow = "outer";
+{
+  var shadow = "inner";
+  check(shadow == "inner", "inner variable");
+}
+check(shadow == "outer", "shadowing ends with the block");
+var counter = 0;
+fun bump() { counter = counter + 1; }   // functions can write globals
+bump();
+bump();
+check(counter == 2, "globals");
+
+// ---------------------------------------------------------------------------
+section("control flow");
+var evens = 0;
+for (var i = 0; i < 10; i = i + 1) {
+  if (i / 2 * 2 == i) evens = evens + 1;
+  else evens = evens + 0;
+}
+check(evens == 5, "for, if/else");
+var n = 100;
+var steps = 0;
+while (n != 1) {            // the Collatz sequence from 100
+  if (n / 2 * 2 == n) n = n / 2;
+  else n = 3 * n + 1;
+  steps = steps + 1;
+}
+check(steps == 25, "while");
+
+// ---------------------------------------------------------------------------
+section("functions");
+// Functions are declared at top level, may be called before they appear,
+// and recurse. A missing return returns nil.
+fun fib(n: int): int {
+  if (n < 2) return n;
+  return fib(n - 1) + fib(n - 2);
+}
+fun nothing() { }
+check(fib(20) == 6765, "recursion");
+check(nothing() == nil, "an implicit return gives nil");
+check(is_even(10) and !is_even(7), "mutual recursion, called before declared");
+fun is_even(n: int): bool { if (n == 0) return true; return is_odd(n - 1); }
+fun is_odd(n: int): bool { if (n == 0) return false; return is_even(n - 1); }
+
+// ---------------------------------------------------------------------------
+section("gradual types");
+// Annotations are optional. Typed code is checked at compile time (and
+// compiled to fast integer code); untyped code is fully dynamic. Where an
+// untyped value meets a typed slot, a runtime guard checks it.
+fun add_typed(a: int, b: int): int { return a + b; }
+fun add_any(a, b) { return a + b; }    // works for ints and for strings
+var maybe: str? = nil;                 // T? is T or nil
+maybe = "now a string";
+check(add_typed(2, 3) == 5, "typed function");
+check(add_any("x", "y") == "xy" and add_any(1, 2) == 3, "untyped function");
+check(maybe == "now a string", "nullable types");
+check(Sys::type_of(1) == "int" and Sys::type_of(maybe) == "str", "types at run time");
+
+// ---------------------------------------------------------------------------
+section("structs and impl");
+// A struct has named fields (typed or not). Instances are references:
+// assignment shares, == is identity. impl blocks add methods (with self)
+// and associated functions (without).
+struct Point { x: int, y: int }
+impl Point {
+  fun new(x: int, y: int): Point { return Point { x, y }; }   // shorthand: x is x: x
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+  fun moved(self, dx: int): Point { return Point { x: self.x + dx, y: self.y }; }
+}
+var p = Point::new(3, 4);
+var alias = p;
+alias.x = 6;
+check(p.x == 6, "instances are shared references");
+check(p.len2() == 52 and Point::len2(p) == 52, "methods, called two ways");
+var moved = p.moved(1);               // a new instance: ours to free (manual memory)
+check(moved.x == 7, "a method returning a new instance");
+free(moved);
+check(Point { x: 1, y: 2 } != Point { x: 1, y: 2 }, "== is identity");
+fun dyn(v) { return v; }              // hides the static type
+check(dyn(p).len2() == 52 and dyn(p).y == 4, "the same calls, looked up at run time");
+
+// ---------------------------------------------------------------------------
+section("generic structs");
+// One definition, one typed struct per list of type arguments, inferred
+// from the values (or written in annotations).
+struct Pair<A, B> { first: A, second: B }
+impl Pair<A, B> {
+  fun swap(self): Pair<B, A> { return Pair { first: self.second, second: self.first }; }
+}
+var pr: Pair<int, str> = Pair { first: 1, second: "one" };
+var sw = pr.swap();                   // a Pair<str, int>
+check(sw.first == "one" and sw.second == 1, "a generic method");
+check(Sys::type_of(sw) == "Pair<str, int>", "each instance is its own type");
+
+// ---------------------------------------------------------------------------
+section("manual memory");
+// Memory is manual by default: free() a struct instance when done. Strings
+// and temporaries are freed automatically, and so are instances the
+// compiler proves never leave their function. Using a variable after
+// free() is a compile error.
+struct Node { value: int, next: Node? }
+var list: Node? = nil;
+for (var i = 0; i < 3; i = i + 1) list = Node { value: i, next: list };
+var sum = 0;
+while (list != nil) {
+  var next = list.next;
+  sum = sum + list.value;
+  free(list);
+  list = next;
+}
+check(sum == 3, "build a list and free it");
+
+// ---------------------------------------------------------------------------
+section("drop, shared structs, dispose");
+// fun drop(self) runs when an instance dies. A `shared struct` is reference
+// counted: it dies when its last reference goes away. dispose(x) frees x
+// if it is managed by hand, and does nothing otherwise.
+// (A reference ends at its last use, not at the end of its scope.)
+// --mm=none frees nothing, so there drop never runs and counts are 0.
+var dropped = 0;
+var kept = nil;
+shared struct Ticket { id: int }
+impl Ticket { fun drop(self) { dropped = dropped + 1; } }
+var mm_none = refcount(Ticket { id: 0 }) == 0;
+dropped = 0;
+fun use_ticket(): int {
+  var t = Ticket { id: 7 };
+  kept = t;                           // a second reference, held by a global
+  return refcount(t);
+}
+check(mm_none or use_ticket() >= 2, "refcount counts references");
+kept = nil;                           // the last reference goes away
+check(mm_none or dropped == 1, "the last reference dropped the Ticket");
+struct Owned { inner: Point }
+impl Owned { fun drop(self) { dispose(self.inner); } }
+free(Owned { inner: Point::new(0, 0) });   // drop frees the Point too
+check(true, "drop on free()");
+
+// ---------------------------------------------------------------------------
+section("Rc and arenas (written in Luma: std/prelude.luma)");
+// Rc::new(x) moves x into a counted box; fields and methods go through it
+// (deref). arena { ... } frees everything allocated inside at its end.
+var r1 = Rc::new(Point::new(1, 2));
+var r2 = r1;                          // shares the box
+r2.x = 10;                            // reaches the Point inside
+check(r1.x == 10 and r1.len2() == 104, "Rc: shared, auto-deref");
+check(Sys::type_of(r1) == "Rc<Point>", "Rc is a generic struct");
+var made = 0;
+arena {
+  for (var i = 0; i < 100; i = i + 1) {
+    var q = Point::new(i, i);         // into the arena: no free() needed
+    made = made + 1;
+  }
+}
+check(made == 100, "an arena block");
+
+// ---------------------------------------------------------------------------
+section("hooks: deref, show, with, move");
+// deref forwards missing members; show is how print shows an instance;
+// with calls enter()/leave() around a block; a `move` parameter takes the
+// caller's variable (using it afterwards is a compile error).
+struct Handle { inner: Point, label: str }
+impl Handle {
+  fun deref(self): Point { return self.inner; }
+  fun show(self): str { return "Handle(" + self.label + ")"; }
+}
+var h = Handle { inner: Point::new(5, 6), label: "h" };
+check(h.x == 5 and h.len2() == 61 and h.label == "h", "deref (own members win)");
+check(Str::of(h) == "Handle(h)", "show");
+var depth = 0;
+struct Indent { by: int }
+impl Indent {
+  fun enter(self) { depth = depth + self.by; }
+  fun leave(self) { depth = depth - self.by; }
+}
+var inside = 0;
+with Indent { by: 2 } { inside = depth; }
+check(inside == 2 and depth == 0, "with");
+fun take(move pt: Point): int { var x = pt.x; free(pt); return x; }
+check(take(Point::new(9, 0)) == 9, "move parameters");
+
+// ---------------------------------------------------------------------------
+section("standard library: Math, Str, List");
+check(Math::abs(-5) == 5 and Math::pow(2, 10) == 1024 and Math::gcd(12, 18) == 6, "Math");
+check(Math::isqrt(99) == 9 and Math::mod(-7, 3) == 2, "Math (more)");
+check(Str::len("hello") == 5 and Str::slice("hello", 1, 3) == "el", "Str::len, slice");
+check(Str::find("hello", "ll") == 2 and Str::upper("abc") == "ABC", "Str::find, upper");
+check(Str::to_int("-42") == -42 and Str::to_int("4x") == nil, "Str::to_int");
+check(Str::join(Str::split("a,b,c", ","), "-") == "a-b-c", "split and join");
+var nums: List<int> = List::new();
+for (var i = 5; i > 0; i = i - 1) nums.push(i * i);
+nums.sort();
+check(nums.len() == 5 and nums.get(0) == 1 and nums.last() == 25, "List: push, sort, get");
+check(nums.index_of(9) == 2 and nums.pop() == 25 and nums.len() == 4, "List: index_of, pop");
+check(Str::of(nums) == "[1, 4, 9, 16]", "a List prints as [..]");
+
+// ---------------------------------------------------------------------------
+section("standard library: File, Sys, Date, Random");
+var path = "build/tour_test.txt";
+check(File::write_all(path, "line 1\nline 2\n"), "File::write_all");
+var f = File::open(path, "r");
+check(f.read_line() == "line 1" and f.read_line() == "line 2" and f.read_line() == nil, "read_line");
+f.close();
+check(File::lines(path).len() == 2 and File::remove(path) and !File::exists(path), "lines, remove, exists");
+check(Sys::args().len() >= 1 and Sys::env("LUMA_SURELY_UNSET") == nil, "Sys::args, env");
+check(Str::of(Sys::date(0)) == "1970-01-01 00:00:00 GMT", "Sys::date");
+check(Sys::time() > 1700000000, "Sys::time");
+var rnd = Random::new(42);
+var roll = rnd.range(1, 7);
+check(roll >= 1 and roll <= 6, "Random");
+
+// ---------------------------------------------------------------------------
+section("C FFI: functions and structs");
+// extern fun calls a C function directly, converting values at the call.
+// extern "sym" binds a different Luma name. extern struct declares a C
+// struct with C layout, passed by pointer (*S) or by value (up to 16 bytes).
+extern fun strlen(s: cstr): u64;
+extern "abs" fun c_abs(x: i32): i32;
+extern struct timespec { tv_sec: i64, tv_nsec: i64 }
+extern struct div_t { quot: i32, rem: i32 }
+extern fun clock_gettime(clock: i32, ts: *timespec): i32;
+extern fun div(num: i32, den: i32): div_t;
+check(strlen("hello") == 5 and c_abs(-3) == 3, "extern fun, symbol names");
+var ts = timespec { };                // zeroed C memory, freed with ts
+check(clock_gettime(0, ts) == 0 and ts.tv_sec > 1700000000, "a struct by pointer: C writes into it");
+var qr = div(17, 5);                  // returned by value, in registers
+check(qr.quot == 3 and qr.rem == 2 and div_t::size() == 8, "a struct by value");
+
+// ---------------------------------------------------------------------------
+section("summary");
+print(passed, "passed,", failed, "failed");
+if (failed > 0) Sys::exit(1);
