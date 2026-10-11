@@ -40,14 +40,25 @@ $(BUILD)/libluma_rt.a: $(BUILD)/obj/luma_rt.o
 $(BUILD)/obj/%.o: src/%.c $(HEADERS) | $(BUILD)/obj
 	$(CC) $(CFLAGS) $(DEFS) -c $< -o $@
 
-# The prelude (std/prelude.luma) is built into luma as a C string.
-$(BUILD)/obj/prelude_src.c: std/prelude.luma | $(BUILD)/obj
-	{ printf 'const char luma_prelude_src[] =\n'; \
-	  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/    "/' -e 's/$$/\\n"/' $<; \
-	  printf '    "";\n'; } > $@
+# The prelude and standard library (std/*.luma) are built into luma as C
+# strings: std/prelude.luma first, then the modules in STD_MODULES order.
+STD_MODULES := math str list file sys random c
+STD_FILES   := std/prelude.luma $(STD_MODULES:%=std/%.luma)
+$(BUILD)/obj/prelude_src.c: $(STD_FILES) | $(BUILD)/obj
+	{ for f in $(STD_FILES); do \
+	    n=$$(basename $$f .luma); \
+	    printf 'static const char src_%s[] =\n' "$$n"; \
+	    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/    "/' -e 's/$$/\\n"/' $$f; \
+	    printf '    "";\n'; \
+	  done; \
+	  printf 'const char *const luma_std_names[] = {'; \
+	  for f in $(STD_FILES); do printf '"%s", ' "$$(basename $$f .luma)"; done; \
+	  printf '0};\nconst char *const luma_std_srcs[] = {'; \
+	  for f in $(STD_FILES); do printf 'src_%s, ' "$$(basename $$f .luma)"; done; \
+	  printf '0};\n'; } > $@
 
 $(BUILD)/obj/prelude_src.o: $(BUILD)/obj/prelude_src.c
-	$(CC) $(CFLAGS) $(DEFS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEFS) -Wno-overlength-strings -c $< -o $@
 
 $(BUILD)/luma: $(BUILD)/obj/main.o $(CORE_OBJ)
 	$(CC) $(CFLAGS) $(DEFS) $^ -o $@

@@ -1,0 +1,1 @@
+'*i32': only C structs (extern struct) have pointer types here; use ptr for other pointers

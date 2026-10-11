@@ -1,0 +1,1 @@
+luma: runtime error: field 'small' of S: 300 does not fit in i8.

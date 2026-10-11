@@ -1,0 +1,126 @@
+// File: reading and writing files through C stdio. A File closes itself
+// when its last reference goes away (drop), or explicitly with close().
+extern "fopen" fun __fopen(path: cstr, mode: cstr): ptr;
+extern "fclose" fun __fclose(f: ptr): i32;
+extern "fgets" fun __fgets(buf: ptr, n: i32, f: ptr): cstr?;
+extern "fread" fun __fread(buf: ptr, size: u64, n: u64, f: ptr): u64;
+extern "fwrite" fun __fwrite(p: cstr, size: u64, n: u64, f: ptr): u64;
+extern "fflush" fun __fflush(f: ptr): i32;
+extern "remove" fun __remove(path: cstr): i32;
+
+shared struct File { __fp: int, __buf: int, path: str }
+
+impl File {
+  // mode as for C fopen: "r", "w", "a", "r+", ... nil if it can't be opened
+  fun open(path: str, mode: str): File? {
+    var fp = __fopen(path, mode);
+    if (fp == 0) return nil;
+    return File { __fp: fp, __buf: C::alloc(4096), path: path };
+  }
+
+  // the whole file, or nil if it can't be read
+  fun read(path: str): str? {
+    var f = File::open(path, "r");
+    if (f == nil) return nil;
+    var text = f.read_all();
+    f.close();
+    return text;
+  }
+
+  // writes (or appends) text to the file at path; false on failure
+  fun write_all(path: str, text: str): bool { return File::__put(path, "w", text); }
+  fun append(path: str, text: str): bool { return File::__put(path, "a", text); }
+
+  // the lines of a file (see Str::lines), or nil
+  fun lines(path: str): List<str>? {
+    var text = File::read(path);
+    if (text == nil) return nil;
+    return Str::lines(text);
+  }
+
+  fun exists(path: str): bool {
+    var fp = __fopen(path, "r");
+    if (fp == 0) return false;
+    __fclose(fp);
+    return true;
+  }
+
+  fun remove(path: str): bool { return __remove(path) == 0; }
+
+  // the next line without its "\n", or nil at the end of the file
+  fun read_line(self): str? {
+    self.__need_open();
+    var parts: List<str> = List::new();
+    var done = false;
+    while (!done) {
+      var piece = __fgets(self.__buf, 4096, self.__fp);
+      if (piece == nil) {
+        done = true;
+      } else {
+        parts.push(piece);
+        done = Str::ends_with(piece, "\n");
+      }
+    }
+    if (parts.is_empty()) return nil;
+    var line = Str::join(parts, "");
+    if (Str::ends_with(line, "\n")) line = Str::slice(line, 0, Str::len(line) - 1);
+    if (Str::ends_with(line, "\r")) line = Str::slice(line, 0, Str::len(line) - 1);
+    return line;
+  }
+
+  // the rest of the file
+  fun read_all(self): str {
+    self.__need_open();
+    var parts: List<str> = List::new();
+    var n = __fread(self.__buf, 1, 4096, self.__fp);
+    while (n > 0) {
+      parts.push(C::string(self.__buf, n));
+      n = __fread(self.__buf, 1, 4096, self.__fp);
+    }
+    return Str::join(parts, "");
+  }
+
+  // false if not all of s could be written
+  fun write(self, s: str): bool {
+    self.__need_open();
+    var n = Str::len(s);
+    return n == 0 or __fwrite(s, 1, n, self.__fp) == n;
+  }
+
+  fun write_line(self, s: str): bool { return self.write(s + "\n"); }
+
+  fun flush(self) {
+    self.__need_open();
+    __fflush(self.__fp);
+  }
+
+  fun is_open(self): bool { return self.__fp != 0; }
+
+  fun close(self) {
+    if (self.__fp != 0) {
+      __fclose(self.__fp);
+      C::free(self.__buf);
+      self.__fp = 0;
+      self.__buf = 0;
+    }
+  }
+
+  fun drop(self) { self.close(); }
+
+  fun show(self): str {
+    if (self.__fp == 0) return "File(" + self.path + ", closed)";
+    return "File(" + self.path + ")";
+  }
+
+  fun __need_open(self) {
+    if (self.__fp == 0) __fail("File " + self.path + " is closed.");
+  }
+
+  fun __put(path: str, mode: str, text: str): bool {
+    var f = File::open(path, mode);
+    if (f == nil) return false;
+    var ok = f.write(text);
+    f.close();
+    return ok;
+  }
+}

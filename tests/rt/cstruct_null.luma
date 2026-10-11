@@ -1,0 +1,3 @@
+extern struct Tm { sec: i32 }
+extern "getenv" fun env_tm(name: cstr): *Tm;
+print(env_tm("LUMA_SURELY_UNSET_VARIABLE").sec);

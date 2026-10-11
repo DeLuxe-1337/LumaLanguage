@@ -1,0 +1,1 @@
+extern fun f(p: *i32): void;

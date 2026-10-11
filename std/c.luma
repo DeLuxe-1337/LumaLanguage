@@ -1,0 +1,25 @@
+// C: raw C memory for the FFI. Addresses are ints (the `ptr` C type).
+// Memory from C::alloc is zeroed and must be given back with C::free.
+extern "calloc" fun __calloc(n: u64, size: u64): ptr;
+extern "free" fun __cfree(p: ptr): void;
+extern "strlen" fun __strlen(p: ptr): u64;
+
+struct C {}
+
+impl C {
+  fun alloc(n: int): int {
+    if (n < 0) return __fail("C::alloc: negative size.");
+    var p = __calloc(Math::max(n, 1), 1);
+    if (p == 0) return __fail("C::alloc: out of memory.");
+    return p;
+  }
+
+  fun free(p: int) { __cfree(p); }
+
+  // n bytes at p as a string; the NUL-terminated string at p
+  fun string(p: int, n: int): str { return __mem_string(p, n); }
+  fun cstring(p: int): str { return __mem_string(p, __strlen(p)); }
+
+  // copies s's bytes to p (no NUL)
+  fun write(p: int, s: str) { __mem_write(p, s); }
+}

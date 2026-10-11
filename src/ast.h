@@ -105,6 +105,7 @@ struct TypeRef {
     TypeRef *args; /* type arguments of a generic type: Pair<int, Point> (owned), else NULL */
     size_t nargs;
     bool nullable; /* written with a trailing '?' */
+    bool pointer;  /* written with a leading '*' (*S: a pointer to a C struct, in extern signatures) */
     int line, col;
 };
 
@@ -135,9 +136,11 @@ struct Stmt {
     bool *param_move;     /* STMT_FUN: `move p` (the call takes the caller's variable) */
     size_t nparams;
     TypeRef type;   /* STMT_VAR: declared type; STMT_FUN / STMT_EXTERN: return type */
+    char *csym;     /* STMT_EXTERN: `extern "symbol" fun name`: the C symbol, when not name (owned) */
     char **tparams; /* STMT_STRUCT / STMT_IMPL: type parameters of a generic struct (owned) */
     size_t ntparams;
     bool shared;    /* STMT_STRUCT: `shared struct` (every instance reference counted) */
+    bool cstruct;   /* STMT_STRUCT: `extern struct` (a C struct: fields have C types) */
 };
 
 typedef struct {

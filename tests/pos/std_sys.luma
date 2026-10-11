@@ -1,0 +1,15 @@
+// The standard library: Sys and Date (std/sys.luma), whose clock and
+// calendar functions use C structs (extern struct timespec, tm).
+var args = Sys::args();
+print(args.len(), Str::len(args.get(0)) > 0);
+print(Sys::env("LUMA_SURELY_UNSET_VARIABLE") == nil, Sys::env("PATH") != nil);
+var d = Sys::date(1700000000);
+print(d, d.weekday_name(), d.year, d.month, d.day);
+print(Sys::date(0), Sys::date(-86400));
+var t0 = Sys::clock_ns();
+print(Sys::time() > 1700000000, Sys::clock_ns() >= t0, Sys::clock_ms() >= 0);
+print(Sys::type_of(d), Sys::type_of(1), Sys::type_of("s"), Sys::type_of(nil), Sys::type_of(Sys::args()));
+print(Sys::run("exit 3"), Sys::run("true"));
+print("before exit");
+Sys::exit(0);
+print("not reached");

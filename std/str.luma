@@ -1,0 +1,148 @@
+// Str: functions on strings. Strings are immutable byte strings; indexes
+// count bytes from 0. Str::len("abc") is 3.
+struct Str {}
+
+impl Str {
+  fun len(s: str): int { return __str_len(s); }
+
+  // the byte at i (0-255), and the one-byte string of a byte
+  fun byte(s: str, i: int): int { return __str_byte(s, i); }
+  fun char(b: int): str { return __str_char(b); }
+
+  // bytes [from, to), clamped to the string ("" when to <= from)
+  fun slice(s: str, from: int, to: int): str {
+    var n = __str_len(s);
+    var a = Math::clamp(from, 0, n);
+    var b = Math::clamp(to, 0, n);
+    if (b <= a) return "";
+    return __str_slice(s, a, b);
+  }
+
+  fun find(s: str, sub: str): int { return __str_find(s, sub, 0); }
+  fun find_from(s: str, sub: str, from: int): int { return __str_find(s, sub, from); }
+  fun contains(s: str, sub: str): bool { return __str_find(s, sub, 0) >= 0; }
+
+  fun starts_with(s: str, prefix: str): bool {
+    var n = __str_len(prefix);
+    return n <= __str_len(s) and __str_slice(s, 0, n) == prefix;
+  }
+
+  fun ends_with(s: str, suffix: str): bool {
+    var n = __str_len(s);
+    var k = __str_len(suffix);
+    return k <= n and __str_slice(s, n - k, n) == suffix;
+  }
+
+  // how many times sub occurs (without overlaps)
+  fun count(s: str, sub: str): int {
+    if (__str_len(sub) == 0) return __fail("Str::count of an empty string.");
+    var n = 0;
+    var i = __str_find(s, sub, 0);
+    while (i >= 0) {
+      n = n + 1;
+      i = __str_find(s, sub, i + __str_len(sub));
+    }
+    return n;
+  }
+
+  fun repeat(s: str, n: int): str {
+    if (n < 0) return __fail("Str::repeat: negative count.");
+    var parts = __array_new(n);
+    for (var k = 0; k < n; k = k + 1) __array_set(parts, k, s);
+    return __str_join(parts, n, "");
+  }
+
+  fun upper(s: str): str { return __str_case(s, true); }
+  fun lower(s: str): str { return __str_case(s, false); }
+
+  fun is_space(b: int): bool { return b == 32 or b == 9 or b == 10 or b == 13; }
+  fun is_digit(b: int): bool { return b >= 48 and b <= 57; }
+  fun is_alpha(b: int): bool { return (b >= 65 and b <= 90) or (b >= 97 and b <= 122); }
+
+  fun trim(s: str): str { return Str::trim_end(Str::trim_start(s)); }
+
+  fun trim_start(s: str): str {
+    var n = __str_len(s);
+    var i = 0;
+    while (i < n and Str::is_space(__str_byte(s, i))) i = i + 1;
+    return __str_slice(s, i, n);
+  }
+
+  fun trim_end(s: str): str {
+    var n = __str_len(s);
+    while (n > 0 and Str::is_space(__str_byte(s, n - 1))) n = n - 1;
+    return __str_slice(s, 0, n);
+  }
+
+  // the pieces between occurrences of sep ("a,b,,c" by "," is 4 pieces)
+  fun split(s: str, sep: str): List<str> {
+    var parts: List<str> = List::new();
+    var k = __str_len(sep);
+    if (k == 0) {
+      for (var i = 0; i < __str_len(s); i = i + 1) parts.push(__str_slice(s, i, i + 1));
+      return parts;
+    }
+    var start = 0;
+    var i = __str_find(s, sep, 0);
+    while (i >= 0) {
+      parts.push(__str_slice(s, start, i));
+      start = i + k;
+      i = __str_find(s, sep, start);
+    }
+    parts.push(__str_slice(s, start, __str_len(s)));
+    return parts;
+  }
+
+  // the lines of s, without their "\n" (or "\r\n"); no empty last line
+  fun lines(s: str): List<str> {
+    var parts = Str::split(s, "\n");
+    if (parts.len() > 0 and parts.last() == "") parts.pop();
+    for (var i = 0; i < parts.len(); i = i + 1)
+      if (Str::ends_with(parts.get(i), "\r")) parts.set(i, Str::slice(parts.get(i), 0, Str::len(parts.get(i)) - 1));
+    return parts;
+  }
+
+  // the space-separated words of s
+  fun words(s: str): List<str> {
+    var out: List<str> = List::new();
+    var n = __str_len(s);
+    var i = 0;
+    while (i < n) {
+      while (i < n and Str::is_space(__str_byte(s, i))) i = i + 1;
+      var start = i;
+      while (i < n and !Str::is_space(__str_byte(s, i))) i = i + 1;
+      if (i > start) out.push(__str_slice(s, start, i));
+    }
+    return out;
+  }
+
+  fun join(parts: List<str>, sep: str): str { return __str_join(parts.__items, parts.__len, sep); }
+
+  fun replace(s: str, old: str, new: str): str { return Str::join(Str::split(s, old), new); }
+
+  fun from_int(n: int): str { return __str_from_int(n); }
+  // the int s spells (optional sign and digits only), or nil
+  fun to_int(s: str): int? { return __str_to_int(s); }
+
+  // -1, 0 or 1, comparing bytes
+  fun compare(a: str, b: str): int { return __str_cmp(a, b); }
+
+  // s padded with fill (one byte) on the left / right to at least width bytes
+  fun pad_left(s: str, width: int, fill: str): str {
+    var n = __str_len(s);
+    if (n >= width) return s;
+    return Str::repeat(fill, width - n) + s;
+  }
+
+  fun pad_right(s: str, width: int, fill: str): str {
+    var n = __str_len(s);
+    if (n >= width) return s;
+    return s + Str::repeat(fill, width - n);
+  }
+
+  // any value as print shows it: Str::of(42) is "42", Str::of("a") is "a"
+  fun of(v): str {
+    if (__type(v) == "str") return v;
+    return __show(v);
+  }
+}

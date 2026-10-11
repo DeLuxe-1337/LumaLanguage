@@ -564,9 +564,18 @@ static void emit_ffi_call(G *g, const IrInstr *in) {
     }
     for (int i = 0; i < in->nargs; i++) E(g, "    mov %s, %s", R64[ARGREG[i]], mem_text(g, base + i, "qword"));
     E(g, "    xor eax, eax    # no vector registers used (variadic-safe)");
-    E(g, "    call %s@PLT", gl->name);
+    E(g, "    call %s@PLT", gl->csym ? gl->csym : gl->name);
     if (gl->cret == CT_VOID) {
         emit_imm(g, RAX, (int64_t)LUMA_NIL);
+    } else if (gl->cret == CT_CSRET) { /* a C struct by value: eightbytes in rax:rdx */
+        char text[600];
+        snprintf(text, sizeof text, "return value of %s", gl->name);
+        int c = ffi_context(text);
+        E(g, "    mov rdi, rax");
+        E(g, "    mov rsi, rdx");
+        E(g, "    lea rdx, [rip + .Lffi.%d]", c);
+        E(g, "    lea rcx, [rip + .Lstruct.%d]", gl->cret_sid);
+        E(g, "    call luma_ffi_ret_cs@PLT");
     } else {
         char text[600];
         snprintf(text, sizeof text, "return value of %s", gl->name);

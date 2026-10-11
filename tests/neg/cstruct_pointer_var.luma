@@ -1,0 +1,2 @@
+extern struct S { x: i32 }
+var p: *S = nil;

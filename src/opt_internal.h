@@ -24,6 +24,9 @@ bool opt_module_has_drop(const IrModule *m);
  * deref method (the runtime calls it on a miss), and printing when some
  * struct has a show method. */
 bool opt_runs_code(const IrModule *m, const IrInstr *in);
+/* A runtime function that only allocates or reads: it frees nothing and
+ * runs no Luma code (std primitives, printing separators, refcount). */
+bool opt_runtime_frees_nothing(const char *name);
 /* A runtime call that prints a value (and calls show() methods). */
 bool opt_is_print_call(const IrModule *m, const IrInstr *in);
 bool opt_has_effect(const IrModule *m, const IrInstr *in, const IrTy *vty);

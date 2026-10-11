@@ -523,6 +523,7 @@ static Stmt *statement(Parser *p);
 /* type → ( IDENTIFIER ( "<" type ( "," type )* ">" )? | "nil" ) "?"?
  * Names are validated by lowering. */
 static bool parse_type(Parser *p, TypeRef *out) {
+    if (match(p, TOK_STAR)) out->pointer = true; /* *S (extern signatures check where it is allowed) */
     Token *t = cur(p);
     if (t->kind != TOK_IDENTIFIER && t->kind != TOK_NIL) {
         expected(p, "a type name");
@@ -826,11 +827,18 @@ static Stmt *extern_declaration(Parser *p, const Token *kw) {
         error_at(p, kw, "extern declarations are only allowed at top level");
         return NULL;
     }
-    if (!consume(p, TOK_FUN, "'fun' after 'extern'")) return NULL;
+    /* extern "symbol" fun name(...): the C symbol differs from the Luma name */
+    Token *sym = check(p, TOK_STRING) ? advance(p) : NULL;
+    if (sym && (sym->value_len == 0 || memchr(sym->value, '\0', sym->value_len))) {
+        error_at(p, sym, "the C symbol name after 'extern' is empty");
+        return NULL;
+    }
+    if (!consume(p, TOK_FUN, sym ? "'fun' after the C symbol name" : "'fun' (or a \"C symbol\" string) after 'extern'")) return NULL;
     Token *name = cur(p);
     if (!consume(p, TOK_IDENTIFIER, "C function name after 'extern fun'")) return NULL;
     Stmt *s = new_stmt(STMT_EXTERN, kw);
     s->name = xstrndup(name->lexeme, name->lexeme_len);
+    if (sym) s->csym = xstrndup(sym->value, sym->value_len);
     s->line = name->line;
     s->col = name->col;
     if (!parse_params(p, s, true)) { stmt_free(s); return NULL; }
@@ -931,6 +939,13 @@ static Stmt *declaration(Parser *p) {
         Token *kw = advance(p);
         return impl_declaration(p, kw);
     }
+    if (check(p, TOK_EXTERN) && peek_is(p, 1, TOK_STRUCT)) { /* extern struct NAME { field: ctype, ... } */
+        Token *kw = advance(p);
+        advance(p);
+        Stmt *s = struct_declaration(p, kw);
+        if (s) s->cstruct = true;
+        return s;
+    }
     if (check(p, TOK_EXTERN)) {
         Token *kw = advance(p);
         return extern_declaration(p, kw);
@@ -1008,6 +1023,7 @@ void stmt_free(Stmt *s) {
     free(s->params);
     free(s->param_types);
     free(s->param_move);
+    free(s->csym);
     typeref_free(&s->type);
     free(s->param_line);
     free(s->param_col);
@@ -1127,7 +1143,7 @@ static void dump_expr(const Expr *e) {
 }
 
 static void dump_type_name(const TypeRef *t) {
-    printf("%s", t->name);
+    printf("%s%s", t->pointer ? "*" : "", t->name);
     if (t->nargs) {
         printf("<");
         for (size_t i = 0; i < t->nargs; i++) {
@@ -1204,7 +1220,7 @@ static void dump_stmt(const Stmt *s, int indent) {
         printf(")\n");
         break;
     case STMT_STRUCT:
-        printf("(%sstruct %s", s->shared ? "shared " : "", s->name);
+        printf("(%sstruct %s", s->cstruct ? "extern " : s->shared ? "shared " : "", s->name);
         dump_tparams(s);
         printf(" ");
         dump_params(s);

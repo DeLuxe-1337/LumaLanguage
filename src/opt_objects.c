@@ -139,10 +139,8 @@ bool opt_objects(IrModule *m, IrFunc *f) {
                  * instances (a later read must reach memory, where memcheck can
                  * see the bug): only runtime calls known to do neither keep
                  * what we know (printing runs show() methods, if any) */
-                static const char *const KEEP[] = {"luma_write_space", "luma_write_newline", "luma_refcount"};
-                bool keep = g->kind == IRG_CEXTERN || (opt_is_print_call(m, in) && !opt_runs_code(m, in));
-                for (size_t i = 0; g->kind == IRG_EXTERN && i < sizeof KEEP / sizeof *KEEP; i++)
-                    keep |= strcmp(g->name, KEEP[i]) == 0;
+                bool keep = g->kind == IRG_CEXTERN || (opt_is_print_call(m, in) && !opt_runs_code(m, in)) ||
+                            (g->kind == IRG_EXTERN && opt_runtime_frees_nothing(g->name));
                 if (!keep) nknown = 0;
                 break;
             }

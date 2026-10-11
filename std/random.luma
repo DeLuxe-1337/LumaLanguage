@@ -1,0 +1,31 @@
+// Random: a seeded pseudo-random generator (a linear congruential
+// generator mod 2^31; reproducible, not for cryptography).
+shared struct Random { __state: int }
+
+impl Random {
+  fun new(seed: int): Random { return Random { __state: Math::mod(seed, 2147483648) }; }
+
+  // the next number, 0 <= n < 2^31
+  fun next(self): int {
+    self.__state = Math::mod(1103515245 * self.__state + 12345, 2147483648);
+    return self.__state;
+  }
+
+  // lo <= n < hi
+  fun range(self, lo: int, hi: int): int {
+    if (hi <= lo) return __fail("Random::range: empty range.");
+    return lo + Math::mod(self.next() / 64, hi - lo);
+  }
+
+  fun bool(self): bool { return Math::mod(self.next() / 64, 2) == 0; }
+
+  // shuffles a List in place (Fisher-Yates)
+  fun shuffle(self, list) {
+    for (var i = list.len() - 1; i > 0; i = i - 1) {
+      var j = self.range(0, i + 1);
+      var t = list.get(i);
+      list.set(i, list.get(j));
+      list.set(j, t);
+    }
+  }
+}

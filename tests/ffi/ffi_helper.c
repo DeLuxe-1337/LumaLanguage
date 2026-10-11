@@ -52,3 +52,24 @@ void *buf_new(int32_t n) { return calloc((size_t)n, sizeof(int32_t)); }
 void buf_set(void *p, int32_t i, int32_t v) { ((int32_t *)p)[i] = v; }
 int32_t buf_get(void *p, int32_t i) { return ((int32_t *)p)[i]; }
 void buf_free(void *p) { free(p); }
+
+/* C structs (extern struct): by value in one or two eightbytes, by pointer,
+ * padding, and a struct C owns. */
+typedef struct { int32_t x, y; } Pair32;           /* 8 bytes: rdi */
+typedef struct { int64_t a, b; } Pair64;           /* 16 bytes: rsi:rdx etc. */
+typedef struct { uint8_t r, g, b; uint16_t w; } Mixed; /* padding: w at 4, size 6 */
+typedef struct { int64_t a, b, c; } Big;           /* 24 bytes: by pointer only */
+
+int64_t pair32_sum(Pair32 p) { return (int64_t)p.x + p.y; }
+Pair32 pair32_make(int32_t x, int32_t y) { Pair32 p = {x, y}; return p; }
+int64_t pair64_sum(Pair64 p) { return p.a + p.b; }
+Pair64 pair64_swap(Pair64 p) { Pair64 q = {p.b, p.a}; return q; }
+void pair64_scale(Pair64 *p, int64_t k) { p->a *= k; p->b *= k; }
+int64_t around_pair(int64_t a, Pair64 p, int64_t b) { return a * 1000 + p.a * 100 + p.b * 10 + b; }
+uint16_t mixed_w(Mixed m) { return (uint16_t)(m.w + m.r + m.g + m.b); }
+Mixed mixed_make(uint8_t r, uint16_t w) { Mixed m = {r, (uint8_t)(r + 1), (uint8_t)(r + 2), w}; return m; }
+int64_t mixed_size(void) { return (int64_t)sizeof(Mixed); }
+int64_t big_sum(const Big *b) { return b->a + b->b + b->c; }
+static Big the_big = {1, 2, 3};
+Big *big_global(void) { return &the_big; }
+Big *big_null(void) { return 0; }

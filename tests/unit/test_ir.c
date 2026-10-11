@@ -115,6 +115,23 @@ static void test_roundtrip(void) {
     expect_roundtrip("module \"x\"\n\nfn @f() {\nb:\n  %0 = const 1\n  ret %0\n}\n");
     expect_roundtrip("module \"s\"\n\nshared struct T {x: int}\nstruct U {t: T?}\n");
     expect_roundtrip("module \"mv\"\n\nfn @f(move %a, %b: int, move %c) {\nentry:\n  ret %a\n}\n");
+    /* C structs (v0.9): fields with C types, by-value eightbytes and results, symbol aliases */
+    expect_roundtrip("module \"cs\"\n\ncstruct P {a: i64, b: i32, s: cstr?}\n\n"
+                     "extern c fn @f(p: cs0, p: cs1, q: ptr): struct P symbol \"real_f\"\n");
+    {
+        IrModule m;
+        const char *src = "module \"l\"\n\ncstruct M {r: u8, g: u8, b: u8, w: u16, p: ptr}\n";
+        CHECK(ir_parse("t.lir", src, strlen(src), &m));
+        const IrStruct *st = &m.structs[0];
+        CHECK(st->cstruct && st->shared && st->ncf == 5 && st->cfoffs[3] == 4 && st->cfoffs[4] == 8 && st->csize == 16);
+        CHECK(st->nfields == 2 && strcmp(st->fields[0], "__ptr") == 0);
+        ir_module_free(&m);
+    }
+    {
+        const char *bad = "module \"x\"\n\ncstruct Q {a: int}\n";
+        IrModule m;
+        CHECK(!ir_parse("t.lir", bad, strlen(bad), &m));
+    }
     /* generic instances: names with type arguments, in types and field references */
     expect_roundtrip("module \"g\"\n\nstruct Box<int?> {value: int?}\nstruct Pair<Box<int?>,str> {first: Box<int?>, second: str}\n\ndata @ctx = str \"x\"\n\n"
                      "fn @f(%p: Pair<Box<int?>,str>?): int? {\nentry:\n  %p = check %p, Pair<Box<int?>,str>, @ctx\n"

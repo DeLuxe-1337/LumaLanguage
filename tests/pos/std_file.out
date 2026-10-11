@@ -1,0 +1,10 @@
+true true false
+true ["one", "two", "three"]
+File(build/test/std_file.txt) one two three nil
+File(build/test/std_file.txt, closed) true 4
+x
+y true true
+true false false
+[0, 22, 74, 43, 95]
+[0, 22, 43, 74, 95] true
+hi 3

@@ -87,6 +87,7 @@ static bool lex_string(Lexer *lx, Token *tok) {
             case '"': out = '"'; break;
             case '\\': out = '\\'; break;
             case 'n': out = '\n'; break;
+            case 'r': out = '\r'; break;
             case 't': out = '\t'; break;
             case -1:
                 lex_error(lx, sline, scol, "unterminated string literal (reached end of file)", NULL);
@@ -96,7 +97,7 @@ static bool lex_string(Lexer *lx, Token *tok) {
                 char esc[3] = {'\\', (char)e, 0};
                 if (e < 0x20 || e >= 0x7f) strcpy(esc, "\\?");
                 lex_error(lx, eline, ecol,
-                          "unsupported escape sequence '%s' (supported: \\\" \\\\ \\n \\t)", esc);
+                          "unsupported escape sequence '%s' (supported: \\\" \\\\ \\n \\r \\t)", esc);
                 buf_free(&val);
                 return false;
             }

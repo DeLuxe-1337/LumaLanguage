@@ -1,0 +1,1 @@
+field 'name' of S is a C string: it can be read, not written (its memory belongs to C)

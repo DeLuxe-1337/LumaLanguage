@@ -1,0 +1,1 @@
+extern struct S<T> { x: i32 }

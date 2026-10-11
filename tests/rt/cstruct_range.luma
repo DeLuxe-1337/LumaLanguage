@@ -1,0 +1,4 @@
+extern struct S { small: i8 }
+var s = S { small: 1 };
+var n = 300;
+s.small = n;

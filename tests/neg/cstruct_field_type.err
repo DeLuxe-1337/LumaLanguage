@@ -1,0 +1,1 @@
+field 'x' of C struct 'S' needs a C type: i8..i64, u8..u64, bool, ptr, cstr or cstr?

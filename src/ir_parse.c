@@ -738,6 +738,9 @@ static bool prescan_structs(P *p) {
             j += 6;
             while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
         }
+        bool cstruct = !shared && p->len - j > 8 && memcmp(p->src + j, "cstruct", 7) == 0 &&
+                       (p->src[j + 7] == ' ' || p->src[j + 7] == '\t');
+        if (cstruct) j++; /* "cstruct": the rest is as for "struct" */
         if (p->len - j > 7 && memcmp(p->src + j, "struct", 6) == 0 && (p->src[j + 6] == ' ' || p->src[j + 6] == '\t')) {
             j += 6;
             while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
@@ -773,6 +776,7 @@ static bool prescan_structs(P *p) {
             int sid = ir_add_struct(p->m, name);
             p->m->structs[sid].line = line;
             p->m->structs[sid].shared = shared;
+            p->m->structs[sid].cstruct = cstruct; /* (fields set by parse_struct) */
         }
         while (i < p->len && p->src[i] != '\n') i++;
         i++;
@@ -783,7 +787,7 @@ static bool prescan_structs(P *p) {
 
 /* struct NAME {field: type, field, ...} [methods {name = @fn, ...}] */
 static bool parse_struct(P *p) {
-    next(p); /* 'struct' */
+    next(p); /* 'struct' or 'cstruct' */
     int sid = p->tok.kind == T_IDENT ? ir_find_struct(p->m, p->tok.text) : -1;
     if (sid < 0) {
         perr(p, p->tok.line, "expected a struct name, found %s", tok_desc(&p->tok));
@@ -794,6 +798,8 @@ static bool parse_struct(P *p) {
     char names[256][256];
     const char *np[256];
     IrTy tys[256];
+    CType ctys[256];
+    bool cstruct = p->m->structs[sid].cstruct;
     int n = 0;
     while (!is_punct(p, '}')) {
         if (n > 0 && !expect_punct(p, ',')) return false;
@@ -811,14 +817,27 @@ static bool parse_struct(P *p) {
         np[n] = names[n];
         tys[n] = TY_ANY;
         next(p);
-        if (is_punct(p, ':')) {
+        if (cstruct) { /* name: ctype */
+            if (!expect_punct(p, ':')) return false;
+            char tn[256];
+            snprintf(tn, sizeof tn, "%s", p->tok.kind == T_IDENT ? p->tok.text : "");
+            int tl = p->tok.line;
+            next(p);
+            bool opt = is_punct(p, '?');
+            if (opt) next(p);
+            if (!ctype_from_name(tn, opt, &ctys[n]) || !ctype_is_field(ctys[n])) {
+                perr(p, tl, "'%s%s' is not a C field type", tn, opt ? "?" : "");
+                return false;
+            }
+        } else if (is_punct(p, ':')) {
             next(p);
             if (!take_type(p, &tys[n])) return false;
         }
         n++;
     }
     next(p);
-    ir_struct_set_fields(p->m, sid, n, np, tys);
+    if (cstruct) ir_cstruct_set_fields(p->m, sid, n, np, ctys);
+    else ir_struct_set_fields(p->m, sid, n, np, tys);
     if (is_ident(p, "methods")) {
         next(p);
         if (!expect_punct(p, '{')) return false;
@@ -918,7 +937,9 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
                     next(&p);
                     bool opt = is_punct(&p, '?');
                     if (opt) next(&p);
-                    if (!ctype_from_name(tn, opt, &types[np])) { perr(&p, tline, "unknown C type '%s%s'", tn, opt ? "?" : ""); goto fail; }
+                    if (!opt && strcmp(tn, "cs0") == 0) types[np] = CT_CSW0; /* a by-value struct's eightbytes */
+                    else if (!opt && strcmp(tn, "cs1") == 0) types[np] = CT_CSW1;
+                    else if (!ctype_from_name(tn, opt, &types[np])) { perr(&p, tline, "unknown C type '%s%s'", tn, opt ? "?" : ""); goto fail; }
                     np++;
                 }
                 next(&p);
@@ -931,10 +952,25 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
                 bool ropt = is_punct(&p, '?');
                 if (ropt) next(&p);
                 CType ret;
-                if (!ctype_from_name(rn, ropt, &ret)) { perr(&p, rline, "unknown C type '%s%s'", rn, ropt ? "?" : ""); goto fail; }
-                if (!expect_nl(&p)) goto fail;
+                int ret_sid = -1;
+                if (!ropt && strcmp(rn, "struct") == 0) { /* struct NAME: a C struct returned by value */
+                    ret_sid = p.tok.kind == T_IDENT ? ir_find_struct(out, p.tok.text) : -1;
+                    if (ret_sid < 0 || !out->structs[ret_sid].cstruct) { perr(&p, rline, "expected a C struct after 'struct'"); goto fail; }
+                    next(&p);
+                    ret = CT_CSRET;
+                } else if (!ctype_from_name(rn, ropt, &ret)) { perr(&p, rline, "unknown C type '%s%s'", rn, ropt ? "?" : ""); goto fail; }
+                char *csym = NULL;
+                if (is_ident(&p, "symbol")) { /* the C symbol called, when not the global's name */
+                    next(&p);
+                    if (p.tok.kind != T_STRING || !p.tok.str.len) { perr(&p, p.tok.line, "expected the C symbol as a string"); goto fail; }
+                    csym = xstrndup((const char *)p.tok.str.data, p.tok.str.len);
+                    next(&p);
+                }
+                if (!expect_nl(&p)) { free(csym); goto fail; }
                 int g = ir_add_cextern(out, name, np, types, pn, ret);
                 out->globals[g].line = line;
+                out->globals[g].csym = csym;
+                out->globals[g].cret_sid = ret_sid;
                 continue;
             }
             if (!expect_ident(&p, "fn")) goto fail;
@@ -984,7 +1020,7 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
                 goto fail;
             }
             if (!parse_struct(&p)) goto fail;
-        } else if (is_ident(&p, "struct")) {
+        } else if (is_ident(&p, "struct") || is_ident(&p, "cstruct")) {
             if (!parse_struct(&p)) goto fail;
         } else if (is_ident(&p, "fn")) {
             if (!parse_function(&p)) goto fail;

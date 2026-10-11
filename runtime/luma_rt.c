@@ -55,8 +55,18 @@ struct LumaStructDesc {
     const LumaMethod *methods;
     LumaFn drop;           /* the struct's drop(self) method, called when an instance dies; or NULL */
     LumaFn show;           /* its show(self): str method, how print shows an instance; or NULL */
-    int64_t flags;         /* LUMA_STRUCT_SHARED */
+    int64_t flags;         /* LUMA_STRUCT_SHARED, LUMA_STRUCT_C */
+    const struct LumaCLayout *c; /* a C struct's fields (LUMA_STRUCT_C), or NULL */
 };
+
+/* A C struct's layout (System V), emitted by the compiler. */
+typedef struct LumaCLayout {
+    int64_t size;
+    int64_t nfields;
+    const char *const *names;
+    const int64_t *ctypes;  /* LUMA_CT_* */
+    const int64_t *offsets;
+} LumaCLayout;
 
 typedef struct {
     uint64_t header;
@@ -108,6 +118,20 @@ static bool is_string(LumaValue v) {
 }
 
 static const LumaString *as_string(LumaValue v) { return (const LumaString *)(uintptr_t)v; }
+
+/* An array (the std library's List storage, reached only through prelude
+ * intrinsics): counted like a string, its items are references. */
+typedef struct {
+    uint64_t header;
+    uint64_t len;
+    LumaValue items[];
+} LumaArray;
+
+static bool is_array(LumaValue v) {
+    return is_object(v) && (((const LumaString *)(uintptr_t)v)->header & 0xff) == LUMA_TYPE_ARRAY;
+}
+
+static LumaArray *as_array(LumaValue v) { return (LumaArray *)(uintptr_t)v; }
 
 static bool is_struct(LumaValue v) {
     return is_object(v) && (((const LumaString *)(uintptr_t)v)->header & 0xff) == LUMA_TYPE_STRUCT;
@@ -398,8 +422,14 @@ static void drain(void) {
             LumaStruct *s = o;
             run_drop(s, true);
             int64_t n = desc_of(s)->nfields;
+            if ((desc_of(s)->flags & LUMA_STRUCT_C) && s->fields[1] == luma_fixnum(1)) /* owned C memory */
+                free((void *)(uintptr_t)fixnum_val(s->fields[0]));
             for (int64_t k = 0; k < n; k++) drop(s->fields[k]);
             free_object(o, false, n);
+        } else if ((*(uint64_t *)o & 0xff) == LUMA_TYPE_ARRAY) {
+            LumaArray *a = o;
+            for (uint64_t k = 0; k < a->len; k++) drop(a->items[k]);
+            free_object(o, false, 0);
         } else {
             free_object(o, false, 0);
         }
@@ -503,6 +533,7 @@ static const char *struct_name(unsigned id) {
 static const char *value_type_name(LumaValue v) {
     unsigned vm = value_mask(v);
     if (vm & MASK_STRUCT) return desc_of(as_struct(v))->name;
+    if (is_array(v)) return "array";
     switch (vm) {
     case MASK_INT: return "int";
     case MASK_STR: return "str";
@@ -645,6 +676,143 @@ LumaValue luma_ffi_ret_cstr_opt(uint64_t r, const char *c) {
     return r ? string_from_c((const char *)(uintptr_t)r) : LUMA_NIL;
 }
 
+/* ---- C structs (extern struct) -------------------------------------------
+ * A C struct value is a counted struct instance whose fields 0 and 1 hold the
+ * address of its C memory and whether it owns it (both as Luma ints); the
+ * descriptor's layout says where each C field is. Owned memory is calloc'd
+ * (rounded up to 16 bytes, so by-value calls can read whole eightbytes) and
+ * freed with the instance; views of memory C owns (*S results) are not. */
+
+LumaValue luma_new_struct(const LumaStructDesc *d, int64_t counted);
+
+static char *cdata(const LumaStruct *o) { return (char *)(uintptr_t)fixnum_val(o->fields[0]); }
+
+static LumaValue cfield_get(const LumaStruct *o, int64_t k) {
+    const LumaCLayout *c = desc_of(o)->c;
+    const char *p = cdata(o) + c->offsets[k];
+    switch (c->ctypes[k]) {
+    case LUMA_CT_I8: return luma_fixnum(*(const int8_t *)p);
+    case LUMA_CT_I16: { int16_t v; memcpy(&v, p, 2); return luma_fixnum(v); }
+    case LUMA_CT_I32: { int32_t v; memcpy(&v, p, 4); return luma_fixnum(v); }
+    case LUMA_CT_U8: return luma_fixnum(*(const uint8_t *)p);
+    case LUMA_CT_U16: { uint16_t v; memcpy(&v, p, 2); return luma_fixnum(v); }
+    case LUMA_CT_U32: { uint32_t v; memcpy(&v, p, 4); return luma_fixnum(v); }
+    case LUMA_CT_BOOL: return make_bool(*p != 0);
+    default: break;
+    }
+    uint64_t w;
+    memcpy(&w, p, 8);
+    char ctx[300];
+    snprintf(ctx, sizeof ctx, "field '%s' of %s", c->names[k], desc_of(o)->name);
+    switch (c->ctypes[k]) {
+    case LUMA_CT_I64: return luma_ffi_ret_i64(w, ctx);
+    case LUMA_CT_U64: return luma_ffi_ret_u64(w, ctx);
+    case LUMA_CT_PTR: return luma_ffi_ret_ptr(w, ctx);
+    case LUMA_CT_CSTR: return luma_ffi_ret_cstr(w, ctx);
+    default: return luma_ffi_ret_cstr_opt(w, ctx);
+    }
+}
+
+static void cfield_set(LumaStruct *o, int64_t k, LumaValue v) {
+    const LumaCLayout *c = desc_of(o)->c;
+    char *p = cdata(o) + c->offsets[k];
+    char ctx[300];
+    snprintf(ctx, sizeof ctx, "field '%s' of %s", c->names[k], desc_of(o)->name);
+    uint64_t w;
+    switch (c->ctypes[k]) {
+    case LUMA_CT_I8: w = luma_ffi_arg_i8(v, ctx); break;
+    case LUMA_CT_I16: w = luma_ffi_arg_i16(v, ctx); break;
+    case LUMA_CT_I32: w = luma_ffi_arg_i32(v, ctx); break;
+    case LUMA_CT_I64: w = luma_ffi_arg_i64(v, ctx); break;
+    case LUMA_CT_U8: w = luma_ffi_arg_u8(v, ctx); break;
+    case LUMA_CT_U16: w = luma_ffi_arg_u16(v, ctx); break;
+    case LUMA_CT_U32: w = luma_ffi_arg_u32(v, ctx); break;
+    case LUMA_CT_U64: w = luma_ffi_arg_u64(v, ctx); break;
+    case LUMA_CT_BOOL: w = luma_ffi_arg_bool(v, ctx); break;
+    case LUMA_CT_PTR: w = luma_ffi_arg_ptr(v, ctx); break;
+    default: panicf("%s is a C string: it can be read, not written (its memory belongs to C).", ctx);
+    }
+    int size = c->ctypes[k] == LUMA_CT_I8 || c->ctypes[k] == LUMA_CT_U8 || c->ctypes[k] == LUMA_CT_BOOL ? 1
+             : c->ctypes[k] == LUMA_CT_I16 || c->ctypes[k] == LUMA_CT_U16 ? 2
+             : c->ctypes[k] == LUMA_CT_I32 || c->ctypes[k] == LUMA_CT_U32 ? 4 : 8;
+    memcpy(p, &w, (size_t)size); /* little-endian: the low bytes */
+}
+
+static int64_t cfield_index(const LumaStruct *o, const char *name) {
+    const LumaCLayout *c = desc_of(o)->c;
+    for (int64_t i = 0; i < c->nfields; i++)
+        if (strcmp(c->names[i], name) == 0) return i;
+    return -1;
+}
+
+static LumaStruct *need_cstruct(LumaValue v) {
+    check_valid(v);
+    if (!is_struct(v) || !(desc_of(as_struct(v))->flags & LUMA_STRUCT_C))
+        panicf("internal error: C struct expected, got %s.", value_type_name(v));
+    return as_struct(v);
+}
+
+/* `S { ... }` of a C struct: new zeroed C memory, owned. */
+LumaValue luma_cs_init(LumaValue v) {
+    LumaStruct *o = need_cstruct(v);
+    size_t size = ((size_t)desc_of(o)->c->size + 15) / 16 * 16;
+    void *p = calloc(1, size ? size : 16);
+    if (!p) luma_panic("Out of memory.");
+    o->fields[0] = luma_fixnum((int64_t)(uintptr_t)p);
+    o->fields[1] = luma_fixnum(1);
+    return LUMA_NIL;
+}
+
+/* s.f / s.f = v with the field's index k known at compile time. */
+LumaValue luma_cs_get(LumaValue v, LumaValue k) { return cfield_get(need_cstruct(v), fixnum_val(k)); }
+
+LumaValue luma_cs_set(LumaValue v, LumaValue k, LumaValue x) {
+    cfield_set(need_cstruct(v), fixnum_val(k), x);
+    return LUMA_NIL;
+}
+
+/* A *S argument: the address of s's C memory, 0 for nil. */
+LumaValue luma_cs_addr(LumaValue v) {
+    if (v == LUMA_NIL) return luma_fixnum(0);
+    return need_cstruct(v)->fields[0];
+}
+
+/* A *S result, or S::at(p): v was made as a view of address p (fields
+ * p, 0). NULL is nil when allowed (nullable), else a runtime error. */
+LumaValue luma_cs_view(LumaValue v, LumaValue nullable, LumaValue what) {
+    LumaStruct *o = need_cstruct(v);
+    if (o->fields[0] == luma_fixnum(0)) {
+        if (nullable == LUMA_TRUE) return LUMA_NIL;
+        panicf("%s is a NULL pointer to %s.", is_string(what) ? as_string(what)->bytes : "a C struct", desc_of(o)->name);
+    }
+    luma_retain(v);
+    return v;
+}
+
+/* A C struct argument passed by value (at most 16 bytes): its eightbytes. */
+static uint64_t cs_word(LumaValue v, const char *ctx, int i) {
+    check_valid(v);
+    if (!is_struct(v) || !(desc_of(as_struct(v))->flags & LUMA_STRUCT_C)) panicf("%s expects a C struct, got %s.", ctx, value_type_name(v));
+    const LumaStruct *o = as_struct(v);
+    int64_t size = desc_of(o)->c->size;
+    uint64_t w = 0;
+    if (size > 8 * i) memcpy(&w, cdata(o) + 8 * i, (size_t)(size - 8 * i < 8 ? size - 8 * i : 8));
+    return w;
+}
+
+uint64_t luma_ffi_arg_cs0(LumaValue v, const char *c) { return cs_word(v, c, 0); }
+uint64_t luma_ffi_arg_cs1(LumaValue v, const char *c) { return cs_word(v, c, 1); }
+
+/* A C struct returned by value: rax and rdx hold its eightbytes. */
+LumaValue luma_ffi_ret_cs(uint64_t lo, uint64_t hi, const char *c, const LumaStructDesc *d) {
+    (void)c;
+    LumaValue v = luma_new_struct(d, luma_mm != LUMA_MM_NONE);
+    luma_cs_init(v);
+    uint64_t w[2] = {lo, hi};
+    memcpy(cdata(as_struct(v)), w, (size_t)(d->c->size < 16 ? d->c->size : 16));
+    return v;
+}
+
 /* ---- printing ----------------------------------------------------------
  * The builtin print(a, b, ...) lowers to
  *     luma_write(a); luma_write_space(); luma_write(b); ...; luma_write_newline();
@@ -678,12 +846,32 @@ static void write_value(FILE *out, LumaValue v, bool quoted) {
             else fputc(c, out);
         }
         fputc('"', out);
+    } else if (is_array(v)) {
+        const LumaArray *a = as_array(v);
+        fputc('[', out);
+        for (uint64_t i = 0; i < a->len; i++) {
+            if (i) fputs(", ", out);
+            write_value(out, a->items[i], true);
+        }
+        fputc(']', out);
     } else if (is_struct(v)) {
         const LumaStruct *o = as_struct(v);
         bool cycle = nprinting == MAX_PRINT_DEPTH;
         for (int i = 0; i < nprinting && !cycle; i++) cycle = printing[i] == o;
         if (cycle) {
             fprintf(out, "%s { ... }", desc_of(o)->name);
+            return;
+        }
+        if ((desc_of(o)->flags & LUMA_STRUCT_C) && !desc_of(o)->show) {
+            const LumaCLayout *c = desc_of(o)->c;
+            fprintf(out, "%s {", desc_of(o)->name);
+            for (int64_t i = 0; i < c->nfields; i++) {
+                fprintf(out, "%s %s: ", i ? "," : "", c->names[i]);
+                LumaValue f = cfield_get(o, i);
+                write_value(out, f, true);
+                luma_release(f);
+            }
+            fputs(c->nfields ? " }" : "}", out);
             return;
         }
         if (desc_of(o)->show) {
@@ -845,6 +1033,10 @@ static _Noreturn void no_member(const LumaStruct *s, const char *kind, const cha
  * temporary that deref returned). */
 LumaValue luma_getfield(LumaValue o, const char *name) {
     LumaStruct *s = need_instance(o, "fields");
+    if (desc_of(s)->flags & LUMA_STRUCT_C) {
+        int64_t k = cfield_index(s, name);
+        if (k >= 0) return cfield_get(s, k);
+    }
     Derefs ds;
     s = deref_for(s, name, false, "fields", &ds);
     int64_t k = find_field(s, name);
@@ -857,6 +1049,14 @@ LumaValue luma_getfield(LumaValue o, const char *name) {
 
 LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
     LumaStruct *s = need_instance(o, "fields");
+    if (desc_of(s)->flags & LUMA_STRUCT_C) {
+        int64_t k = cfield_index(s, name);
+        if (k >= 0) {
+            cfield_set(s, k, v);
+            luma_release(v); /* (a setfield takes over its value: C memory keeps a copy) */
+            return LUMA_NIL;
+        }
+    }
     Derefs ds;
     s = deref_for(s, name, false, "fields", &ds);
     int64_t k = find_field(s, name);
@@ -887,6 +1087,8 @@ LumaValue luma_free(LumaValue v) {
     if (!is_struct(v)) panicf("free() expects a struct instance, got %s.", value_type_name(v));
     LumaStruct *o = as_struct(v);
     const LumaStructDesc *d = desc_of(o);
+    if (d->flags & LUMA_STRUCT_C)
+        panicf("'%s' is a C struct: its value is freed automatically (and memory C owns stays C's).", d->name);
     if (d->flags & LUMA_STRUCT_SHARED)
         panicf("'%s' is a shared struct; it is freed when its last reference goes away.", d->name);
     if (is_dropping(o)) panicf("free() of an instance of '%s' whose drop() is running.", d->name);
@@ -918,6 +1120,248 @@ LumaValue luma_dispose(LumaValue v) {
 LumaValue luma_refcount(LumaValue v) {
     check_valid(v);
     return luma_fixnum(is_object(v) ? *rc_word((void *)(uintptr_t)v) : 0);
+}
+
+/* ---- std library primitives (prelude intrinsics, used by the std files) ---
+ * Like every runtime function they borrow their arguments and return a
+ * reference the caller owns. Bad arguments are runtime errors: the std
+ * library checks what users pass before calling these. */
+
+static int64_t need_int(LumaValue v, const char *what) {
+    check_valid(v);
+    if (!is_fixnum(v)) panicf("%s expects int, got %s.", what, value_type_name(v));
+    return fixnum_val(v);
+}
+
+static const LumaString *need_str(LumaValue v, const char *what) {
+    check_valid(v);
+    if (!is_string(v)) panicf("%s expects str, got %s.", what, value_type_name(v));
+    return as_string(v);
+}
+
+static LumaArray *need_array(LumaValue v) {
+    check_valid(v);
+    if (!is_array(v)) panicf("internal error: array expected, got %s.", value_type_name(v));
+    return as_array(v);
+}
+
+static LumaValue string_from_bytes(const char *p, size_t n) {
+    LumaString *s = new_string(n);
+    memcpy(s->bytes, p, n);
+    return (LumaValue)(uintptr_t)s;
+}
+
+/* __array_new(n): n items, all nil. */
+LumaValue luma_array_new(LumaValue n) {
+    int64_t len = need_int(n, "array size");
+    if (len < 0 || len > (int64_t)(SIZE_MAX / 16)) panicf("Bad array size %" PRId64 ".", len);
+    LumaArray *a = alloc_object(sizeof *a + (size_t)len * sizeof(LumaValue));
+    a->header = LUMA_TYPE_ARRAY | ((uint64_t)(luma_mm != LUMA_MM_NONE) << 32);
+    a->len = (uint64_t)len;
+    for (int64_t i = 0; i < len; i++) a->items[i] = LUMA_NIL;
+    return (LumaValue)(uintptr_t)a;
+}
+
+LumaValue luma_array_len(LumaValue a) { return luma_fixnum((int64_t)need_array(a)->len); }
+
+static uint64_t array_index(const LumaArray *a, LumaValue i) {
+    int64_t k = need_int(i, "array index");
+    if (k < 0 || (uint64_t)k >= a->len) panicf("Index %" PRId64 " is out of range (length %" PRIu64 ").", k, a->len);
+    return (uint64_t)k;
+}
+
+LumaValue luma_array_get(LumaValue a, LumaValue i) {
+    LumaArray *arr = need_array(a);
+    LumaValue v = arr->items[array_index(arr, i)];
+    luma_retain(v);
+    return v;
+}
+
+LumaValue luma_array_set(LumaValue a, LumaValue i, LumaValue v) {
+    LumaArray *arr = need_array(a);
+    uint64_t k = array_index(arr, i);
+    check_valid(v);
+    luma_retain(v); /* the array holds its own reference */
+    LumaValue old = arr->items[k];
+    arr->items[k] = v;
+    luma_release(old);
+    return LUMA_NIL;
+}
+
+LumaValue luma_str_len(LumaValue s) { return luma_fixnum((int64_t)need_str(s, "Str::len")->len); }
+
+/* __str_byte(s, i): the byte at i (0-255). */
+LumaValue luma_str_byte(LumaValue s, LumaValue i) {
+    const LumaString *x = need_str(s, "Str::byte");
+    int64_t k = need_int(i, "Str::byte");
+    if (k < 0 || (uint64_t)k >= x->len) panicf("Index %" PRId64 " is out of range (length %" PRIu64 ").", k, x->len);
+    return luma_fixnum((unsigned char)x->bytes[k]);
+}
+
+/* __str_char(b): a one-byte string. */
+LumaValue luma_str_char(LumaValue b) {
+    int64_t c = need_int(b, "Str::char");
+    if (c < 0 || c > 255) panicf("Str::char expects a byte (0-255), got %" PRId64 ".", c);
+    char ch = (char)c;
+    return string_from_bytes(&ch, 1);
+}
+
+/* __str_slice(s, from, to): bytes [from, to), 0 <= from <= to <= len. */
+LumaValue luma_str_slice(LumaValue s, LumaValue from, LumaValue to) {
+    const LumaString *x = need_str(s, "Str::slice");
+    int64_t a = need_int(from, "Str::slice"), b = need_int(to, "Str::slice");
+    if (a < 0 || b < a || (uint64_t)b > x->len)
+        panicf("Slice [%" PRId64 ", %" PRId64 ") is out of range (length %" PRIu64 ").", a, b, x->len);
+    return string_from_bytes(x->bytes + a, (size_t)(b - a));
+}
+
+/* __str_find(s, sub, from): the first index >= from where sub occurs, or -1. */
+LumaValue luma_str_find(LumaValue s, LumaValue sub, LumaValue from) {
+    const LumaString *x = need_str(s, "Str::find"), *y = need_str(sub, "Str::find");
+    int64_t a = need_int(from, "Str::find");
+    if (a < 0) a = 0;
+    if ((uint64_t)a > x->len) return luma_fixnum(-1);
+    for (uint64_t i = (uint64_t)a; i + y->len <= x->len; i++)
+        if (memcmp(x->bytes + i, y->bytes, y->len) == 0) return luma_fixnum((int64_t)i);
+    return luma_fixnum(-1);
+}
+
+/* __str_cmp(a, b): -1, 0 or 1 (bytewise). */
+LumaValue luma_str_cmp(LumaValue a, LumaValue b) {
+    const LumaString *x = need_str(a, "Str::compare"), *y = need_str(b, "Str::compare");
+    size_t n = x->len < y->len ? x->len : y->len;
+    int c = memcmp(x->bytes, y->bytes, n);
+    if (c == 0) c = x->len < y->len ? -1 : x->len > y->len;
+    return luma_fixnum(c < 0 ? -1 : c > 0);
+}
+
+LumaValue luma_str_from_int(LumaValue n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof buf, "%" PRId64, need_int(n, "Str::from_int"));
+    return string_from_bytes(buf, (size_t)len);
+}
+
+/* __str_to_int(s): the decimal integer s spells (optional sign, digits,
+ * nothing else), or nil. */
+LumaValue luma_str_to_int(LumaValue s) {
+    const LumaString *x = need_str(s, "Str::to_int");
+    size_t i = 0;
+    bool neg = false;
+    if (i < x->len && (x->bytes[i] == '-' || x->bytes[i] == '+')) neg = x->bytes[i++] == '-';
+    if (i == x->len) return LUMA_NIL;
+    int64_t v = 0;
+    for (; i < x->len; i++) {
+        char c = x->bytes[i];
+        if (c < '0' || c > '9') return LUMA_NIL;
+        if (v > (LUMA_FIXNUM_MAX - (c - '0')) / 10) return LUMA_NIL; /* (also rejects -2^62: fine) */
+        v = v * 10 + (c - '0');
+    }
+    return luma_fixnum(neg ? -v : v);
+}
+
+/* __str_case(s, upper): ASCII letters to upper (1) or lower (0) case. */
+LumaValue luma_str_case(LumaValue s, LumaValue upper) {
+    const LumaString *x = need_str(s, "Str::upper");
+    LumaString *r = new_string(x->len);
+    for (uint64_t i = 0; i < x->len; i++) {
+        char c = x->bytes[i];
+        if (upper == LUMA_TRUE && c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (upper != LUMA_TRUE && c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        r->bytes[i] = c;
+    }
+    return (LumaValue)(uintptr_t)r;
+}
+
+/* __str_join(items, n, sep): the first n items of an array (all strings),
+ * separated by sep. */
+LumaValue luma_str_join(LumaValue items, LumaValue n, LumaValue sep) {
+    const LumaArray *a = need_array(items);
+    int64_t k = need_int(n, "Str::join");
+    const LumaString *s = need_str(sep, "Str::join");
+    if (k < 0 || (uint64_t)k > a->len) k = (int64_t)a->len;
+    size_t total = 0;
+    for (int64_t i = 0; i < k; i++) {
+        if (!is_string(a->items[i])) panicf("Str::join expects a list of str, got %s.", value_type_name(a->items[i]));
+        total += as_string(a->items[i])->len + (i ? s->len : 0);
+    }
+    LumaString *r = new_string(total);
+    size_t o = 0;
+    for (int64_t i = 0; i < k; i++) {
+        if (i) {
+            memcpy(r->bytes + o, s->bytes, s->len);
+            o += s->len;
+        }
+        const LumaString *x = as_string(a->items[i]);
+        memcpy(r->bytes + o, x->bytes, x->len);
+        o += x->len;
+    }
+    return (LumaValue)(uintptr_t)r;
+}
+
+/* __type(v): "int", "str", "bool", "nil", "array" or the struct's name. */
+LumaValue luma_type_name(LumaValue v) {
+    check_valid(v);
+    return string_from_c(value_type_name(v));
+}
+
+/* __fail(msg): a runtime error with this message (Sys::fail, and the std
+ * library's own checks). */
+LumaValue luma_fail(LumaValue msg) {
+    check_valid(msg);
+    if (is_string(msg)) panicf("%s", as_string(msg)->bytes);
+    luma_panic("failure");
+}
+
+/* __array_sort(a, n): sorts the first n items, all ints or all strs. */
+static int compare_items(const void *x, const void *y) {
+    LumaValue a = *(const LumaValue *)x, b = *(const LumaValue *)y;
+    if (is_fixnum(a)) return fixnum_val(a) < fixnum_val(b) ? -1 : fixnum_val(a) > fixnum_val(b);
+    return (int)fixnum_val(luma_str_cmp(a, b));
+}
+
+LumaValue luma_array_sort(LumaValue a, LumaValue n) {
+    LumaArray *arr = need_array(a);
+    int64_t k = need_int(n, "List::sort");
+    if (k < 0 || (uint64_t)k > arr->len) k = (int64_t)arr->len;
+    if (k == 0) return LUMA_NIL;
+    bool ints = is_fixnum(arr->items[0]);
+    for (int64_t i = 0; i < k; i++) {
+        check_valid(arr->items[i]);
+        if (ints ? !is_fixnum(arr->items[i]) : !is_string(arr->items[i]))
+            panicf("List::sort sorts a list of ints or a list of strs, got %s and %s.", value_type_name(arr->items[0]),
+                   value_type_name(arr->items[i]));
+    }
+    qsort(arr->items, (size_t)k, sizeof *arr->items, compare_items);
+    return LUMA_NIL;
+}
+
+/* __argc() / __argv(i): the program's command line (argv[0] included). */
+static int main_argc;
+static char **main_argv;
+
+LumaValue luma_argc(void) { return luma_fixnum(main_argc); }
+
+LumaValue luma_argv(LumaValue i) {
+    int64_t k = need_int(i, "Sys::arg");
+    if (k < 0 || k >= main_argc) panicf("Index %" PRId64 " is out of range (%d arguments).", k, main_argc);
+    return string_from_c(main_argv[k]);
+}
+
+/* __mem_string(p, n): n bytes at address p, as a new string. __mem_write(p,
+ * s): copies s's bytes (no NUL) to address p. Addresses are ints (C ptr). */
+LumaValue luma_mem_string(LumaValue p, LumaValue n) {
+    int64_t a = need_int(p, "C::string"), k = need_int(n, "C::string");
+    if (a == 0) luma_panic("C::string of a NULL pointer.");
+    if (k < 0) panicf("C::string expects a length >= 0, got %" PRId64 ".", k);
+    return string_from_bytes((const char *)(uintptr_t)a, (size_t)k);
+}
+
+LumaValue luma_mem_write(LumaValue p, LumaValue s) {
+    int64_t a = need_int(p, "C::write");
+    const LumaString *x = need_str(s, "C::write");
+    if (a == 0) luma_panic("C::write to a NULL pointer.");
+    memcpy((void *)(uintptr_t)a, x->bytes, x->len);
+    return LUMA_NIL;
 }
 
 /* ---- arena intrinsics (used only by the prelude's Arena) ----------------- */
@@ -1174,6 +1618,10 @@ static void mark_from(LumaValue v, unsigned char *marked, PtrVec *stack) {
                     for (size_t j = 0; j < a->objs.n; j++) vec_push(stack, a->objs.items[j]);
             for (int64_t k = 0; k < desc_of(s)->nfields; k++)
                 if (is_object(s->fields[k])) vec_push(stack, (void *)(uintptr_t)s->fields[k]);
+        } else if ((h & 0xff) == LUMA_TYPE_ARRAY) {
+            const LumaArray *a = o;
+            for (uint64_t k = 0; k < a->len; k++)
+                if (is_object(a->items[k])) vec_push(stack, (void *)(uintptr_t)a->items[k]);
         }
     }
 }
@@ -1181,19 +1629,21 @@ static void mark_from(LumaValue v, unsigned char *marked, PtrVec *stack) {
 /* "2 Node, 1 str" for the live objects whose mark equals `which`. */
 static void describe_objects(const unsigned char *marked, unsigned char which, char *buf, size_t n) {
     uint64_t nstructs = luma_structs[0];
-    uint64_t *counts = calloc(nstructs + 2, sizeof *counts);
+    uint64_t *counts = calloc(nstructs + 3, sizeof *counts);
     if (!counts) luma_panic("Out of memory.");
     for (size_t i = 0; i < live.n; i++) {
         if (marked[i] != which) continue;
         const uint64_t *h = live.items[i];
         if ((*h & 0xff) == LUMA_TYPE_STRUCT) counts[desc_of((const LumaStruct *)h)->id]++;
+        else if ((*h & 0xff) == LUMA_TYPE_ARRAY) counts[nstructs + 2]++;
         else counts[nstructs + 1]++;
     }
     buf[0] = '\0';
-    for (uint64_t id = 1; id <= nstructs + 1; id++) {
+    for (uint64_t id = 1; id <= nstructs + 2; id++) {
         if (!counts[id]) continue;
         size_t len = strlen(buf);
-        snprintf(buf + len, n - len, "%s%" PRIu64 " %s", len ? ", " : "", counts[id], id <= nstructs ? struct_name((unsigned)id) : "str");
+        snprintf(buf + len, n - len, "%s%" PRIu64 " %s", len ? ", " : "", counts[id],
+                 id <= nstructs ? struct_name((unsigned)id) : id == nstructs + 1 ? "str" : "array");
     }
     free(counts);
 }
@@ -1221,7 +1671,9 @@ static void memcheck_report(void) {
     free(marked);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    main_argc = argc;
+    main_argv = argv;
     install_stack_guard();
     const char *mc = getenv("LUMA_MEMCHECK");
     memcheck = mc && *mc && strcmp(mc, "0") != 0;

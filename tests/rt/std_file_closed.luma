@@ -1,0 +1,3 @@
+var f = File::open("build/test/std_closed.txt", "w");
+f.close();
+f.write("x");

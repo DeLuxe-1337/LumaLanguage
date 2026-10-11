@@ -123,9 +123,15 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
             }
             for (int i = 0; i < in->nargs; i++) load(out, ARG_REGS[i], scratch + i);
             buf_printf(out, "    xor eax, eax    # no vector registers used (variadic-safe)\n");
-            buf_printf(out, "    call %s@PLT\n", g->name);
+            buf_printf(out, "    call %s@PLT\n", g->csym ? g->csym : g->name);
             if (g->cret == CT_VOID) {
                 buf_printf(out, "    mov rax, %" PRIu64 "    # void -> nil\n", (uint64_t)LUMA_NIL);
+            } else if (g->cret == CT_CSRET) { /* a C struct by value: eightbytes in rax:rdx */
+                int c = ffi_context("return value of %s", 0, NULL, g->name);
+                buf_printf(out, "    mov rdi, rax\n    mov rsi, rdx\n");
+                buf_printf(out, "    lea rdx, [rip + .Lffi.%d]\n", c);
+                buf_printf(out, "    lea rcx, [rip + .Lstruct.%d]\n", g->cret_sid);
+                buf_printf(out, "    call luma_ffi_ret_cs@PLT\n");
             } else {
                 int c = ffi_context("return value of %s", 0, NULL, g->name);
                 buf_printf(out, "    mov rdi, rax\n");
@@ -338,12 +344,27 @@ static void emit_structs(const IrModule *m, Buf *out) {
         int show = ir_struct_show(m, i);
         if (show >= 0) buf_printf(out, "    .quad %s    # show\n", m->globals[show].name);
         else buf_printf(out, "    .quad 0    # no show\n");
-        buf_printf(out, "    .quad %d    # flags%s\n", st->shared ? 1 : 0, st->shared ? ": shared" : "");
+        buf_printf(out, "    .quad %d    # flags%s%s\n", (st->shared ? 1 : 0) | (st->cstruct ? 2 : 0), st->shared ? ": shared" : "",
+                   st->cstruct ? ", C struct" : "");
+        if (st->cstruct) buf_printf(out, "    .quad .Lscl.%d    # C layout\n", i);
+        else buf_printf(out, "    .quad 0\n");
         if (st->nfields) {
             buf_printf(out, ".Lsfields.%d:\n", i);
             for (int k = 0; k < st->nfields; k++) buf_printf(out, "    .quad .Lsfname.%d.%d    # %s\n", i, k, st->fields[k]);
             buf_printf(out, ".Lsftys.%d:\n", i);
             for (int k = 0; k < st->nfields; k++) buf_printf(out, "    .quad %u\n", st->ftys[k]);
+        }
+        if (st->cstruct) { /* size, field count, names, C types, offsets */
+            buf_printf(out, ".Lscl.%d:\n    .quad %d, %d, .Lscln.%d, .Lsclt.%d, .Lsclo.%d\n", i, st->csize, st->ncf, i, i, i);
+            buf_printf(out, ".Lscln.%d:\n", i);
+            for (int k = 0; k < st->ncf; k++) buf_printf(out, "    .quad .Lsclname.%d.%d\n", i, k);
+            if (!st->ncf) buf_printf(out, "    .quad 0\n");
+            buf_printf(out, ".Lsclt.%d:\n", i);
+            for (int k = 0; k < st->ncf; k++) buf_printf(out, "    .quad %d    # %s\n", (int)st->cftys[k], ctype_name(st->cftys[k]));
+            if (!st->ncf) buf_printf(out, "    .quad 0\n");
+            buf_printf(out, ".Lsclo.%d:\n", i);
+            for (int k = 0; k < st->ncf; k++) buf_printf(out, "    .quad %d\n", st->cfoffs[k]);
+            if (!st->ncf) buf_printf(out, "    .quad 0\n");
         }
         if (st->nmethods) {
             buf_printf(out, ".Lsmeth.%d:\n", i);
@@ -364,6 +385,11 @@ static void emit_structs(const IrModule *m, Buf *out) {
         for (int k = 0; k < st->nfields; k++) {
             buf_printf(out, ".Lsfname.%d.%d:\n", i, k);
             x86_emit_ascii(out, st->fields[k], strlen(st->fields[k]));
+            buf_printf(out, "    .byte 0\n");
+        }
+        for (int k = 0; k < st->ncf; k++) {
+            buf_printf(out, ".Lsclname.%d.%d:\n", i, k);
+            x86_emit_ascii(out, st->cfnames[k], strlen(st->cfnames[k]));
             buf_printf(out, "    .byte 0\n");
         }
         for (int k = 0; k < st->nmethods; k++) {

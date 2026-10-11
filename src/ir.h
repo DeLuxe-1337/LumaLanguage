@@ -117,6 +117,10 @@ typedef enum { IRG_FUNC, IRG_EXTERN, IRG_DATA, IRG_VAR, IRG_CEXTERN } IrGlobalKi
 typedef enum {
     CT_I8, CT_I16, CT_I32, CT_I64, CT_U8, CT_U16, CT_U32, CT_U64,
     CT_BOOL, CT_CSTR, CT_CSTR_OPT, CT_PTR, CT_VOID,
+    /* C structs passed by value (v0.9): the first / second eightbyte of a
+     * struct argument (both take the struct's Luma value), and a struct
+     * result (IrGlobal.cret_sid). Not written in Luma source. */
+    CT_CSW0, CT_CSW1, CT_CSRET,
     CT_COUNT
 } CType;
 
@@ -134,6 +138,8 @@ typedef struct {
     CType *cparams;   /* IRG_CEXTERN: parameter C types (arity entries, owned) */
     char **cnames;    /* IRG_CEXTERN: parameter names, for runtime messages (owned) */
     CType cret;       /* IRG_CEXTERN: return C type */
+    char *csym;       /* IRG_CEXTERN: the C symbol called, when not name (v0.9; owned) */
+    int cret_sid;     /* IRG_CEXTERN with cret CT_CSRET: the C struct returned by value */
     IrTy *ptys;       /* IRG_FUNC: declared parameter types (arity entries, owned; NULL = all any) */
     IrTy ty;          /* IRG_FUNC: declared result type; IRG_VAR: declared variable type */
     uint64_t moves;   /* IRG_FUNC: bit i set when parameter i is `move` (v0.8; checked by mem_check_frees) */
@@ -156,6 +162,10 @@ typedef struct {
 /* The name used in messages and printed values: a space after each comma
  * of a generic instance's name ("Pair<int,str>" -> "Pair<int, str>"). */
 void ir_struct_display(const char *name, char *buf, size_t n);
+/* Can a C struct field have this C type? (scalars, bool, ptr, cstr, cstr?) */
+bool ctype_is_field(CType c);
+/* Size and alignment of a C field type (System V x86-64). */
+int ctype_size(CType c);
 
 typedef struct {
     char *name;
@@ -166,6 +176,15 @@ typedef struct {
     char **mnames;    /* method names (owned) */
     int *mglobals;    /* the IR function implementing each (params: self, then the arguments) */
     bool shared;      /* `shared struct`: every instance is reference counted (v0.8) */
+    /* A C struct (`cstruct`, v0.9): its Luma fields are the hidden __ptr (the
+     * C memory's address) and __owned (1 if freed with the instance); the C
+     * fields and their System V layout are these. */
+    bool cstruct;
+    int ncf;
+    char **cfnames;   /* (owned) */
+    CType *cftys;     /* i8..u64, bool, cstr, cstr?, ptr (owned) */
+    int *cfoffs;      /* byte offsets (owned) */
+    int csize, calign;
     int line;
 } IrStruct;
 
@@ -185,6 +204,12 @@ typedef struct IrModule {
     IrStruct *structs; /* v0.5 */
     int nstructs;
 } IrModule;
+
+/* Declares struct sid as a C struct with these fields: hidden Luma fields
+ * __ptr and __owned (both int), shared, and the System V layout. */
+void ir_cstruct_set_fields(IrModule *m, int sid, int n, const char *const *names, const CType *ctys);
+/* The C field named name of a C struct, or -1. */
+int ir_cstruct_field(const IrStruct *st, const char *name);
 
 /* The global of struct sid's show hook: a method `show(self): str` (print
  * shows an instance as the string it returns); -1 if none. */

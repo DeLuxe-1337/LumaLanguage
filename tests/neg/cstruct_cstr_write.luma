@@ -1,0 +1,3 @@
+extern struct S { name: cstr? }
+var s: S = S { };
+s.name = "x";

@@ -1,0 +1,2 @@
+var l: List<str> = List::new();
+print(l.pop());

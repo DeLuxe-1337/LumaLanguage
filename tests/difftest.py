@@ -83,6 +83,23 @@ def check(n):
     return n
 
 
+# Standard library functions the generator calls (std/*.luma): name ->
+# (parameter names, parameter types, result type, implementation). Strings
+# are byte strings in Luma: lengths count UTF-8 bytes, case is ASCII only.
+def _ascii_upper(s):
+    return "".join(chr(ord(c) - 32) if "a" <= c <= "z" else c for c in s)
+
+
+STD = {
+    "Math::abs": (["x"], ["int"], "int", lambda x: check(-x if x < 0 else x)),
+    "Math::min": (["a", "b"], ["int", "int"], "int", lambda a, b: min(a, b)),
+    "Math::max": (["a", "b"], ["int", "int"], "int", lambda a, b: max(a, b)),
+    "Str::len": (["s"], ["str"], "int", lambda s: len(s.encode("utf-8"))),
+    "Str::upper": (["s"], ["str"], "str", _ascii_upper),
+    "Str::from_int": (["n"], ["int"], "str", lambda n: str(n)),
+}
+
+
 def truthy(v):
     return not (v is None or v is False)
 
@@ -198,7 +215,7 @@ def render_e(e):
         return "(%s = %s)" % (e[1], render_e(e[2]))
     if k == "un":
         return "(%s%s)" % (e[1], render_e(e[2]))
-    if k == "call":
+    if k == "call" or k == "std":
         return "%s(%s)" % (e[1], ", ".join(render_e(a) for a in e[2]))
     if k == "new":   # (an instance G<int> of a generic struct is written G { ... })
         name = e[1].split("<")[0]
@@ -373,6 +390,12 @@ class Interp:
             fn = self.funs[e[1]]
             args = [self.ev(a) for a in e[2]]      # all arguments, left to right
             return self.invoke(fn, args)
+        if k == "std":
+            names, types, _, impl = STD[e[1]]
+            args = [self.ev(a) for a in e[2]]
+            for name, value, t in zip(names, args, types):
+                self.guard(value, t, "argument '%s' of '%s'" % (name, e[1]))
+            return impl(*args)
         if k == "log":
             left = self.ev(e[2])
             if e[1] == "or":
@@ -573,6 +596,10 @@ class Gen:
                 if r.random() < 0.15:   # an assignment to the field, used as a value
                     return ("set", obj, f, self.slot_expr(t, a, depth - 1, exclude))   # (its value is the expression's)
                 return ("get", obj, f)
+        stdc = [n for n, d in STD.items() if d[2] == t]
+        if stdc and r.random() < 0.06:   # a standard library function (std/*.luma)
+            name = r.choice(stdc)
+            return ("std", name, [self.expr(pt, depth - 1, exclude) for pt in STD[name][1]])
         cands = [f for f in self.funs[:self.callable] if f[2] == t]
         if cands and r.random() < 0.15:
             name, ptypes, _, panns = r.choice(cands)

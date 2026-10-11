@@ -1,0 +1,4 @@
+struct List { items }
+impl List { fun size(self): int { return 3; } }
+var l = List { items: nil };
+print(l.size(), Math::max(1, 2));

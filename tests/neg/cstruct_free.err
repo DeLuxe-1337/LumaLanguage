@@ -1,0 +1,1 @@
+'S' is a C struct: its value is freed automatically (and memory C owns stays C's)

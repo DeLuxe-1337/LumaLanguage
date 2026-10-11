@@ -498,10 +498,7 @@ static bool may_free(const IrModule *m, const IrInstr *in) {
         if (g->kind == IRG_CEXTERN) return false;
         if (g->kind == IRG_FUNC) return true;
         if (opt_is_print_call(m, in)) return opt_runs_code(m, in); /* show() methods */
-        static const char *const SAFE[] = {"luma_write_space", "luma_write_newline", "luma_refcount"};
-        for (size_t i = 0; i < sizeof SAFE / sizeof *SAFE; i++)
-            if (strcmp(g->name, SAFE[i]) == 0) return false;
-        return true;
+        return !opt_runtime_frees_nothing(g->name);
     }
     default: return false;
     }

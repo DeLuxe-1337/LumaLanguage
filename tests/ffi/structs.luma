@@ -1,0 +1,52 @@
+// C structs (extern struct) with the C library helpers in ffi_helper.c and
+// with libc: literals, fields, by value (one or two eightbytes, both ways),
+// by pointer (in, out, NULL), padding, views of memory C owns.
+extern struct Pair32 { x: i32, y: i32 }
+extern struct Pair64 { a: i64, b: i64 }
+extern struct Mixed { r: u8, g: u8, b: u8, w: u16 }
+extern struct Big { a: i64, b: i64, c: i64 }
+
+extern fun pair32_sum(p: Pair32): i64;
+extern fun pair32_make(x: i32, y: i32): Pair32;
+extern fun pair64_sum(p: Pair64): i64;
+extern fun pair64_swap(p: Pair64): Pair64;
+extern fun pair64_scale(p: *Pair64, k: i64): void;
+extern fun around_pair(a: i64, p: Pair64, b: i64): i64;
+extern fun mixed_w(m: Mixed): u16;
+extern fun mixed_make(r: u8, w: u16): Mixed;
+extern fun mixed_size(): i64;
+extern fun big_sum(b: *Big): i64;
+extern fun big_global(): *Big;
+extern fun big_null(): *Big?;
+
+var p = Pair32 { x: 3, y: -4 };
+print(p, pair32_sum(p), pair32_make(7, 8), Pair32::size());
+
+var q = Pair64 { a: 1, b: 2 };
+print(pair64_sum(q), pair64_swap(q), around_pair(4, q, 3));
+pair64_scale(q, 10);             // C writes through the pointer
+print(q.a, q.b);
+q.b = 99;
+print(q);
+
+var m = mixed_make(10, 1000);
+print(m, mixed_w(m), Mixed::size(), mixed_size());
+m.w = 7;
+print(mixed_w(m));
+
+var big = Big { a: 5, b: 6, c: 7 };
+print(big_sum(big), Big::size());
+var g = big_global();            // a view of C's static struct
+g.a = 100;
+print(big_global().a, big_null() == nil);
+
+// by address: S::addr and S::at
+var again = Pair64::at(Pair64::addr(q));
+again.a = -1;
+print(q.a);
+
+// untyped access goes through the same C fields
+fun dyn(v) { return v; }
+var d = dyn(q);
+d.b = 5;
+print(d.a, d.b, q);

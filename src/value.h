@@ -31,6 +31,7 @@ typedef uint64_t LumaValue;
 
 #define LUMA_TYPE_STRING 1
 #define LUMA_TYPE_STRUCT 2
+#define LUMA_TYPE_ARRAY 3  /* the std library's List storage: header, length, items */
 #define LUMA_TYPE_FREED 0x7F /* a freed object (kept readable: see runtime "memory") */
 
 /* Object header: bits 0-7 type id, bits 8-31 struct id (structs), bits 32-63
@@ -48,6 +49,21 @@ typedef uint64_t LumaValue;
 
 /* Struct descriptor flags (LumaStructDesc.flags). */
 #define LUMA_STRUCT_SHARED 1 /* every instance is counted */
+#define LUMA_STRUCT_C 2      /* a C struct: fields 0/1 = address / owned; layout in LumaStructDesc.c */
+
+/* C field types of C structs (the compiler's CType numbering). */
+#define LUMA_CT_I8 0
+#define LUMA_CT_I16 1
+#define LUMA_CT_I32 2
+#define LUMA_CT_I64 3
+#define LUMA_CT_U8 4
+#define LUMA_CT_U16 5
+#define LUMA_CT_U32 6
+#define LUMA_CT_U64 7
+#define LUMA_CT_BOOL 8
+#define LUMA_CT_CSTR 9
+#define LUMA_CT_CSTR_OPT 10
+#define LUMA_CT_PTR 11
 
 /* A struct instance: header = LUMA_TYPE_STRUCT | (struct index + 1) << 8
  * | count << 32, then a pointer to the struct's descriptor, then one word

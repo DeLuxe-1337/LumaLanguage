@@ -58,6 +58,17 @@ static bool module_has_show(const IrModule *m) {
 
 bool opt_module_has_drop(const IrModule *m) { return has_method(m, "drop"); }
 
+bool opt_runtime_frees_nothing(const char *name) {
+    static const char *const N[] = {
+        "luma_write_space", "luma_write_newline", "luma_refcount", "luma_array_new", "luma_array_len",
+        "luma_array_get", "luma_str_len", "luma_str_byte", "luma_str_char", "luma_str_slice", "luma_str_find",
+        "luma_str_cmp", "luma_str_from_int", "luma_str_to_int", "luma_str_case", "luma_str_join", "luma_argc",
+        "luma_argv", "luma_mem_string", "luma_mem_write", "luma_type_name"};
+    for (size_t i = 0; i < sizeof N / sizeof *N; i++)
+        if (strcmp(name, N[i]) == 0) return true;
+    return false;
+}
+
 bool opt_is_print_call(const IrModule *m, const IrInstr *in) {
     if (in->op != IR_CALL || m->globals[in->global].kind != IRG_EXTERN) return false;
     static const char *const P[] = {"luma_write", "luma_print", "luma_show"};

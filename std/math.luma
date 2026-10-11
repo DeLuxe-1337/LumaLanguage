@@ -1,0 +1,78 @@
+// Math: integer arithmetic (Luma has no floats yet). Associated functions:
+// Math::abs(-3), Math::pow(2, 10). Overflow is a runtime error, as for +.
+struct Math {}
+
+impl Math {
+  fun abs(x: int): int { if (x < 0) return -x; return x; }
+  fun min(a: int, b: int): int { if (a < b) return a; return b; }
+  fun max(a: int, b: int): int { if (a > b) return a; return b; }
+  fun clamp(x: int, lo: int, hi: int): int {
+    if (lo > hi) return __fail("Math::clamp: lo > hi.");
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+  }
+  fun sign(x: int): int { if (x < 0) return -1; if (x > 0) return 1; return 0; }
+  fun is_even(x: int): bool { return x / 2 * 2 == x; }
+  fun is_odd(x: int): bool { return x / 2 * 2 != x; }
+
+  // floor modulo: the result has the sign of b (as / is floor division)
+  fun mod(a: int, b: int): int {
+    if (b == 0) return __fail("Math::mod: division by zero.");
+    return a - a / b * b;
+  }
+
+  // base^exp for exp >= 0, by squaring
+  fun pow(base: int, exp: int): int {
+    if (exp < 0) return __fail("Math::pow: negative exponent.");
+    var result = 1;
+    var b = base;
+    var e = exp;
+    while (e > 0) {
+      if (e / 2 * 2 != e) result = result * b;
+      e = e / 2;
+      if (e > 0) b = b * b;
+    }
+    return result;
+  }
+
+  fun gcd(a: int, b: int): int {
+    var x = Math::abs(a);
+    var y = Math::abs(b);
+    while (y != 0) {
+      var t = x - x / y * y;
+      x = y;
+      y = t;
+    }
+    return x;
+  }
+
+  fun lcm(a: int, b: int): int {
+    if (a == 0 or b == 0) return 0;
+    return Math::abs(a / Math::gcd(a, b) * b);
+  }
+
+  // the largest r with r * r <= n (n >= 0), by Newton's method
+  fun isqrt(n: int): int {
+    if (n < 0) return __fail("Math::isqrt: negative argument.");
+    if (n < 2) return n;
+    var x = n / 2 + 1;
+    var y = (x + n / x) / 2;
+    while (y < x) {
+      x = y;
+      y = (x + n / x) / 2;
+    }
+    return x;
+  }
+
+  // the number of decimal digits of x (1 for 0)
+  fun digits(x: int): int {
+    var n = 1;
+    var v = Math::abs(x / 10);
+    while (v > 0) { n = n + 1; v = v / 10; }
+    return n;
+  }
+
+  fun max_int(): int { return 4611686018427387903; }
+  fun min_int(): int { return -4611686018427387903 - 1; }
+}

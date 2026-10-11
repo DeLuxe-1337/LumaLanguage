@@ -1,5 +1,6 @@
 /* ir.c - LIR construction helpers and the canonical text printer. */
 #include "ir.h"
+#include "value.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -188,6 +189,7 @@ IrTy ir_ctype_ty(CType c) {
     case CT_CSTR: return TY_STR;
     case CT_CSTR_OPT: return TY_STR | TY_NIL;
     case CT_VOID: return TY_NIL;
+    case CT_CSRET: return TY_ANY; /* a C struct (lowering checks which) */
     default: return TY_INT; /* every integer type and ptr */
     }
 }
@@ -316,6 +318,7 @@ void ir_module_free(IrModule *m) {
             for (int k = 0; k < g->arity; k++) free(g->cnames[k]);
         free(g->cnames);
         free(g->cparams);
+        free(g->csym);
         free(g->ptys);
         free(g->name);
         free(g->data);
@@ -324,6 +327,10 @@ void ir_module_free(IrModule *m) {
         IrStruct *st = &m->structs[i];
         for (int k = 0; k < st->nfields; k++) free(st->fields[k]);
         for (int k = 0; k < st->nmethods; k++) free(st->mnames[k]);
+        for (int k = 0; k < st->ncf; k++) free(st->cfnames[k]);
+        free(st->cfnames);
+        free(st->cftys);
+        free(st->cfoffs);
         free(st->fields);
         free(st->ftys);
         free(st->mnames);
@@ -370,8 +377,57 @@ int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len) {
 int ir_add_var(IrModule *m, const char *name) { return add_global(m, IRG_VAR, name); }
 
 static const char *const CTYPE_NAMES[CT_COUNT] = {
-    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "bool", "cstr", "cstr?", "ptr", "void",
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "bool", "cstr", "cstr?", "ptr", "void", "cs0", "cs1", "struct",
 };
+
+/* The runtime reads C field types by number (src/value.h). */
+_Static_assert(CT_I8 == LUMA_CT_I8 && CT_I16 == LUMA_CT_I16 && CT_I32 == LUMA_CT_I32 && CT_I64 == LUMA_CT_I64 &&
+                   CT_U8 == LUMA_CT_U8 && CT_U16 == LUMA_CT_U16 && CT_U32 == LUMA_CT_U32 && CT_U64 == LUMA_CT_U64 &&
+                   CT_BOOL == LUMA_CT_BOOL && CT_CSTR == LUMA_CT_CSTR && CT_CSTR_OPT == LUMA_CT_CSTR_OPT &&
+                   CT_PTR == LUMA_CT_PTR,
+               "C type numbers differ between ir.h and value.h");
+
+bool ctype_is_field(CType c) { return c <= CT_PTR; }
+
+int ctype_size(CType c) {
+    switch (c) {
+    case CT_I8: case CT_U8: case CT_BOOL: return 1;
+    case CT_I16: case CT_U16: return 2;
+    case CT_I32: case CT_U32: return 4;
+    default: return 8;
+    }
+}
+
+void ir_cstruct_set_fields(IrModule *m, int sid, int n, const char *const *names, const CType *ctys) {
+    static const char *const hidden[] = {"__ptr", "__owned"};
+    static const IrTy hty[] = {TY_INT, TY_INT};
+    ir_struct_set_fields(m, sid, 2, hidden, hty);
+    IrStruct *st = &m->structs[sid];
+    st->cstruct = true;
+    st->shared = true;
+    st->ncf = n;
+    st->cfnames = xmalloc((size_t)(n ? n : 1) * sizeof *st->cfnames);
+    st->cftys = xmalloc((size_t)(n ? n : 1) * sizeof *st->cftys);
+    st->cfoffs = xmalloc((size_t)(n ? n : 1) * sizeof *st->cfoffs);
+    int off = 0, align = 1;
+    for (int i = 0; i < n; i++) {
+        int sz = ctype_size(ctys[i]);
+        off = (off + sz - 1) / sz * sz;
+        st->cfnames[i] = xstrdup(names[i]);
+        st->cftys[i] = ctys[i];
+        st->cfoffs[i] = off;
+        off += sz;
+        if (sz > align) align = sz;
+    }
+    st->calign = align;
+    st->csize = (off + align - 1) / align * align;
+}
+
+int ir_cstruct_field(const IrStruct *st, const char *name) {
+    for (int i = 0; i < st->ncf; i++)
+        if (strcmp(st->cfnames[i], name) == 0) return i;
+    return -1;
+}
 
 const char *ctype_name(CType t) { return (unsigned)t < CT_COUNT ? CTYPE_NAMES[t] : "?"; }
 
@@ -383,6 +439,7 @@ bool ctype_from_name(const char *name, bool nullable, CType *out) {
     }
     for (int i = 0; i < CT_COUNT; i++) {
         if (i == CT_CSTR_OPT) continue;
+        if (i > CT_VOID) break; /* (the by-value struct forms are not written as names) */
         if (strcmp(name, CTYPE_NAMES[i]) == 0) {
             *out = (CType)i;
             return true;
@@ -705,8 +762,12 @@ void ir_print_module(const IrModule *m, Buf *out) {
     if (m->nstructs) buf_byte(out, '\n');
     for (int i = 0; i < m->nstructs; i++) {
         const IrStruct *st = &m->structs[i];
-        buf_printf(out, "%sstruct %s {", st->shared ? "shared " : "", st->name);
-        for (int k = 0; k < st->nfields; k++) {
+        if (st->cstruct) {
+            buf_printf(out, "cstruct %s {", st->name);
+            for (int k = 0; k < st->ncf; k++) buf_printf(out, "%s%s: %s", k ? ", " : "", st->cfnames[k], ctype_name(st->cftys[k]));
+        } else
+            buf_printf(out, "%sstruct %s {", st->shared ? "shared " : "", st->name);
+        for (int k = 0; !st->cstruct && k < st->nfields; k++) {
             buf_printf(out, "%s%s", k ? ", " : "", st->fields[k]);
             if (st->ftys[k] != TY_ANY) {
                 char tn[300];
@@ -743,7 +804,13 @@ void ir_print_module(const IrModule *m, Buf *out) {
             buf_printf(out, "extern c fn @%s(", g->name);
             for (int k = 0; k < g->arity; k++)
                 buf_printf(out, "%s%s: %s", k ? ", " : "", g->cnames[k], ctype_name(g->cparams[k]));
-            buf_printf(out, "): %s\n", ctype_name(g->cret));
+            if (g->cret == CT_CSRET) buf_printf(out, "): struct %s", m->structs[g->cret_sid].name);
+            else buf_printf(out, "): %s", ctype_name(g->cret));
+            if (g->csym) {
+                buf_printf(out, " symbol ");
+                print_string(out, g->csym, strlen(g->csym));
+            }
+            buf_byte(out, '\n');
         } else {
             buf_printf(out, "data @%s = str ", g->name);
             print_string(out, g->data, g->data_len);

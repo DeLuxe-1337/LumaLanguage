@@ -1,0 +1,28 @@
+// The standard library: File, C memory and Random (std/file.luma, c.luma,
+// random.luma). Files are closed explicitly: --mm=none never runs drop.
+var path = "build/test/std_file.txt";
+print(File::write_all(path, "one\ntwo\r\nthree"), File::exists(path), File::exists("build/test/nope.txt"));
+print(File::read(path) == "one\ntwo\r\nthree", File::lines(path));
+var f = File::open(path, "r");
+print(f, f.read_line(), f.read_line(), f.read_line(), f.read_line());
+f.close();
+print(f, File::append(path, "\nfour"), File::lines(path).len());
+var w = File::open(path, "w");
+w.write_line("x");
+w.write("y");
+w.close();
+print(File::read(path), File::read("build/test/missing") == nil, File::open("build/test/missing", "r") == nil);
+print(File::remove(path), File::exists(path), File::remove(path));
+
+var r = Random::new(42);
+var seq: List<int> = List::new();
+for (var i = 0; i < 5; i = i + 1) seq.push(r.range(0, 100));
+print(seq);
+r.shuffle(seq);
+seq.sort();
+print(seq, Random::new(42).next() == Random::new(42).next());
+
+var p = C::alloc(8);
+C::write(p, "hi");
+print(C::cstring(p), Str::len(C::string(p, 3)));
+C::free(p);

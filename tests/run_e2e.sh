@@ -363,6 +363,9 @@ for src in tests/ffi/*.luma; do
     fi
 done
 done
+# C structs and symbol aliases survive the IR's text form
+check "ffi/structs: .lir recompiles to identical .s, and parse/print round trip" sh -c \
+    "$LUMA tests/ffi/structs.luma -S -o $OUT/fst && cp $OUT/fst.lir $OUT/fst_rt.lir && $LUMA $OUT/fst_rt.lir -S -o $OUT/fst_rt --dump-ir > $OUT/fst.reprint && sed 1d $OUT/fst.s > $OUT/x1 && sed 1d $OUT/fst_rt.s > $OUT/x2 && cmp $OUT/x1 $OUT/x2 && cmp $OUT/fst.lir $OUT/fst.reprint"
 check "ffi: link a C object file given on the command line" sh -c \
     "$LUMA tests/ffi/types.luma -o $OUT/ffi_obj $FFILIB/ffi_helper.o && $OUT/ffi_obj | cmp -s - tests/ffi/types.out"
 check "ffi: -lNAME / -LDIR attached forms" sh -c \

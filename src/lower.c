@@ -87,8 +87,12 @@ typedef struct {
     const char *name;
     int global;   /* IR global index (C symbol) */
     const Stmt *decl;
-    CType *ctypes; /* per parameter (owned) */
-    CType cret;
+    CType *ctypes; /* per parameter (owned); CT_PTR for *S, CT_CSW0 for a struct by value */
+    CType cret;    /* CT_PTR for *S, CT_CSRET for a struct by value */
+    int *psid;     /* per parameter: the C struct (IR id) of *S or S, else -1 (owned) */
+    bool *pnull;   /* per parameter: *S? (owned) */
+    int rsid;      /* the C struct returned (*S, *S? or S), else -1 */
+    bool rnull;    /* *S? */
 } ExtInfo;
 
 typedef struct {
@@ -143,7 +147,8 @@ typedef struct {
     int nstrings;
     int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
     int dispose_fn, refcount_fn;
-    int intrinsic_fn[8]; /* runtime externs of the prelude's intrinsics (INTRINSICS) */
+    int intrinsic_fn[64]; /* runtime externs of the prelude's intrinsics (INTRINSICS) */
+    int cs_fn[5];         /* luma_cs_init, _get, _set, _addr, _view (C structs) */
     Fn *f;
     bool failed;
     int col; /* column of the expression being lowered (IrInstr.col, for diagnostics after lowering) */
@@ -356,6 +361,11 @@ static const TArg *tenv_find(L *l, const char *name) {
 /* Resolves a Luma type annotation; T_ANY if absent. */
 static Ty resolve_type(L *l, const TypeRef *t) {
     if (!t->name) return T_ANY;
+    if (t->pointer) {
+        lerr(l, t->line, t->col, "'*%s' is a C pointer type, only allowed in extern declarations (a Luma value of a C struct is just %s)",
+             t->name, t->name);
+        return T_ANY;
+    }
     Ty nil = t->nullable ? T_NIL : 0;
     const TArg *ta = tenv_find(l, t->name);
     if (ta) {
@@ -417,6 +427,41 @@ static void unify(L *l, const TypeRef *pat, Ty actual, const char *const *names,
     if (si < 0 || l->structs[si].generic != gi) return;
     for (size_t k = 0; k < pat->nargs; k++) unify(l, &pat->args[k], l->structs[si].targs[k], names, n, binds, bound);
 }
+
+/* A C struct in an extern signature: `*S` / `*S?` (a pointer: CT_PTR) or
+ * `S` (by value, at most 16 bytes: CT_CSW0 / CT_CSRET). Returns the
+ * struct's IR id, or -1 when t names no C struct (or after an error). */
+static int extern_struct_type(L *l, const TypeRef *t, bool is_return, CType *ct, bool *nullable) {
+    *nullable = false;
+    if (!t->name) return -1;
+    int si = find_struct(l, t->name);
+    bool cs = si >= 0 && l->structs[si].decl && l->structs[si].decl->cstruct;
+    if (!cs) {
+        if (t->pointer)
+            lerr(l, t->line, t->col, "'*%s': only C structs (extern struct) have pointer types here; use ptr for other pointers", t->name);
+        return -1;
+    }
+    int sid = l->structs[si].sid;
+    if (t->pointer) {
+        *ct = CT_PTR;
+        *nullable = t->nullable;
+        return sid;
+    }
+    if (t->nullable) {
+        lerr(l, t->line, t->col, "a C struct passed by value cannot be nil; use *%s? for a pointer that may be NULL", t->name);
+        return -1;
+    }
+    if (l->m->structs[sid].csize > 16) {
+        lerr(l, t->line, t->col, "C struct '%s' is %d bytes: structs larger than 16 bytes are passed by pointer here (*%s)",
+             t->name, l->m->structs[sid].csize, t->name);
+        return -1;
+    }
+    *ct = is_return ? CT_CSRET : CT_CSW0;
+    return sid;
+}
+
+/* The C struct (index into l->structs) a type is exactly, or -1. */
+static int cstruct_of(L *l, Ty t);
 
 /* Resolves a C type in an extern declaration. */
 static CType resolve_ctype(L *l, const TypeRef *t, bool is_return) {
@@ -676,6 +721,28 @@ static const struct {
     {"__arena_pop", "luma_arena_leave", 0, T_NIL},
     {"__arena_destroy", "luma_arena_destroy", 1, T_NIL},
     {"__show", "luma_show", 1, T_ANY},
+    /* std library primitives (runtime/luma_rt.c) */
+    {"__array_new", "luma_array_new", 1, T_ANY},
+    {"__array_len", "luma_array_len", 1, T_ANY},
+    {"__array_get", "luma_array_get", 2, T_ANY},
+    {"__array_set", "luma_array_set", 3, T_ANY},
+    {"__str_len", "luma_str_len", 1, T_ANY},
+    {"__str_byte", "luma_str_byte", 2, T_ANY},
+    {"__str_char", "luma_str_char", 1, T_ANY},
+    {"__str_slice", "luma_str_slice", 3, T_ANY},
+    {"__str_find", "luma_str_find", 3, T_ANY},
+    {"__str_cmp", "luma_str_cmp", 2, T_ANY},
+    {"__str_from_int", "luma_str_from_int", 1, T_ANY},
+    {"__str_to_int", "luma_str_to_int", 1, T_ANY},
+    {"__str_case", "luma_str_case", 2, T_ANY},
+    {"__str_join", "luma_str_join", 3, T_ANY},
+    {"__fail", "luma_fail", 1, T_ANY},
+    {"__type", "luma_type_name", 1, T_ANY},
+    {"__array_sort", "luma_array_sort", 2, T_ANY},
+    {"__argc", "luma_argc", 0, T_ANY},
+    {"__argv", "luma_argv", 1, T_ANY},
+    {"__mem_string", "luma_mem_string", 2, T_ANY},
+    {"__mem_write", "luma_mem_write", 2, T_ANY},
 };
 
 static bool in_prelude(L *l) {
@@ -683,31 +750,39 @@ static bool in_prelude(L *l) {
     return fi && fi->decl->line >= LUMA_PRELUDE_LINE;
 }
 
-static Val lower_intrinsic(L *l, const Expr *e, int hint) {
+static size_t intrinsic_index(const char *name) {
     size_t k = 0;
-    while (k < sizeof INTRINSICS / sizeof *INTRINSICS && strcmp(INTRINSICS[k].name, e->name) != 0) k++;
-    if (!in_prelude(l) || k == sizeof INTRINSICS / sizeof *INTRINSICS) {
-        lerr(l, e->line, e->col, "'%s' is internal to the prelude (names starting with __ are reserved)", e->name);
-        return NO_VAL;
-    }
+    while (k < sizeof INTRINSICS / sizeof *INTRINSICS && strcmp(INTRINSICS[k].name, name) != 0) k++;
+    return k;
+}
+
+static Val lower_intrinsic(L *l, const Expr *e, int hint) {
+    size_t k = intrinsic_index(e->name);
     if ((int)e->nargs != INTRINSICS[k].arity) {
         lerr(l, e->line, e->col, "'%s' expects %d argument%s, got %zu", e->name, INTRINSICS[k].arity,
              INTRINSICS[k].arity == 1 ? "" : "s", e->nargs);
         return NO_VAL;
     }
-    Val v[1];
+    Val v[4];
     if (!lower_operands(l, e->args, e->nargs, v)) return NO_VAL;
     int d = hint >= 0 ? hint : -1;
     Val r = result(l, hint, &d);
     int g = runtime_extern(l, &l->intrinsic_fn[k], INTRINSICS[k].symbol, INTRINSICS[k].arity);
-    int arg = e->nargs ? v[0].v : -1;
-    emit_call(l, hint == DISCARD ? IR_NONE : d, g, e->nargs ? &arg : NULL, (int)e->nargs, e->line);
+    int args[4];
+    for (size_t i = 0; i < e->nargs; i++) args[i] = v[i].v;
+    emit_call(l, hint == DISCARD ? IR_NONE : d, g, e->nargs ? args : NULL, (int)e->nargs, e->line);
     r.ty = INTRINSICS[k].ret;
     return r;
 }
 
 static Val lower_call(L *l, const Expr *e, int hint) {
-    if (strncmp(e->name, "__", 2) == 0) return lower_intrinsic(l, e, hint);
+    if (strncmp(e->name, "__", 2) == 0) { /* intrinsics and the std files' own helpers */
+        if (!in_prelude(l)) {
+            lerr(l, e->line, e->col, "'%s' is internal to the prelude (names starting with __ are reserved)", e->name);
+            return NO_VAL;
+        }
+        if (intrinsic_index(e->name) < sizeof INTRINSICS / sizeof *INTRINSICS) return lower_intrinsic(l, e, hint);
+    }
     Name n = lookup(l, e->name);
     if (n.kind == NAME_LOCAL || n.kind == NAME_GLOBAL) {
         lerr(l, e->line, e->col, "'%s' is a variable, not a function", e->name);
@@ -754,7 +829,10 @@ static Val lower_call(L *l, const Expr *e, int hint) {
         if (ssi >= 0 && l->m->structs[l->structs[ssi].sid].shared) {
             char tn[600];
             ir_struct_display(l->structs[ssi].name, tn, sizeof tn);
-            lerr(l, e->args[0]->line, e->args[0]->col, "'%s' is a shared struct; it is freed when its last reference goes away", tn);
+            if (l->m->structs[l->structs[ssi].sid].cstruct)
+                lerr(l, e->args[0]->line, e->args[0]->col, "'%s' is a C struct: its value is freed automatically (and memory C owns stays C's)", tn);
+            else
+                lerr(l, e->args[0]->line, e->args[0]->col, "'%s' is a shared struct; it is freed when its last reference goes away", tn);
             goto done;
         }
         emit_call(l, IR_NONE, runtime_extern(l, &l->free_fn, "luma_free", 1), args, 1, e->line);
@@ -803,7 +881,27 @@ static Val lower_call(L *l, const Expr *e, int hint) {
     }
     if (n.kind == NAME_EXTERN) {
         const ExtInfo *x = &l->exts[n.index];
+        int cargs[MAX_PARAMS * 2], nc = 0;
+        int kept[MAX_PARAMS], nkept = 0; /* *S arguments: alive until C returns */
         for (size_t i = 0; i < e->nargs; i++) {
+            if (x->psid[i] >= 0) { /* a C struct: *S (its address) or S (its eightbytes) */
+                char what[300];
+                snprintf(what, sizeof what, "argument '%s' of '%s'", x->decl->params[i], x->name);
+                Ty want = ty_struct_of(x->psid[i]) | (x->pnull[i] ? T_NIL : 0);
+                vals[i].ty = flow(l, vals[i], want, what, e->args[i]->line, e->args[i]->col);
+                if (l->failed) goto done;
+                if (x->ctypes[i] == CT_PTR) {
+                    int a = temp(l);
+                    emit_call(l, a, runtime_extern(l, &l->cs_fn[3], "luma_cs_addr", 1), &vals[i].v, 1, e->line);
+                    cargs[nc++] = a;
+                    kept[nkept++] = vals[i].v;
+                } else {
+                    cargs[nc++] = vals[i].v;
+                    if (l->m->structs[x->psid[i]].csize > 8) cargs[nc++] = vals[i].v;
+                }
+                continue;
+            }
+            cargs[nc++] = vals[i].v;
             /* Static check only: the runtime converter validates the value anyway. */
             Ty want = ctype_luma(x->ctypes[i]);
             if (!(vals[i].ty & want)) {
@@ -815,9 +913,44 @@ static Val lower_call(L *l, const Expr *e, int hint) {
                 goto done;
             }
         }
+        if (x->rsid >= 0 && x->cret == CT_PTR) { /* *S: a view of C's memory (or nil for NULL with *S?) */
+            int a = temp(l), z = temp(l), o = temp(l);
+            emit_call(l, a, x->global, cargs, nc, e->line);
+            for (int i = 0; i < nkept; i++) emit(l, IR_KEEP, e->line)->a = kept[i];
+            emit(l, IR_CONST_INT, e->line)->dst = z;
+            IrInstr *nw = emit(l, IR_NEW, e->line);
+            nw->dst = o;
+            nw->sid = x->rsid;
+            nw->nargs = 2;
+            nw->args = xmalloc(2 * sizeof(int));
+            nw->args[0] = a;
+            nw->args[1] = z;
+            r = result(l, hint, &d);
+            if (hint != DISCARD) {
+                char what[300];
+                snprintf(what, sizeof what, "the result of %s", x->name);
+                int vargs[3] = {o, temp(l), temp(l)};
+                emit(l, x->rnull ? IR_CONST_TRUE : IR_CONST_FALSE, e->line)->dst = vargs[1];
+                IrInstr *c = emit(l, IR_CONST_DATA, e->line);
+                c->dst = vargs[2];
+                c->global = string_data(l, what, strlen(what));
+                emit_call(l, d, runtime_extern(l, &l->cs_fn[4], "luma_cs_view", 3), vargs, 3, e->line);
+                Ty t = ty_struct_of(x->rsid) | (x->rnull ? T_NIL : 0);
+                r.ty = T_ANY;
+                r.ty = flow(l, r, t, what, e->line, e->col); /* (the view is exactly that) */
+            }
+            goto done;
+        }
         r = result(l, hint, &d);
-        emit_call(l, hint == DISCARD ? IR_NONE : d, x->global, args, (int)e->nargs, e->line);
+        emit_call(l, hint == DISCARD ? IR_NONE : d, x->global, cargs, nc, e->line);
+        for (int i = 0; i < nkept; i++) emit(l, IR_KEEP, e->line)->a = kept[i];
         r.ty = ctype_luma(x->cret);
+        if (x->rsid >= 0 && hint != DISCARD) { /* a struct by value: the runtime boxed it */
+            char what[300];
+            snprintf(what, sizeof what, "the result of %s", x->name);
+            r.ty = T_ANY;
+            r.ty = flow(l, r, ty_struct_of(x->rsid), what, e->line, e->col);
+        }
         goto done;
     }
     const FnInfo *fi = &l->fns[n.index];
@@ -868,6 +1001,168 @@ static int static_struct(L *l, Ty t) {
     for (int i = 0; i < l->nstructs; i++)
         if (l->structs[i].sid == sid) return i;
     return -1;
+}
+
+static int cstruct_of(L *l, Ty t) {
+    int si = static_struct(l, t);
+    return si >= 0 && l->m->structs[l->structs[si].sid].cstruct ? si : -1;
+}
+
+/* ---- C structs (extern struct): their fields live in C memory, reached
+ * through runtime calls with the field's index (docs/DESIGN.md "C FFI"). */
+
+static int const_int(L *l, int64_t v, int line) {
+    int d = temp(l);
+    IrInstr *in = emit(l, IR_CONST_INT, line);
+    in->dst = d;
+    in->imm = v;
+    return d;
+}
+
+/* s.f / s.f = v on a value statically of C struct si. */
+static Val cstruct_field(L *l, int si, Val obj, const Expr *e, Val *set, int hint) {
+    const IrStruct *st = &l->m->structs[l->structs[si].sid];
+    int k = ir_cstruct_field(st, e->name);
+    if (k < 0) {
+        lerr(l, e->line, e->col, "C struct '%s' has no field '%s'", st->name, e->name);
+        return NO_VAL;
+    }
+    char what[600];
+    snprintf(what, sizeof what, "field '%s' of %s", e->name, st->name);
+    CType ct = st->cftys[k];
+    int ki = const_int(l, k, e->line);
+    if (set) {
+        if (ct == CT_CSTR || ct == CT_CSTR_OPT) {
+            lerr(l, e->line, e->col, "%s is a C string: it can be read, not written (its memory belongs to C)", what);
+            return NO_VAL;
+        }
+        set->ty = flow(l, *set, ctype_luma(ct), what, e->right->line, e->right->col);
+        int args[3] = {obj.v, ki, set->v};
+        emit_call(l, IR_NONE, runtime_extern(l, &l->cs_fn[2], "luma_cs_set", 3), args, 3, e->line);
+        if (hint >= 0) {
+            emit_mov(l, hint, set->v, e->line);
+            return (Val){hint, set->ty};
+        }
+        return *set;
+    }
+    int d = temp(l);
+    int args[2] = {obj.v, ki};
+    emit_call(l, d, runtime_extern(l, &l->cs_fn[1], "luma_cs_get", 2), args, 2, e->line);
+    Val r = {d, T_ANY};
+    r.ty = flow(l, r, ctype_luma(ct), what, e->line, e->col); /* (the runtime converted it to exactly this) */
+    if (hint >= 0) {
+        emit_mov(l, hint, d, e->line);
+        r.v = hint;
+    }
+    return r;
+}
+
+/* S { f: v, ... } of a C struct: zeroed C memory, then the given fields. */
+static Val cstruct_literal(L *l, int si, const Expr *e, int hint) {
+    int sid = l->structs[si].sid;
+    const IrStruct *st = &l->m->structs[sid];
+    for (size_t i = 0; i < e->nargs; i++) {
+        int k = ir_cstruct_field(st, e->fields[i]);
+        if (k < 0) {
+            lerr(l, e->field_line[i], e->field_col[i], "C struct '%s' has no field '%s'", st->name, e->fields[i]);
+            return NO_VAL;
+        }
+        for (size_t j = 0; j < i; j++)
+            if (strcmp(e->fields[j], e->fields[i]) == 0) {
+                lerr(l, e->field_line[i], e->field_col[i], "field '%s' is given twice", e->fields[i]);
+                return NO_VAL;
+            }
+        if (st->cftys[k] == CT_CSTR || st->cftys[k] == CT_CSTR_OPT) {
+            lerr(l, e->field_line[i], e->field_col[i], "field '%s' of %s is a C string: it can be read, not written (its memory belongs to C)",
+                 e->fields[i], st->name);
+            return NO_VAL;
+        }
+    }
+    Val *vals = xmalloc((e->nargs ? e->nargs : 1) * sizeof *vals);
+    if (!lower_operands(l, e->args, e->nargs, vals)) {
+        free(vals);
+        return NO_VAL;
+    }
+    int z = const_int(l, 0, e->line), o = temp(l);
+    IrInstr *in = emit(l, IR_NEW, e->line);
+    in->dst = o;
+    in->sid = sid;
+    in->nargs = 2;
+    in->args = xmalloc(2 * sizeof(int));
+    in->args[0] = in->args[1] = z;
+    emit_call(l, IR_NONE, runtime_extern(l, &l->cs_fn[0], "luma_cs_init", 1), &o, 1, e->line);
+    for (size_t i = 0; i < e->nargs && !l->failed; i++) {
+        int k = ir_cstruct_field(st, e->fields[i]);
+        char what[600];
+        snprintf(what, sizeof what, "field '%s' of %s", e->fields[i], st->name);
+        vals[i].ty = flow(l, vals[i], ctype_luma(st->cftys[k]), what, e->args[i]->line, e->args[i]->col);
+        int args[3] = {o, const_int(l, k, e->line), vals[i].v};
+        emit_call(l, IR_NONE, runtime_extern(l, &l->cs_fn[2], "luma_cs_set", 3), args, 3, e->line);
+    }
+    free(vals);
+    if (l->failed) return NO_VAL;
+    if (hint == DISCARD) return NO_VAL;
+    if (hint >= 0) {
+        emit_mov(l, hint, o, e->line);
+        return (Val){hint, ty_struct_of(sid)};
+    }
+    return (Val){o, ty_struct_of(sid)};
+}
+
+/* S::size(), S::at(address), S::addr(s): the functions every C struct has
+ * (unless its impl defines one of these names). */
+static bool cstruct_builtin(L *l, int si, const Expr *e, int hint, Val *out) {
+    int sid = l->structs[si].sid;
+    const IrStruct *st = &l->m->structs[sid];
+    bool size = strcmp(e->str, "size") == 0, at = strcmp(e->str, "at") == 0, addr = strcmp(e->str, "addr") == 0;
+    if (!size && !at && !addr) return false;
+    if (e->nargs != (size ? 0u : 1u)) {
+        lerr(l, e->line, e->col, "'%s::%s' expects %d argument%s, got %zu", st->name, e->str, size ? 0 : 1, size ? "s" : "", e->nargs);
+        *out = NO_VAL;
+        return true;
+    }
+    if (size) {
+        int d = hint >= 0 ? hint : temp(l);
+        IrInstr *in = emit(l, IR_CONST_INT, e->line);
+        in->dst = d;
+        in->imm = st->csize;
+        *out = (Val){d, T_INT};
+        return true;
+    }
+    Val v = lower_expr(l, e->args[0], -1);
+    *out = NO_VAL;
+    if (v.v < 0) return true;
+    char what[600];
+    snprintf(what, sizeof what, "argument of %s::%s", st->name, e->str);
+    int d = hint >= 0 ? hint : temp(l);
+    if (addr) { /* the address of its C memory */
+        v.ty = flow(l, v, ty_struct_of(sid), what, e->args[0]->line, e->args[0]->col);
+        emit_call(l, d, runtime_extern(l, &l->cs_fn[3], "luma_cs_addr", 1), &v.v, 1, e->line);
+        Val r = {d, T_ANY};
+        r.ty = flow(l, r, T_INT, what, e->line, e->col);
+        *out = r;
+        return true;
+    }
+    /* at: a view of the C struct at that address (memory C owns) */
+    v.ty = flow(l, v, T_INT, what, e->args[0]->line, e->args[0]->col);
+    int z = const_int(l, 0, e->line), o = temp(l);
+    IrInstr *in = emit(l, IR_NEW, e->line);
+    in->dst = o;
+    in->sid = sid;
+    in->nargs = 2;
+    in->args = xmalloc(2 * sizeof(int));
+    in->args[0] = v.v;
+    in->args[1] = z;
+    int vargs[3] = {o, temp(l), temp(l)};
+    emit(l, IR_CONST_FALSE, e->line)->dst = vargs[1];
+    IrInstr *c = emit(l, IR_CONST_DATA, e->line);
+    c->dst = vargs[2];
+    c->global = string_data(l, what, strlen(what));
+    emit_call(l, d, runtime_extern(l, &l->cs_fn[4], "luma_cs_view", 3), vargs, 3, e->line);
+    Val r = {d, T_ANY};
+    r.ty = flow(l, r, ty_struct_of(sid), what, e->line, e->col);
+    *out = r;
+    return true;
 }
 
 /* A field access or method call on a value that can never be a struct. */
@@ -1091,6 +1386,7 @@ static int infer_instance(L *l, int gi, Ty expect, const char *const *names, con
 static Val lower_struct_literal(L *l, const Expr *e, int hint, Ty expect) {
     int si = find_struct(l, e->name);
     int gi = si < 0 ? find_generic(l, e->name) : -1;
+    if (si >= 0 && l->m->structs[l->structs[si].sid].cstruct) return cstruct_literal(l, si, e, hint);
     if (si < 0 && gi < 0) {
         lerr(l, e->line, e->col, "unknown struct '%s'", e->name);
         return NO_VAL;
@@ -1184,6 +1480,12 @@ static Val lower_field(L *l, const Expr *e, int hint) {
     int first;
     v[0] = deref_member(l, v[0], e->name, false, e->line, e->col, &boxes, &first);
     if (v[0].v < 0) return NO_VAL;
+    int csi = cstruct_of(l, v[0].ty);
+    if (csi >= 0 && ir_cstruct_field(&l->m->structs[l->structs[csi].sid], e->name) >= 0) {
+        Val r = cstruct_field(l, csi, v[0], e, set ? &v[1] : NULL, hint);
+        keep_boxes(l, &boxes, e->line);
+        return r;
+    }
     int si = static_struct(l, v[0].ty);
     int sid = -1, k = -1;
     if (si >= 0) {
@@ -1325,6 +1627,10 @@ static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
     if (strcmp(e->str, "drop") == 0) {
         lerr(l, e->line, e->col, "drop() runs by itself when an instance is freed; call free(x) or dispose(x) instead");
         return NO_VAL;
+    }
+    if (si >= 0 && l->m->structs[l->structs[si].sid].cstruct && find_impl_fn(l, si, e->str) < 0) {
+        Val r;
+        if (cstruct_builtin(l, si, e, hint, &r)) return r;
     }
     if (gi >= 0) {
         /* Box::new(args): the instance comes from the argument types (and the
@@ -1909,6 +2215,10 @@ static void collect_structs(L *l, const Program *prog) {
             lerr(l, s->line, s->col, "struct '%s' is already defined", s->name);
             return;
         }
+        if (s->ntparams && s->cstruct) {
+            lerr(l, s->line, s->col, "a C struct cannot be generic");
+            return;
+        }
         if (s->ntparams) { /* generic: instantiated on demand */
             for (size_t k = 0; k < s->ntparams; k++)
                 if (is_type_name(s->tparams[k])) {
@@ -1950,6 +2260,23 @@ static void collect_structs(L *l, const Program *prog) {
     int nfixed = l->nstructs; /* (instances created while resolving fields set their own) */
     for (int si = 0; si < nfixed && !l->failed; si++) {
         const Stmt *s = l->structs[si].decl;
+        if (s->cstruct) { /* extern struct: C field types, C layout */
+            CType *ct = xmalloc((s->nparams ? s->nparams : 1) * sizeof *ct);
+            for (size_t k = 0; k < s->nparams && !l->failed; k++) {
+                for (size_t j = 0; j < k; j++)
+                    if (strcmp(s->params[k], s->params[j]) == 0)
+                        lerr(l, s->param_line[k], s->param_col[k], "duplicate field '%s'", s->params[k]);
+                const TypeRef *t = &s->param_types[k];
+                if (!t->name || t->pointer || t->nargs || !ctype_from_name(t->name, t->nullable, &ct[k]) || !ctype_is_field(ct[k]))
+                    lerr(l, t->name ? t->line : s->param_line[k], t->name ? t->col : s->param_col[k],
+                         "field '%s' of C struct '%s' needs a C type: i8..i64, u8..u64, bool, ptr, cstr or cstr?",
+                         s->params[k], s->name);
+            }
+            if (!l->failed)
+                ir_cstruct_set_fields(l->m, l->structs[si].sid, (int)s->nparams, (const char *const *)s->params, ct);
+            free(ct);
+            continue;
+        }
         Ty *tys = xmalloc((s->nparams ? s->nparams : 1) * sizeof *tys);
         for (size_t k = 0; k < s->nparams; k++) {
             for (size_t j = 0; j < k; j++)
@@ -2306,15 +2633,40 @@ static void collect_declarations(L *l, const Program *prog) {
                 lerr(l, s->line, s->col, "C functions with more than %d parameters are not supported yet", MAX_PARAMS);
                 continue;
             }
-            ExtInfo x = {s->name, -1, s, NULL, CT_VOID};
-            x.ctypes = xmalloc((s->nparams ? s->nparams : 1) * sizeof *x.ctypes);
-            for (size_t k = 0; k < s->nparams; k++) x.ctypes[k] = resolve_ctype(l, &s->param_types[k], false);
-            x.cret = resolve_ctype(l, &s->type, true);
+            ExtInfo x = {s->name, -1, s, NULL, CT_VOID, NULL, NULL, -1, false};
+            size_t np = s->nparams ? s->nparams : 1;
+            x.ctypes = xmalloc(np * sizeof *x.ctypes);
+            x.psid = xmalloc(np * sizeof *x.psid);
+            x.pnull = xmalloc(np * sizeof *x.pnull);
+            /* the C parameters: a struct by value is one or two eightbytes */
+            CType cps[MAX_PARAMS * 2];
+            const char *cns[MAX_PARAMS * 2];
+            int ncp = 0;
+            for (size_t k = 0; k < s->nparams; k++) {
+                x.psid[k] = extern_struct_type(l, &s->param_types[k], false, &x.ctypes[k], &x.pnull[k]);
+                if (x.psid[k] < 0) x.ctypes[k] = resolve_ctype(l, &s->param_types[k], false);
+                int words = x.ctypes[k] == CT_CSW0 ? (l->m->structs[x.psid[k]].csize > 8 ? 2 : 1) : 1;
+                for (int w = 0; w < words; w++) {
+                    if (ncp == MAX_PARAMS) {
+                        lerr(l, s->line, s->col, "C functions with more than %d parameters (counting each eightbyte of a struct passed by value) are not supported yet",
+                             MAX_PARAMS);
+                        break;
+                    }
+                    cps[ncp] = w ? CT_CSW1 : x.ctypes[k];
+                    cns[ncp++] = s->params[k];
+                }
+            }
+            x.rsid = extern_struct_type(l, &s->type, true, &x.cret, &x.rnull);
+            if (x.rsid < 0) x.cret = resolve_ctype(l, &s->type, true);
             if (l->failed) {
                 free(x.ctypes);
+                free(x.psid);
+                free(x.pnull);
                 continue;
             }
-            x.global = ir_add_cextern(l->m, s->name, (int)s->nparams, x.ctypes, (const char *const *)s->params, x.cret);
+            x.global = ir_add_cextern(l->m, s->name, ncp, cps, cns, x.cret);
+            if (x.cret == CT_CSRET) l->m->globals[x.global].cret_sid = x.rsid;
+            if (s->csym) l->m->globals[x.global].csym = xstrdup(s->csym);
             l->exts = xrealloc(l->exts, (size_t)(l->nexts + 1) * sizeof *l->exts);
             l->exts[l->nexts++] = x;
         } else if (s->kind == STMT_VAR) {
@@ -2392,8 +2744,8 @@ static void names_add(Names *s, const char *n) {
     s->v[s->n++] = n;
 }
 
-/* The struct names a piece of code mentions (types, literals, X::f calls;
- * an arena block mentions Arena). */
+/* The names a piece of code mentions: struct names (types, literals, X::f
+ * calls; an arena block mentions Arena) and called functions. */
 static void mention_stmt(const Stmt *s, Names *out);
 
 static void mention_type(const TypeRef *t, Names *out) {
@@ -2404,7 +2756,7 @@ static void mention_type(const TypeRef *t, Names *out) {
 
 static void mention_expr(const Expr *e, Names *out) {
     if (!e) return;
-    if (e->kind == EXPR_ASSOC || e->kind == EXPR_STRUCT) names_add(out, e->name);
+    if (e->kind == EXPR_ASSOC || e->kind == EXPR_STRUCT || e->kind == EXPR_CALL) names_add(out, e->name);
     if (e->kind == EXPR_ARENA) names_add(out, "Arena");
     mention_expr(e->left, out);
     mention_expr(e->right, out);
@@ -2423,50 +2775,102 @@ static void mention_stmt(const Stmt *s, Names *out) {
     mention_stmt(s->body, out);
 }
 
-/* The program followed by the prelude's declarations it uses (into all,
- * which borrows the statements of both). False after an error: a name the
- * prelude defines or reserves is declared again. */
+/* The name a top-level statement defines (an impl adds to its struct's). */
+static const char *defines(const Stmt *s) {
+    return s->kind == STMT_STRUCT || s->kind == STMT_IMPL || s->kind == STMT_FUN || s->kind == STMT_EXTERN ||
+                   s->kind == STMT_VAR
+               ? s->name
+               : NULL;
+}
+
+static bool same_typeref(const TypeRef *a, const TypeRef *b) {
+    if (!a->name || !b->name) return !a->name && !b->name;
+    if (strcmp(a->name, b->name) != 0 || a->nullable != b->nullable || a->nargs != b->nargs) return false;
+    for (size_t i = 0; i < a->nargs; i++)
+        if (!same_typeref(&a->args[i], &b->args[i])) return false;
+    return true;
+}
+
+/* Two `extern fun` declarations of the same C function that agree. */
+static bool same_extern(const Stmt *a, const Stmt *b) {
+    if (a->nparams != b->nparams || !same_typeref(&a->type, &b->type)) return false;
+    for (size_t i = 0; i < a->nparams; i++)
+        if (!same_typeref(&a->param_types[i], &b->param_types[i])) return false;
+    return true;
+}
+
+/* The program followed by the std declarations it uses (into all, which
+ * borrows the statements of both). std/prelude.luma's names are reserved;
+ * a library module's name the program defines itself is the program's,
+ * unless std code needs the library's. False after an error. */
 static bool with_prelude(const char *path, const Program *prog, const Program *pre, Program *all) {
     bool ok = true;
+    Names own = {0}; /* what the program defines */
     for (size_t i = 0; i < prog->len; i++) {
         const Stmt *s = prog->stmts[i];
-        if (s->kind != STMT_STRUCT && s->kind != STMT_FUN && s->kind != STMT_VAR && s->kind != STMT_EXTERN &&
-            s->kind != STMT_IMPL)
-            continue;
-        bool taken = strncmp(s->name, "__", 2) == 0;
-        for (size_t k = 0; k < pre->len && !taken; k++)
-            taken = pre->stmts[k]->kind == STMT_STRUCT && strcmp(pre->stmts[k]->name, s->name) == 0;
-        if (taken) {
-            fprintf(stderr, "%s:%d:%d: error: '%s' is %s%s\n", path, s->line, s->col, s->name,
-                    strncmp(s->name, "__", 2) == 0 ? "reserved (names starting with __ belong to the prelude)"
-                                                   : "defined by the prelude",
-                    s->kind == STMT_IMPL && strncmp(s->name, "__", 2) != 0 ? "; it cannot have another impl block" : "");
+        const char *n = defines(s);
+        if (!n) continue;
+        names_add(&own, n);
+        bool core = false;
+        for (size_t k = 0; k < pre->len && !core; k++)
+            core = prelude_is_core(pre->stmts[k]->line) && pre->stmts[k]->kind == STMT_STRUCT &&
+                   strcmp(pre->stmts[k]->name, n) == 0;
+        if (strncmp(n, "__", 2) == 0 || core) {
+            fprintf(stderr, "%s:%d:%d: error: '%s' is %s%s\n", path, s->line, s->col, n,
+                    core ? "defined by the prelude" : "reserved (names starting with __ belong to the prelude)",
+                    core && s->kind == STMT_IMPL ? "; it cannot have another impl block" : "");
             ok = false;
         }
     }
-    if (!ok) return false;
-    Names used = {0};
-    for (size_t i = 0; i < prog->len; i++) mention_stmt(prog->stmts[i], &used);
-    bool *keep = xcalloc(pre->len ? pre->len : 1, sizeof *keep);
-    for (bool changed = true; changed;) { /* (prelude code may mention more prelude structs) */
-        changed = false;
-        for (size_t k = 0; k < pre->len; k++)
-            if (!keep[k] && names_has(&used, pre->stmts[k]->name)) {
-                keep[k] = changed = true;
-                mention_stmt(pre->stmts[k], &used);
-            }
+    if (!ok) {
+        free(own.v);
+        return false;
     }
-    all->source_path = prog->source_path;
-    all->cap = pre->len + prog->len + 1;
-    all->stmts = xmalloc(all->cap * sizeof *all->stmts);
-    all->len = 0;
-    /* the program's structs first: struct ids, and memcheck's lists, are in this order */
-    for (size_t i = 0; i < prog->len; i++) all->stmts[all->len++] = prog->stmts[i];
-    for (size_t k = 0; k < pre->len; k++)
-        if (keep[k]) all->stmts[all->len++] = pre->stmts[k];
+    /* what the program uses and does not define itself */
+    Names used = {0}, mine = {0};
+    for (size_t i = 0; i < prog->len; i++) mention_stmt(prog->stmts[i], &mine);
+    for (size_t i = 0; i < mine.n; i++)
+        if (!names_has(&own, mine.v[i])) names_add(&used, mine.v[i]);
+    bool *keep = xcalloc(pre->len ? pre->len : 1, sizeof *keep);
+    for (bool changed = true; changed && ok;) { /* std code may use more std items */
+        changed = false;
+        for (size_t k = 0; k < pre->len && ok; k++) {
+            const Stmt *s = pre->stmts[k];
+            const char *n = defines(s);
+            if (keep[k] || !n || !names_has(&used, n)) continue;
+            if (names_has(&own, n)) {
+                /* the program defines it too: an agreeing extern is shared */
+                const Stmt *u = NULL;
+                for (size_t i = 0; i < prog->len && !u; i++)
+                    if (defines(prog->stmts[i]) && strcmp(defines(prog->stmts[i]), n) == 0) u = prog->stmts[i];
+                if (s->kind == STMT_EXTERN && u->kind == STMT_EXTERN && same_extern(s, u)) continue;
+                fprintf(stderr, "%s:%d:%d: error: '%s' is defined by the program and by the standard library (%s), which needs its own\n",
+                        path, u->line, u->col, n, prelude_path(path, s->line));
+                ok = false;
+                break;
+            }
+            keep[k] = changed = true;
+            Names more = {0};
+            mention_stmt(s, &more);
+            for (size_t i = 0; i < more.n; i++) names_add(&used, more.v[i]);
+            free(more.v);
+        }
+    }
+    if (ok) {
+        all->source_path = prog->source_path;
+        all->cap = pre->len + prog->len + 1;
+        all->stmts = xmalloc(all->cap * sizeof *all->stmts);
+        all->len = 0;
+        /* the program's structs first: struct ids, and memcheck's lists, are in this order */
+        for (size_t i = 0; i < prog->len; i++) all->stmts[all->len++] = prog->stmts[i];
+        for (size_t k = 0; k < pre->len; k++)
+            if (keep[k]) all->stmts[all->len++] = pre->stmts[k];
+    }
     free(keep);
     free(used.v);
-    return true;
+    free(mine.v);
+    free(own.v);
+    return ok;
 }
 
 bool lower_program(const Program *user, IrModule *out) {
@@ -2483,7 +2887,8 @@ bool lower_program(const Program *user, IrModule *out) {
     l.m = out;
     l.write_fn = l.space_fn = l.newline_fn = l.free_fn = -1;
     l.dispose_fn = l.refcount_fn = -1;
-    for (int i = 0; i < 8; i++) l.intrinsic_fn[i] = -1;
+    for (int i = 0; i < 64; i++) l.intrinsic_fn[i] = -1;
+    for (int i = 0; i < 5; i++) l.cs_fn[i] = -1;
     Fn main_fn;
     int main_fi = ir_add_func(out, "luma_main", 0);
     collect_declarations(&l, prog);
@@ -2508,7 +2913,11 @@ bool lower_program(const Program *user, IrModule *out) {
     free(l.generics);
     for (int i = 0; i < l.ntenvs; i++) free(l.tenvs[i]);
     free(l.tenvs);
-    for (int i = 0; i < l.nexts; i++) free(l.exts[i].ctypes);
+    for (int i = 0; i < l.nexts; i++) {
+        free(l.exts[i].ctypes);
+        free(l.exts[i].psid);
+        free(l.exts[i].pnull);
+    }
     free(l.fns);
     free(l.exts);
     free(l.gvars);

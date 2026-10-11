@@ -1,0 +1,113 @@
+// List<T>: a growable list. Like a string it is shared and freed when its
+// last reference goes away; it holds references to its items and does not
+// free them. Indexes start at 0; an index out of range is a runtime error.
+shared struct List<T> { __items, __len: int }
+
+impl List<T> {
+  fun new(): List<T> { return List { __items: __array_new(4), __len: 0 }; }
+
+  fun len(self): int { return self.__len; }
+  fun is_empty(self): bool { return self.__len == 0; }
+
+  fun get(self, i: int): T {
+    self.__check(i);
+    return __array_get(self.__items, i);
+  }
+
+  fun set(self, i: int, v: T) {
+    self.__check(i);
+    __array_set(self.__items, i, v);
+  }
+
+  fun push(self, v: T) {
+    if (self.__len == __array_len(self.__items)) self.__grow(self.__len * 2 + 4);
+    __array_set(self.__items, self.__len, v);
+    self.__len = self.__len + 1;
+  }
+
+  fun pop(self): T {
+    if (self.__len == 0) return __fail("List::pop of an empty list.");
+    self.__len = self.__len - 1;
+    var v = __array_get(self.__items, self.__len);
+    __array_set(self.__items, self.__len, nil);
+    return v;
+  }
+
+  fun first(self): T { return self.get(0); }
+  fun last(self): T { return self.get(self.__len - 1); }
+
+  // inserts v before index i (0 <= i <= len)
+  fun insert(self, i: int, v: T) {
+    if (i < 0 or i > self.__len) return __fail("Index " + __str_from_int(i) + " is out of range for insert (length " + __str_from_int(self.__len) + ").");
+    self.push(v);
+    for (var k = self.__len - 1; k > i; k = k - 1) __array_set(self.__items, k, __array_get(self.__items, k - 1));
+    __array_set(self.__items, i, v);
+  }
+
+  // removes and returns the item at i
+  fun remove(self, i: int): T {
+    self.__check(i);
+    var v = __array_get(self.__items, i);
+    for (var k = i; k < self.__len - 1; k = k + 1) __array_set(self.__items, k, __array_get(self.__items, k + 1));
+    self.__len = self.__len - 1;
+    __array_set(self.__items, self.__len, nil);
+    return v;
+  }
+
+  // the first index of an item == v, or -1
+  fun index_of(self, v: T): int {
+    for (var k = 0; k < self.__len; k = k + 1)
+      if (__array_get(self.__items, k) == v) return k;
+    return -1;
+  }
+
+  fun contains(self, v: T): bool { return self.index_of(v) >= 0; }
+
+  fun clear(self) {
+    for (var k = 0; k < self.__len; k = k + 1) __array_set(self.__items, k, nil);
+    self.__len = 0;
+  }
+
+  fun reverse(self) {
+    var i = 0;
+    var j = self.__len - 1;
+    while (i < j) {
+      var t = __array_get(self.__items, i);
+      __array_set(self.__items, i, __array_get(self.__items, j));
+      __array_set(self.__items, j, t);
+      i = i + 1;
+      j = j - 1;
+    }
+  }
+
+  // sorts in place: a list of ints, or of strs (bytewise)
+  fun sort(self) { __array_sort(self.__items, self.__len); }
+
+  // a new list with items [from, to) (clamped to the list)
+  fun slice(self, from: int, to: int): List<T> {
+    var r: List<T> = List::new();
+    var a = Math::max(from, 0);
+    var b = Math::min(to, self.__len);
+    for (var k = a; k < b; k = k + 1) r.push(__array_get(self.__items, k));
+    return r;
+  }
+
+  fun copy(self): List<T> { return self.slice(0, self.__len); }
+
+  fun show(self): str {
+    var parts = __array_new(self.__len);
+    for (var k = 0; k < self.__len; k = k + 1) __array_set(parts, k, __show(__array_get(self.__items, k)));
+    return "[" + __str_join(parts, self.__len, ", ") + "]";
+  }
+
+  fun __check(self, i: int) {
+    if (i < 0 or i >= self.__len)
+      __fail("Index " + __str_from_int(i) + " is out of range (length " + __str_from_int(self.__len) + ").");
+  }
+
+  fun __grow(self, cap: int) {
+    var items = __array_new(cap);
+    for (var k = 0; k < self.__len; k = k + 1) __array_set(items, k, __array_get(self.__items, k));
+    self.__items = items;
+  }
+}

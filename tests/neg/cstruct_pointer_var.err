@@ -1,0 +1,1 @@
+'*S' is a C pointer type, only allowed in extern declarations (a Luma value of a C struct is just S)

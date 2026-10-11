@@ -1,0 +1,106 @@
+// Sys: the program's environment: arguments, environment variables, exit,
+// running commands, time and dates. Uses C structs (extern struct) for the
+// C library's timespec and tm.
+extern struct __Timespec { tv_sec: i64, tv_nsec: i64 }
+extern struct __TimeT { t: i64 }
+extern struct __Tm { sec: i32, min: i32, hour: i32, mday: i32, mon: i32, year: i32, wday: i32, yday: i32, isdst: i32,
+                     gmtoff: i64, zone: cstr? }
+
+extern "getenv" fun __getenv(name: cstr): cstr?;
+extern "exit" fun __exit(code: i32): void;
+extern "system" fun __system(cmd: cstr): i32;
+extern "clock_gettime" fun __clock_gettime(clock: i32, ts: *__Timespec): i32;
+extern "gmtime_r" fun __gmtime_r(t: *__TimeT, out: *__Tm): *__Tm?;
+extern "localtime_r" fun __localtime_r(t: *__TimeT, out: *__Tm): *__Tm?;
+extern "write" fun __write(fd: i32, s: cstr, n: u64): i64;
+extern "fflush" fun __fflush_all(f: ptr): i32;
+
+struct Sys {}
+
+impl Sys {
+  // the command line, the program's own name first
+  fun args(): List<str> {
+    var out: List<str> = List::new();
+    for (var i = 0; i < __argc(); i = i + 1) out.push(__argv(i));
+    return out;
+  }
+
+  fun env(name: str): str? { return __getenv(name); }
+
+  // ends the program now (output written so far is flushed)
+  fun exit(code: int) {
+    __fflush_all(0);
+    __exit(code);
+  }
+
+  // runs a shell command; its exit status (-1 if it could not run)
+  fun run(cmd: str): int {
+    __fflush_all(0);
+    var status = __system(cmd);
+    if (status < 0) return -1;
+    return Math::mod(status / 256, 256);
+  }
+
+  // a runtime error with this message
+  fun fail(msg: str) { __fail(msg); }
+
+  // writes a line to standard error
+  fun eprint(s: str) {
+    __fflush_all(0);
+    var line = s + "\n";
+    __write(2, line, Str::len(line));
+  }
+
+  // "int", "str", "bool", "nil", or the struct's name
+  fun type_of(v): str { return __type(v); }
+
+  // seconds since 1970-01-01 UTC
+  fun time(): int {
+    var ts = __Timespec { };
+    __clock_gettime(0, ts);
+    return ts.tv_sec;
+  }
+
+  // a monotonic clock in milliseconds / nanoseconds (for measuring durations)
+  fun clock_ms(): int { return Sys::clock_ns() / 1000000; }
+
+  fun clock_ns(): int {
+    var ts = __Timespec { };
+    __clock_gettime(1, ts);
+    return ts.tv_sec * 1000000000 + ts.tv_nsec;
+  }
+
+  // the date and time of t (seconds since 1970), in UTC / in the local time zone
+  fun date(t: int): Date { return Sys::__date(t, true); }
+  fun local_date(t: int): Date { return Sys::__date(t, false); }
+
+  fun __date(t: int, utc: bool): Date {
+    var tt = __TimeT { t: t };
+    var tm = __Tm { };
+    var ok: __Tm? = nil;
+    if (utc) ok = __gmtime_r(tt, tm);
+    else ok = __localtime_r(tt, tm);
+    if (ok == nil) return __fail("Sys::date: time out of range.");
+    var zone = tm.zone;
+    if (zone == nil) zone = "";
+    return Date { year: tm.year + 1900, month: tm.mon + 1, day: tm.mday, hour: tm.hour, minute: tm.min,
+                  second: tm.sec, weekday: tm.wday, zone: zone };
+  }
+}
+
+// A calendar date and time (Sys::date). weekday: 0 is Sunday.
+shared struct Date { year: int, month: int, day: int, hour: int, minute: int, second: int, weekday: int, zone: str }
+
+impl Date {
+  // "2024-03-09 14:05:00 UTC"
+  fun show(self): str {
+    return Str::from_int(self.year) + "-" + Date::__two(self.month) + "-" + Date::__two(self.day) + " " +
+           Date::__two(self.hour) + ":" + Date::__two(self.minute) + ":" + Date::__two(self.second) + " " + self.zone;
+  }
+
+  fun weekday_name(self): str {
+    return Str::split("Sunday Monday Tuesday Wednesday Thursday Friday Saturday", " ").get(self.weekday);
+  }
+
+  fun __two(n: int): str { return Str::pad_left(Str::from_int(n), 2, "0"); }
+}
