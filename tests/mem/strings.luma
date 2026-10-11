@@ -1,0 +1,27 @@
+// Strings are freed automatically in --mm=manual and --mm=rc: temporaries
+// (print arguments, intermediate concatenations), overwritten variables,
+// globals and fields. cat() is a function so no concatenation is folded at
+// compile time and the allocation counts are the same at every -O level.
+fun cat(a, b) { return a + b; }
+fun shout(s) { return cat(cat(s, "!"), "!"); }
+
+var g = cat("glo", "bal");
+print(shout(g), cat(g, g));                      // 3 temporaries, freed after print
+
+var parts = "";
+for (var i = 0; i < 100; i = i + 1) parts = cat(parts, "x");   // 99 old values freed
+print(parts);
+
+struct Box { s: str, any }
+fun fill(b: Box) {
+  b.s = cat(b.s, "+");        // static field: the old string is released
+  b.any = cat("a", "b");
+}
+var b = Box { s: cat("bo", "x"), any: nil };
+fill(b);
+fill(b);
+print(b);
+
+g = cat("new", "value");      // the old global value is released
+print(g);
+cat("dropped", "result");      // a call whose result is discarded

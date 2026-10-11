@@ -125,7 +125,8 @@ typedef struct {
     int cs[5], ncs;       /* callee-saved registers used */
     bool framed;
     int frame_size;       /* bytes reserved below the callee-saved pushes */
-    Lines body, stubs, *cur;
+    Lines body, stubs, late, *cur; /* late: stubs of code that is itself in a stub */
+    int *defer_of;        /* a release done only on the slow path of the add at this index, or -1 */
     int ovf, divz;        /* labels of the noreturn error stubs, -1 until used */
     int *undef;           /* per global: undefined-variable stub label, or -1 */
 } G;
@@ -582,6 +583,8 @@ static void emit_ffi_call(G *g, const IrInstr *in) {
 
 static int64_t untag(int64_t w) { return w >> 1; }
 
+static void emit_release(G *g, int idx, const IrInstr *in);
+
 static void emit_arith(G *g, int idx, const IrInstr *in) {
     IrTy ta = g->tya[idx], tb = g->tyb[idx];
     if (!(ta & TY_INT) || !(tb & TY_INT)) {
@@ -685,7 +688,15 @@ static void emit_arith(G *g, int idx, const IrInstr *in) {
     store_reg(g, d, T);
     if (slow >= 0) {
         E(g, ".Lk%d:", cont);
-        slow_stub(g, idx, in, slow, cont);
+        /* The releases of the operands that follow an add run only on its
+         * slow path: on the fast path both operands were fixnums. */
+        Lines *save = g->cur;
+        g->cur = &g->stubs;
+        E(g, ".Lk%d:", slow);
+        call_runtime(g, idx, in);
+        for (int j = idx + 1; j < g->ninstr && g->defer_of[j] == idx; j++) emit_release(g, j, g->ins[j]);
+        E(g, "    jmp .Lk%d", cont);
+        g->cur = save;
     }
 }
 
@@ -865,9 +876,14 @@ static void emit_fused_br(G *g, int b, int idx, const IrInstr *br) {
 /* Can a value of type t be a non-object (so the tag test is needed)? */
 static bool may_be_immediate(IrTy t) { return t == 0 || (t & (TY_INT | TY_BOOL | TY_NIL)); }
 
+/* Can a value of type t be an object at all? (Flow-sensitive: after `n < 2`
+ * succeeds, n is an int.) */
+static bool may_be_object(IrTy t) { return t == 0 || (t & (TY_STR | TY_STRUCT)); }
+
 static void emit_retain(G *g, int idx, const IrInstr *in) {
     Loc L = g->loc[in->a];
     if (L.kind == LOC_IMM || L.kind == LOC_DATA) return; /* constants are never counted */
+    if (!may_be_object(g->tya[idx])) return;
     int r = use_r(g, in->a, R11), done = new_label();
     if (may_be_immediate(g->tya[idx])) {
         E(g, "    test %s, 7", R8B[r]);
@@ -898,7 +914,7 @@ static void emit_release_reg(G *g, int idx, int r, IrTy ty, bool maybe_zero) {
     E(g, "    sub dword ptr [%s + %d], 1", R64[r], LUMA_RC_OFFSET);
     E(g, ".Lk%d:", done);
     Lines *save = g->cur;
-    g->cur = &g->stubs;
+    g->cur = save == &g->stubs ? &g->late : &g->stubs; /* (this code may itself be in a stub) */
     E(g, ".Lk%d:", last);
     int saved[NREGS];
     int ns = live_caller(g, 2 * idx, 2 * idx + 2, -1, saved);
@@ -911,6 +927,7 @@ static void emit_release_reg(G *g, int idx, int r, IrTy ty, bool maybe_zero) {
 static void emit_release(G *g, int idx, const IrInstr *in) {
     Loc L = g->loc[in->a];
     if (L.kind == LOC_IMM || L.kind == LOC_DATA) return;
+    if (!may_be_object(g->tya[idx])) return;
     if (L.kind == LOC_REG) {
         emit_release_reg(g, idx, L.reg, g->tya[idx], false);
     } else {
@@ -1325,6 +1342,25 @@ static void analyze(G *g) {
         g->fuse_cmp[bidx] = idx;
     }
 
+    /* releases right after an add that needs a tag check, of its operands:
+     * emitted on the add's slow path only (see emit_arith) */
+    g->defer_of = xmalloc((size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) g->defer_of[i] = -1;
+    for (int li = 0; li < g->nlayout; li++) {
+        int b = g->layout[li];
+        const IrBlock *bl = &f->blocks[b];
+        for (int k = 0; k < bl->n; k++) {
+            const IrInstr *in = &bl->instrs[k];
+            int idx = g->first[b] + k;
+            IrTy ta = g->tya[idx], tb = g->tyb[idx];
+            if (in->op != IR_ADD || !(ta & TY_INT) || !(tb & TY_INT) || (ty_int_only(ta) && ty_int_only(tb))) continue;
+            for (int j = k + 1; j < bl->n && bl->instrs[j].op == IR_RELEASE &&
+                                (bl->instrs[j].a == in->a || bl->instrs[j].a == in->b) && bl->instrs[j].a != in->dst;
+                 j++)
+                g->defer_of[g->first[b] + j] = idx;
+        }
+    }
+
     /* live intervals */
     bool *param_live = xcalloc((size_t)(f->nparams + 1), sizeof(bool));
     if (g->nlayout > 0) {
@@ -1621,9 +1657,10 @@ static void gen_func(const IrModule *m, const IrFunc *f, Buf *out) {
             tmp.len = 0;
             ir_print_instr(m, f, in, &tmp);
             buf_byte(&tmp, 0);
-            const char *note = g.fused[idx] ? "    (fused into the branch)" : g.skip[idx] ? "    (tail call)" : "";
+            const char *note = g.fused[idx] ? "    (fused into the branch)" : g.skip[idx] ? "    (tail call)"
+                             : g.defer_of[idx] >= 0 ? "    (on the add's slow path)" : "";
             E(&g, "    # %s%s", (const char *)tmp.data, note);
-            if (g.fused[idx] || g.skip[idx]) continue;
+            if (g.fused[idx] || g.skip[idx] || g.defer_of[idx] >= 0) continue;
             emit_instr(&g, b, idx, in);
         }
     }
@@ -1652,8 +1689,10 @@ static void gen_func(const IrModule *m, const IrFunc *f, Buf *out) {
     Lines all = {0};
     for (int i = 0; i < g.body.n; i++) lines_push(&all, g.body.v[i]);
     for (int i = 0; i < g.stubs.n; i++) lines_push(&all, g.stubs.v[i]);
+    for (int i = 0; i < g.late.n; i++) lines_push(&all, g.late.v[i]);
     free(g.body.v);
     free(g.stubs.v);
+    free(g.late.v);
     peephole(&all);
 
     int nregs = 0;
@@ -1686,6 +1725,7 @@ static void gen_func(const IrModule *m, const IrFunc *f, Buf *out) {
     free(g.fuse_br);
     free(g.tail);
     free(g.skip);
+    free(g.defer_of);
     free(g.loc);
     free(g.start);
     free(g.end);

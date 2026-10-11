@@ -248,6 +248,9 @@ int main(int argc, char **argv) {
         if (!lower_program(&prog, &ir)) goto done;
         have_ir = true;
         ir.mm = IR_MM_MANUAL;
+        /* free(x) followed by a use of x on every path is a compile error
+         * (all modes); like every compile error, before any file is written */
+        if (!mem_check_frees(&ir, input)) goto done;
     }
     if (mm >= 0) ir.mm = (IrMemMode)mm;
     ir_print_module(&ir, &ir_buf);
@@ -259,8 +262,7 @@ int main(int argc, char **argv) {
     /* 3. verify (always, including IR we produced ourselves) */
     /* (line numbers refer to INPUT: .lir lines, or .luma lines for lowered IR) */
     if (!ir_verify(&ir, input)) goto done;
-    /* 3a. free(x) followed by a use of x on every path is a compile error (all modes) */
-    if (!mem_check_frees(&ir, input)) goto done;
+    if (from_ir && !mem_check_frees(&ir, input)) goto done; /* (lowered IR was checked above) */
 
     /* 3b. optimize (-O2): the result is written to OUT.opt.lir and must verify */
     if (opt_level >= 2) {

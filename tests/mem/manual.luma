@@ -1,0 +1,55 @@
+// A program written for --mm=manual: everything it stores somewhere, it
+// frees. Under --mm=rc the free() calls do nothing and the same objects are
+// reclaimed by reference counting; either way nothing leaks.
+struct Node { value: int, label: str, next: Node? }
+struct Point { x: int, y: int }
+
+impl Point {
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+}
+
+fun cat(a, b) { return a + b; }
+
+fun build(n: int): Node? {
+  var list: Node? = nil;
+  for (var i = 0; i < n; i = i + 1) list = Node { value: i, label: cat("n", "#"), next: list };
+  return list;
+}
+
+fun destroy(list: Node?) {
+  while (list != nil) {
+    var next = list.next;
+    free(list);            // also releases the node's label string
+    list = next;
+  }
+}
+
+// a local the compiler can prove never escapes: freed automatically
+fun dist2(a: int, b: int): int {
+  var p = Point { x: a, y: b };
+  return p.len2();
+}
+
+var l = build(1000);
+var sum = 0;
+var n = l;
+while (n != nil) { sum = sum + n.value; n = n.next; }
+destroy(l);
+l = nil;
+n = nil;
+print(sum);
+
+var total = 0;
+for (var i = 0; i < 100; i = i + 1) total = total + dist2(i, 2);
+print(total);
+
+var maybe: Point? = nil;
+free(maybe);               // free(nil) does nothing
+var p = Point { x: 3, y: 4 };
+if (p.len2() > 10) {
+  free(p);                 // freed on one path...
+  p = nil;
+} else {
+  print("small");
+}
+free(p);                   // ...and free(nil) on the other is fine

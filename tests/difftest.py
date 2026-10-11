@@ -495,7 +495,7 @@ class Gen:
                 S, f, a = r.choice(gets)
                 obj = self.expr(S, depth - 1, exclude)
                 if r.random() < 0.15:   # an assignment to the field, used as a value
-                    return ("set", obj, f, self.field_value(S, f, t, a, depth - 1, exclude))
+                    return ("set", obj, f, self.slot_expr(t, a, depth - 1, exclude))   # (its value is the expression's)
                 return ("get", obj, f)
         cands = [f for f in self.funs[:self.callable] if f[2] == t]
         if cands and r.random() < 0.15:

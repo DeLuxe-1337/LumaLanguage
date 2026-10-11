@@ -1,0 +1,2 @@
+luma: memcheck: --mm=rc, 112 allocated, 107 freed, 0 leaked, 5 reachable from globals
+luma: memcheck: reachable from globals: 1 Box, 4 str

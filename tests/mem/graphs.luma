@@ -1,0 +1,37 @@
+// Object graphs under reference counting: a list whose head moves, field
+// overwrites (typed, so the compiler writes the field directly and releases
+// the old value itself), sharing, and cycles (which reference counting
+// cannot reclaim: memcheck lists them as leaked).
+struct Node { value: int, next: Node? }
+struct Pair { left, right }
+
+fun push(list: Node?, v: int): Node { return Node { value: v, next: list }; }
+
+var list: Node? = nil;
+for (var i = 0; i < 1000; i = i + 1) list = push(list, i);
+for (var i = 0; i < 500; i = i + 1) list = list.next;      // drops 500 nodes
+var sum = 0;
+var n = list;
+while (n != nil) { sum = sum + n.value; n = n.next; }
+print(sum);
+
+var q: Pair = Pair { left: nil, right: nil };
+for (var i = 0; i < 10; i = i + 1) q.left = Pair { left: i, right: nil };   // 9 overwritten
+var shared = Node { value: 7, next: nil };
+q.right = Pair { left: shared, right: shared };   // one node, two references
+shared = nil;
+print(q.left.left, q.right.left.value);
+
+var c = Pair { left: nil, right: nil };
+c.right = c;           // a cycle of one
+c = nil;
+
+fun ring() {           // a cycle of two that only refers to itself
+  var a = Pair { left: nil, right: nil };
+  var b = Pair { left: a, right: nil };
+  a.right = b;
+}
+ring();
+
+list = nil;
+n = nil;

@@ -6,7 +6,9 @@
  *      types prove to be exactly struct S becomes static: `getfield %o, .x`
  *      -> `getfield %o, S.x` (when S has a field x), `setfield %o, .x, %v`
  *      likewise when %v also fits the field's type, and `callm %o, .m(...)`
- *      -> `call @<S's entry for m>(%o, ...)` when the arity matches. If the
+ *      -> `call @<S's entry for m>(%o, ...)` when the arity matches (the
+ *      typed method itself, not its checking .dyn wrapper, when the
+ *      arguments are proven to fit its parameters). If the
  *      field or method does not exist, the dynamic form stays, so the
  *      runtime error is unchanged.
  *      A `check` that the (now more precise) types prove becomes a `mov`.
@@ -14,8 +16,9 @@
  *      after an earlier read or write of the same %o S.f becomes a `mov`
  *      of the known value, unless something in between may have changed
  *      it: a write to field S.f of any object (it may be the same one), a
- *      dynamic write, a call to a Luma function or method, or a new
- *      assignment to %o or to the known value's vreg. */
+ *      dynamic write, a call to a Luma function or method, a free(), or a
+ *      new assignment to %o or to the known value's vreg. */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -47,6 +50,23 @@ static bool devirtualize(const IrModule *m, IrInstr *in, const IrTy *st) {
     if (in->op == IR_CALLM) {
         int k = ir_struct_method(sd, in->name);
         if (k < 0 || m->globals[sd->mglobals[k]].arity != in->nargs + 1) return false;
+        int target = sd->mglobals[k];
+        /* The table entry of a method with typed parameters is its checking
+         * wrapper @m.S.f.dyn; call @m.S.f itself when the arguments' types
+         * already satisfy its parameters. */
+        const char *wn = m->globals[target].name;
+        size_t wl = strlen(wn);
+        if (wl > 4 && strcmp(wn + wl - 4, ".dyn") == 0) {
+            char real[512];
+            snprintf(real, sizeof real, "%.*s", (int)(wl - 4), wn);
+            int rg = ir_find_global(m, real);
+            bool fits = rg >= 0 && m->globals[rg].kind == IRG_FUNC && m->globals[rg].arity == in->nargs + 1;
+            for (int i = 0; fits && i <= in->nargs; i++) {
+                IrTy at = st[i == 0 ? in->a : in->args[i - 1]];
+                fits = at != 0 && ir_ty_sub(at, ir_param_ty(&m->globals[rg], i));
+            }
+            if (fits) target = rg;
+        }
         int *args = xmalloc((size_t)(in->nargs + 1) * sizeof *args);
         args[0] = in->a;
         for (int i = 0; i < in->nargs; i++) args[i + 1] = in->args[i];
@@ -56,7 +76,7 @@ static bool devirtualize(const IrModule *m, IrInstr *in, const IrTy *st) {
         in->args = args;
         in->nargs++;
         in->op = IR_CALL;
-        in->global = sd->mglobals[k];
+        in->global = target;
         in->a = IR_NONE;
         return true;
     }
@@ -110,9 +130,13 @@ bool opt_objects(IrModule *m, IrFunc *f) {
                 else forget_field(known, &nknown, in->sid, in->field);
                 break;
             case IR_CALLM: nknown = 0; break;
-            case IR_CALL:
-                if (m->globals[in->global].kind == IRG_FUNC) nknown = 0; /* Luma code may write fields */
+            case IR_CALL: {
+                const IrGlobal *g = &m->globals[in->global];
+                /* Luma code may write fields; free() ends the instance (a later
+                 * read must reach memory, where memcheck can see the bug) */
+                if (g->kind == IRG_FUNC || (g->kind == IRG_EXTERN && strcmp(g->name, "luma_free") == 0)) nknown = 0;
                 break;
+            }
             default: break;
             }
             if (in->dst >= 0) forget_vreg(known, &nknown, in->dst);

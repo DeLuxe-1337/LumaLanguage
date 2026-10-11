@@ -1,0 +1,8 @@
+// The second free() goes through an untyped alias, so the compiler cannot see it.
+struct Point { x: int, y: int }
+fun dyn(x) { return x; }
+var p = Point { x: 1, y: 2 };
+var q = dyn(p);
+free(p);
+print("freed once");
+free(q);

@@ -108,6 +108,7 @@ typedef struct {
     int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
     Fn *f;
     bool failed;
+    int col; /* column of the expression being lowered (IrInstr.col, for diagnostics after lowering) */
 } L;
 
 static void ty_name(L *l, Ty t, char *buf, size_t n) { ir_ty_describe(l->m, t, " or ", buf, n); }
@@ -201,6 +202,7 @@ static void set_block(L *l, int b) {
 static IrInstr *emit(L *l, IrOp op, int line) {
     IrInstr *in = ir_emit(fn(l), l->f->cur, op);
     in->line = line;
+    in->col = l->col;
     return in;
 }
 
@@ -874,7 +876,18 @@ static Val assign_to(L *l, const Expr *e, Name n, int hint) {
  * that is free (no extra mov). The hint is only ever written by the final
  * instruction of the expression, after all operands are read, so `x = x + 1`
  * can safely lower to `%x = add %x, %1`. DISCARD means the value is unused. */
+static Val lower_expr_at(L *l, const Expr *e, int hint);
+
+/* Instructions emitted for e (after its operands) carry e's column. */
 static Val lower_expr(L *l, const Expr *e, int hint) {
+    int saved = l->col;
+    l->col = e->col;
+    Val v = lower_expr_at(l, e, hint);
+    l->col = saved;
+    return v;
+}
+
+static Val lower_expr_at(L *l, const Expr *e, int hint) {
     if (l->failed) return NO_VAL;
     int d = hint >= 0 ? hint : -1;
     IrInstr *in;

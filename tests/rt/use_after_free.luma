@@ -1,0 +1,7 @@
+// Reading a field of a freed instance through an untyped alias.
+struct Point { x: int, y: int }
+fun dyn(x) { return x; }
+var p = Point { x: 1, y: 2 };
+var q = dyn(p);
+free(p);
+print(q.x);

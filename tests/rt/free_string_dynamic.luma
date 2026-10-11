@@ -1,0 +1,2 @@
+fun dyn(x) { return x; }
+free(dyn("a string"));

@@ -1,0 +1,4 @@
+global!! globalglobal
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Box { s: "box++", any: "ab" }
+newvalue

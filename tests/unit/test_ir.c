@@ -1,9 +1,10 @@
 /* Unit tests for the LIR text form (parse/print round trip), the parser's
- * error handling, and the verifier. */
+ * error handling, the verifier, and the memory pass (mem.c). */
 #include <stdlib.h>
 
 #include "check.h"
 #include "ir.h"
+#include "mem.h"
 
 static bool parse_str(const char *src, IrModule *m) { return ir_parse("t.lir", src, strlen(src), m); }
 
@@ -314,11 +315,142 @@ static void test_builder_verifier(void) {
     ir_module_free(&m);
 }
 
+/* ---- memory pass (mem.c) ---- */
+
+/* Parses src, runs mem_lower, verifies, and returns the printed body of
+ * function @fname (from its "fn" line to "}"), or NULL. Caller frees. */
+static char *mem_body(const char *src, const char *fname) {
+    IrModule m;
+    if (!parse_str(src, &m)) return NULL;
+    char *res = NULL;
+    if (ir_verify(&m, "t.lir")) {
+        mem_lower(&m);
+        if (ir_verify(&m, "t.lir")) {
+            Buf b = {0};
+            ir_print_module(&m, &b);
+            buf_byte(&b, 0);
+            char head[128];
+            snprintf(head, sizeof head, "fn @%s(", fname);
+            char *start = strstr((char *)b.data, head);
+            char *end = start ? strstr(start, "\n}\n") : NULL;
+            if (end) {
+                size_t n = (size_t)(end - start) + 3;
+                res = malloc(n + 1);
+                memcpy(res, start, n);
+                res[n] = '\0';
+            }
+            buf_free(&b);
+        }
+    }
+    ir_module_free(&m);
+    return res;
+}
+
+static void expect_mem(const char *src, const char *fname, const char *want) {
+    char *got = mem_body(src, fname);
+    check_count++;
+    if (!got || strcmp(got, want) != 0) {
+        check_failures++;
+        printf("FAIL: memory pass on @%s\n--- want\n%s--- got\n%s\n", fname, want, got ? got : "(error)");
+    }
+    free(got);
+}
+
+static void test_memory(void) {
+    /* the memory line round-trips; none is the default and is not printed */
+    expect_roundtrip("module \"m\"\nmemory rc\n\nfn @luma_main() {\nentry:\n  %n = const nil\n  ret %n\n}\n");
+    expect_roundtrip("module \"m\"\nmemory manual\n\nfn @luma_main() {\nentry:\n  %n = const nil\n  ret %n\n}\n");
+    IrModule m;
+    CHECK(!parse_str("module \"m\"\nmemory gc\n", &m));
+
+    const char *HEAD = "module \"m\"\nmemory rc\n\nextern fn @luma_write(1)\nglobal @var.x\n\n";
+    char src[2048];
+
+    /* parameters are borrowed: no operations for them */
+    snprintf(src, sizeof src, "%sfn @f(%%s) {\nentry:\n  call @luma_write(%%s)\n  %%r = add %%s, %%s\n  ret %%r\n}\n", HEAD);
+    expect_mem(src, "f", "fn @f(%s) {\nentry:\n  call @luma_write(%s)\n  %r = add %s, %s\n  ret %r\n}\n");
+
+    /* an owned temporary dies at a borrowing use: released right after it */
+    snprintf(src, sizeof src, "%sfn @g(%%a) {\nentry:\n  %%t = add %%a, %%a\n  call @luma_write(%%t)\n  %%n = const nil\n  ret %%n\n}\n", HEAD);
+    expect_mem(src, "g", "fn @g(%a) {\nentry:\n  %t = add %a, %a\n  call @luma_write(%t)\n  release %t\n  %n = const nil\n  ret %n\n}\n");
+
+    /* consumed while still live (store): retained first; the last use (ret) moves it */
+    snprintf(src, sizeof src, "%sfn @h(%%a) {\nentry:\n  %%t = add %%a, %%a\n  store @var.x, %%t\n  call @luma_write(%%t)\n  ret %%t\n}\n", HEAD);
+    expect_mem(src, "h", "fn @h(%a) {\nentry:\n  %t = add %a, %a\n  retain %t\n  store @var.x, %t\n  call @luma_write(%t)\n  ret %t\n}\n");
+
+    /* returning a borrowed parameter retains it; load's result is retained */
+    snprintf(src, sizeof src, "%sfn @i(%%a) {\nentry:\n  %%g = load @var.x\n  call @luma_write(%%g)\n  ret %%a\n}\n", HEAD);
+    expect_mem(src, "i", "fn @i(%a) {\nentry:\n  %g = load @var.x\n  retain %g\n  call @luma_write(%g)\n  release %g\n  retain %a\n  ret %a\n}\n");
+
+    /* dying on a critical edge: the edge gets its own block */
+    snprintf(src, sizeof src, "%sfn @k(%%a, %%c) {\nentry:\n  %%t = add %%a, %%a\n  br %%c, use, join\nuse:\n"
+             "  call @luma_write(%%t)\n  jmp join\njoin:\n  %%n = const nil\n  ret %%n\n}\n", HEAD);
+    expect_mem(src, "k", "fn @k(%a, %c) {\nentry:\n  %t = add %a, %a\n  br %c, use, rel.1\nuse:\n  call @luma_write(%t)\n"
+               "  release %t\n  jmp join\njoin:\n  %n = const nil\n  ret %n\nrel.1:\n  release %t\n  jmp join\n}\n");
+
+    /* `%s = add %s, ...` with the old value dying: kept in a temporary */
+    snprintf(src, sizeof src, "%sfn @l(%%a) {\nentry:\n  %%s = add %%a, %%a\n  %%s = add %%s, %%a\n  ret %%s\n}\n", HEAD);
+    expect_mem(src, "l", "fn @l(%a) {\nentry:\n  %s = add %a, %a\n  %s.2 = mov %s\n  %s = add %s.2, %a\n  release %s.2\n  ret %s\n}\n");
+
+    /* a reassigned parameter is retained on entry and owned from then on */
+    snprintf(src, sizeof src, "%sfn @p(%%a) {\nentry:\n  call @luma_write(%%a)\n  %%a = add %%a, %%a\n  ret %%a\n}\n", HEAD);
+    expect_mem(src, "p", "fn @p(%a) {\nentry:\n  retain %a\n  call @luma_write(%a)\n  %a.1 = mov %a\n  %a = add %a.1, %a.1\n"
+               "  release %a.1\n  ret %a\n}\n");
+
+    /* ints, booleans and literals need nothing */
+    snprintf(src, sizeof src, "%sdata @s0 = str \"lit\"\nfn @q(%%n: int) {\nentry:\n  %%s = const @s0\n  call @luma_write(%%s)\n"
+             "  %%m = add %%n, %%n\n  call @luma_write(%%m)\n  ret %%s\n}\n", HEAD);
+    expect_mem(src, "q", "fn @q(%n: int) {\nentry:\n  %s = const @s0\n  call @luma_write(%s)\n  %m = add %n, %n\n"
+               "  call @luma_write(%m)\n  ret %s\n}\n");
+
+    /* escape analysis (manual): only the instance that stays local is counted */
+    {
+        const char *esc = "module \"m\"\nmemory manual\n\nstruct P {x}\n\nextern fn @luma_free(1)\nglobal @var.g\n\n"
+                          "fn @keep(%o) {\nentry:\n  store @var.g, %o\n  ret %o\n}\n\n"
+                          "fn @look(%o: P) {\nentry:\n  %x = getfield %o, P.x\n  ret %x\n}\n\n"
+                          "fn @luma_main() {\nentry:\n  %n = const nil\n  %a = new P(%n)\n  %b = new P(%n)\n"
+                          "  call @luma_free(%b)\n  %c = new P(%n)\n  %r = call @keep(%c)\n  %d = new P(%n)\n"
+                          "  %e = call @look(%d)\n  ret %n\n}\n";
+        IrModule em;
+        CHECK(parse_str(esc, &em) && ir_verify(&em, "t.lir"));
+        mem_lower(&em);
+        CHECK(ir_verify(&em, "t.lir"));
+        const IrFunc *mf = &em.funcs[em.globals[ir_find_global(&em, "luma_main")].func];
+        int counted[4] = {-1, -1, -1, -1}, k = 0;
+        for (int i = 0; i < mf->blocks[0].n && k < 4; i++)
+            if (mf->blocks[0].instrs[i].op == IR_NEW) counted[k++] = (int)mf->blocks[0].instrs[i].imm;
+        CHECK_EQ_INT(counted[0], 1); /* a: never leaves luma_main */
+        CHECK_EQ_INT(counted[1], 0); /* b: passed to free() */
+        CHECK_EQ_INT(counted[2], 0); /* c: stored into a global by @keep */
+        CHECK_EQ_INT(counted[3], 1); /* d: @look only reads it */
+        ir_module_free(&em);
+    }
+
+    /* compile-time free() checks */
+    {
+        const char *twice = "module \"m\"\n\nextern fn @luma_free(1)\n\nfn @luma_main() {\nentry:\n  %p = const nil\n"
+                            "  call @luma_free(%p)\n  call @luma_free(%p)\n  ret %p\n}\n";
+        const char *maybe = "module \"m\"\n\nextern fn @luma_free(1)\n\nfn @f(%p, %c) {\nentry:\n  br %c, a, b\na:\n"
+                            "  call @luma_free(%p)\n  jmp b\nb:\n  ret %p\n}\n";
+        const char *again = "module \"m\"\n\nextern fn @luma_free(1)\n\nfn @f(%p) {\nentry:\n  call @luma_free(%p)\n"
+                            "  %p = const nil\n  ret %p\n}\n";
+        IrModule fm;
+        printf("[expected diagnostic follows]\n");
+        CHECK(parse_str(twice, &fm) && !mem_check_frees(&fm, "t.lir"));
+        ir_module_free(&fm);
+        CHECK(parse_str(maybe, &fm) && mem_check_frees(&fm, "t.lir")); /* freed on one path only: allowed */
+        ir_module_free(&fm);
+        CHECK(parse_str(again, &fm) && mem_check_frees(&fm, "t.lir")); /* reassigned after free: fine */
+        ir_module_free(&fm);
+    }
+}
+
 int main(void) {
     test_roundtrip();
     test_parse_details();
     test_parse_errors();
     test_verifier();
     test_builder_verifier();
+    test_memory();
     return check_report("test_ir");
 }

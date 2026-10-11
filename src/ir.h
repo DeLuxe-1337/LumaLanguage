@@ -99,6 +99,7 @@ typedef struct {
     char *name;     /* dynamic IR_GETFIELD / IR_SETFIELD, IR_CALLM: field or method name (owned) */
     int target[2];  /* IR_JMP / IR_BR: block indices */
     int line;       /* source line for diagnostics (0 if unknown) */
+    int col;        /* source column of the expression it came from (0 if unknown; not in the text form) */
 } IrInstr;
 
 typedef struct {

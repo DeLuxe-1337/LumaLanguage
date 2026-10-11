@@ -1,0 +1,15 @@
+// Releasing the head of a million-node list frees the whole chain. The
+// runtime destroys objects iteratively, so the depth of the structure never
+// reaches the C stack.
+struct Node { value: int, next: Node? }
+
+fun build(n: int): Node? {
+  var list: Node? = nil;
+  for (var i = 0; i < n; i = i + 1) list = Node { value: i, next: list };
+  return list;
+}
+
+var list = build(1000000);
+print(list.value);
+list = nil;
+print("released");

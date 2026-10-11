@@ -262,6 +262,66 @@ for src in tests/rt/*.luma; do
 done
 done
 
+# ---------------------------------------------------------- memory management
+# tests/mem/NAME.luma runs with LUMA_MEMCHECK=1 under every mode that has an
+# expected report NAME.MODE.mem (stderr: the memcheck summary, or a runtime
+# error, then exit 1), at every level; stdout must equal NAME.MODE.out if it
+# exists, else NAME.out. The counts do not depend on the level.
+printf '== memory management ==\n'
+for src in tests/mem/*.luma; do
+    name=$(basename "$src" .luma)
+    for mm in manual rc none; do
+        [ -f "tests/mem/$name.$mm.mem" ] || continue
+        want_out="tests/mem/$name.out"
+        [ -f "tests/mem/$name.$mm.out" ] && want_out="tests/mem/$name.$mm.out"
+        want_st=0
+        grep -q "runtime error" "tests/mem/$name.$mm.mem" && want_st=1
+        for lvl in 0 1 2; do
+            exe="$OUT/mem_${name}_${mm}_$lvl"
+            if ! "$LUMA" -O$lvl --mm=$mm "$src" -o "$exe" >"$OUT/last.log" 2>&1; then bad "mem/$name --mm=$mm -O$lvl compiles"; sed 's/^/      /' "$OUT/last.log"; continue; fi
+            LUMA_MEMCHECK=1 "$exe" >"$exe.stdout" 2>"$exe.stderr"
+            st=$?
+            if [ $st -eq $want_st ] && cmp -s "$exe.stdout" "$want_out" && cmp -s "$exe.stderr" "tests/mem/$name.$mm.mem"; then
+                ok "mem/$name --mm=$mm -O$lvl: $(head -1 "$exe.stderr" | sed 's/^luma: //')"
+            else
+                bad "mem/$name --mm=$mm -O$lvl (exit $st)"; diff "$want_out" "$exe.stdout" | head -5 | sed 's/^/      /'
+                diff "tests/mem/$name.$mm.mem" "$exe.stderr" | sed 's/^/      /'
+            fi
+        done
+    done
+done
+
+# Every positive program under the other memory modes, with memcheck on (a
+# use of freed memory would be a runtime error): same output, exit 0.
+for mm in rc none; do
+    for src in tests/pos/*.luma; do
+        name=$(basename "$src" .luma)
+        lvl=2
+        [ "$mm" = none ] && lvl=0
+        [ "$lvl" = 0 ] && [ "$name" = tail_calls ] && continue
+        exe="$OUT/posmm_${mm}_$name"
+        if ! "$LUMA" -O$lvl --mm=$mm "$src" -o "$exe" >"$OUT/last.log" 2>&1; then bad "pos/$name --mm=$mm compiles"; sed 's/^/      /' "$OUT/last.log"; continue; fi
+        LUMA_MEMCHECK=1 "$exe" >"$exe.actual" 2>"$exe.stderr"
+        st=$?
+        grep -v '^luma: memcheck:' "$exe.stderr" >"$exe.err2"
+        if [ $st -eq 0 ] && cmp -s "$exe.actual" "tests/pos/$name.out" && [ ! -s "$exe.err2" ]; then ok "pos/$name --mm=$mm -O$lvl (memcheck)"
+        else bad "pos/$name --mm=$mm -O$lvl (exit $st)"; diff "tests/pos/$name.out" "$exe.actual" | head -10 | sed 's/^/      /'; cat "$exe.err2"; fi
+    done
+done
+
+# The memory pass's output and properties.
+printf 'fun cat(a, b) { return a + b; }\nprint(cat("a", "b"));\n' > "$OUT/temps.luma"
+check "--mm=manual writes OUT.mem.lir; the print temporary is released" sh -c \
+    "$LUMA $OUT/temps.luma -o $OUT/temps && grep -q '^memory manual' $OUT/temps.lir && grep -q 'release' $OUT/temps.mem.lir"
+check "--mm=none: no OUT.mem.lir, no reference counting" sh -c \
+    "rm -f $OUT/tn.mem.lir && $LUMA --mm=none $OUT/temps.luma -o $OUT/tn && [ ! -e $OUT/tn.mem.lir ] && ! grep -q 'luma_r[ce]' $OUT/tn.s"
+check "typed integer code gets no retain/release (fib)" sh -c \
+    "$LUMA --mm=rc bench/fib_typed.luma -o $OUT/fibrc && ! awk '/^fn @fn.fib/,/^}/' $OUT/fibrc.mem.lir | grep -q 'retain\|release'"
+check "--dump-mem-ir prints the memory-lowered IR" sh -c "$LUMA --mm=rc $OUT/temps.luma -S -o $OUT/t2 --dump-mem-ir | grep -q '^memory rc'"
+check "retain/release cannot be written in LIR" sh -c \
+    "printf 'module \"m\"\nmemory rc\nfn @luma_main() {\ne:\n  %%x = const nil\n  retain %%x\n  ret %%x\n}\n' > $OUT/rr.lir && ! $LUMA $OUT/rr.lir -o $OUT/rr 2>$OUT/e && grep -q 'inserted by the compiler' $OUT/e"
+check "unknown --mm mode is reported" sh -c "! $LUMA --mm=gc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'unknown memory mode' $OUT/e"
+
 # ---------------------------------------------------------- C FFI
 printf '== C FFI (extern fun) ==\n'
 FFILIB="$OUT/ffilib"

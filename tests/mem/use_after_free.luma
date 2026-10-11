@@ -1,0 +1,15 @@
+// A bug memcheck catches: q is a typed alias of p, so q.label is read straight
+// from memory (no runtime check). Under LUMA_MEMCHECK=1 freed memory is never
+// reused and the fields of a freed instance read as a poison value, which
+// the next runtime operation reports. (Under --mm=rc and --mm=none, free()
+// does not reclaim anything, so the program runs normally.)
+struct Tag { label: str, n: int }
+fun alias(t: Tag): Tag { return t; }
+fun cat(a, b) { return a + b; }
+
+var p = Tag { label: cat("hel", "lo"), n: 1 };
+var q: Tag = alias(p);
+print(q.label);
+free(p);
+print("freed");
+print(q.label);

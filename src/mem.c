@@ -74,11 +74,14 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
         const char *name = var_name(f, v, nb, sizeof nb);
         if (!name) continue;
         if (report) {
+            char at[64];
+            if (in->col > 0) snprintf(at, sizeof at, "%d:%d", in->line, in->col);
+            else snprintf(at, sizeof at, "%d", in->line);
             if (freeing)
-                fprintf(stderr, "%s:%d: error: '%s' is freed twice (free(%s) on line %d already freed it)\n", path,
-                        in->line, name, name, state[v]);
+                fprintf(stderr, "%s:%s: error: '%s' is freed twice (free(%s) on line %d already freed it)\n", path, at,
+                        name, name, state[v]);
             else
-                fprintf(stderr, "%s:%d: error: '%s' is used after free(%s) on line %d\n", path, in->line, name, name,
+                fprintf(stderr, "%s:%s: error: '%s' is used after free(%s) on line %d\n", path, at, name, name,
                         state[v]);
         }
         ok = false;
@@ -465,6 +468,46 @@ static void lower_func(Mem *mm, IrFunc *f) {
             int d = f->blocks[b].instrs[k].dst;
             if (d >= 0 && d < f->nparams) borrowed[d] = false;
         }
+    /* ... and so do copies of borrowed values (mov / check) that are only
+     * ever defined that way and never handed on (no consuming use): they
+     * live no longer than the call that lent the original */
+    {
+        bool *cand = xcalloc((size_t)nv0 + 1, sizeof *cand);
+        for (int v = f->nparams; v < nv0; v++) cand[v] = true;
+        for (int b = 0; b < nb; b++)
+            for (int k = 0; k < f->blocks[b].n; k++) {
+                const IrInstr *in = &f->blocks[b].instrs[k];
+                UseCount u[2];
+                if (in->dst >= f->nparams && in->op != IR_MOV && in->op != IR_CHECK) cand[in->dst] = false;
+                if (in->op == IR_STORE || in->op == IR_RET || in->op == IR_SETFIELD || in->op == IR_NEW) {
+                    int n = in->op == IR_NEW ? 0 : collect_uses(in, u);
+                    for (int i = 0; i < n; i++)
+                        if (u[i].consume) cand[u[i].v] = false;
+                    for (int i = 0; in->op == IR_NEW && i < in->nargs; i++) cand[in->args[i]] = false;
+                }
+            }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (int b = 0; b < nb; b++)
+                for (int k = 0; k < f->blocks[b].n; k++) {
+                    const IrInstr *in = &f->blocks[b].instrs[k];
+                    bool src_borrowed = in->a >= 0 && (borrowed[in->a] || (in->a >= f->nparams && cand[in->a]));
+                    if ((in->op == IR_MOV || in->op == IR_CHECK) && in->dst >= f->nparams && cand[in->dst] && !src_borrowed) {
+                        cand[in->dst] = false; /* a copy of an owned value owns its own reference */
+                        changed = true;
+                    }
+                    /* copying a candidate into an owned vreg consumes it: it must own */
+                    if ((in->op == IR_MOV || in->op == IR_CHECK) && in->a >= f->nparams && cand[in->a] &&
+                        in->dst >= 0 && !cand[in->dst] && !borrowed[in->dst]) {
+                        cand[in->a] = false;
+                        changed = true;
+                    }
+                }
+        }
+        for (int v = f->nparams; v < nv0; v++)
+            if (cand[v]) borrowed[v] = true;
+        free(cand);
+    }
 
     Cfg cfg;
     cfg_build(f, &cfg);
@@ -531,12 +574,18 @@ static void lower_func(Mem *mm, IrFunc *f) {
                 uc = xrealloc(uc, (size_t)ucap * sizeof *uc);
             }
             int nu = collect_uses(&in, uc);
+            bool copy_borrowed = (in.op == IR_MOV || in.op == IR_CHECK) && d >= 0 && d < nv0 && borrowed[d];
+            if (copy_borrowed) /* a borrowed copy takes no reference of its own */
+                for (int i = 0; i < nu; i++) {
+                    uc[i].borrow += uc[i].consume;
+                    uc[i].consume = 0;
+                }
             if (dropped_result_heap(mm, &in)) { /* give the result a vreg, and release it */
                 in.dst = opt_fresh_vreg(f, "drop");
                 ilist_push(&post, rc_instr(IR_RELEASE, in.dst, line));
             }
             /* the result */
-            if (d >= 0 && managed[d]) {
+            if (d >= 0 && managed[d] && !borrowed[d]) {
                 if (result_borrowed(in.op)) {
                     if (bit_get(live, d)) ilist_push(&post, rc_instr(IR_RETAIN, d, line));
                 } else if (!bit_get(live, d)) {
