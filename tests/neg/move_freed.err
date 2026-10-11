@@ -1,0 +1,1 @@
+'q' is freed after it was moved into B::new() on line 6

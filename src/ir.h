@@ -136,6 +136,7 @@ typedef struct {
     CType cret;       /* IRG_CEXTERN: return C type */
     IrTy *ptys;       /* IRG_FUNC: declared parameter types (arity entries, owned; NULL = all any) */
     IrTy ty;          /* IRG_FUNC: declared result type; IRG_VAR: declared variable type */
+    uint64_t moves;   /* IRG_FUNC: bit i set when parameter i is `move` (v0.8; checked by mem_check_frees) */
     int line;
 } IrGlobal;
 

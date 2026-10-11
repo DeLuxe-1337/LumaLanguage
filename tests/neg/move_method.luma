@@ -1,0 +1,8 @@
+struct P { x: int }
+struct B { p: P? }
+impl B { fun put(self, move p: P) { self.p = p; } }
+fun f(b: B) {
+  var q = P { x: 1 };
+  b.put(q);
+  b.put(q);
+}

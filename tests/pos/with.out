@@ -1,0 +1,11 @@
+0 a
+2 b
+4 c
+0 d
+0 +a +b +c -c -b -a +d -d 
+2 0 +outer +inner -inner -outer 
+-1 0 +outer +inner -inner after -outer 
+5
+0 +i -i 
+3
+0 dyn +dyn -dyn 

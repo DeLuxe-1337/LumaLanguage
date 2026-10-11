@@ -140,6 +140,15 @@ static void test_parse(void) {
     CHECK(!parse_str("var b: Box<int>= 1;", &p));          /* '>=' is one token: needs a space */
     CHECK(!parse_str("struct P<> { x }", &p));
     CHECK(!parse_str("var b: Box<int = 1;", &p));
+    /* move parameters ("move" is a keyword only before a parameter name) and with */
+    CHECK(parse_str("fun f(move a, b, move: int) { move(1); } with x { y; } with T { a: 1 } { } var v = with T { } { };", &p));
+    CHECK(p.stmts[0]->param_move[0] && !p.stmts[0]->param_move[1] && !p.stmts[0]->param_move[2] &&
+          strcmp(p.stmts[0]->params[2], "move") == 0);
+    CHECK(p.stmts[1]->expr->kind == EXPR_WITH && p.stmts[1]->expr->left->kind == EXPR_VAR); /* x, then a block */
+    CHECK(p.stmts[2]->expr->kind == EXPR_WITH && p.stmts[2]->expr->left->kind == EXPR_STRUCT);
+    CHECK(p.stmts[3]->kind == STMT_VAR && p.stmts[3]->expr->kind == EXPR_WITH && p.stmts[3]->expr->left->kind == EXPR_STRUCT);
+    program_free(&p);
+    CHECK(!parse_str("with x;", &p));
     CHECK(parse_str("if (a) { b; }", &p)); /* NAME '{' is a block here, not a struct literal */
     CHECK(p.stmts[0]->kind == STMT_IF && p.stmts[0]->then_branch->kind == STMT_BLOCK);
     program_free(&p);

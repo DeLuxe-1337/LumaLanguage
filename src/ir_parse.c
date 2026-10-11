@@ -629,8 +629,13 @@ static bool parse_function(P *p) {
     char params[64][256];
     IrTy ptys[64];
     int np = 0;
+    uint64_t moves = 0;
     while (!is_punct(p, ')')) {
         if (np > 0 && !expect_punct(p, ',')) return false;
+        if (is_ident(p, "move") && np < 64) {
+            moves |= (uint64_t)1 << np;
+            next(p);
+        }
         if (p->tok.kind != T_VREG) {
             perr(p, p->tok.line, "expected parameter, found %s", tok_desc(&p->tok));
             return false;
@@ -662,6 +667,7 @@ static bool parse_function(P *p) {
     f->line = line;
     IrGlobal *g = &p->m->globals[f->global];
     g->ty = rty;
+    g->moves = moves;
     bool typed = false;
     for (int i = 0; i < np; i++) typed |= ptys[i] != TY_ANY;
     if (typed) {

@@ -110,7 +110,11 @@ typedef struct {
     int nscope, cap_scope;
     int depth;
     int ntemps, nlabels;
-    int narenas;  /* arena blocks entered at this point (left before a return) */
+    /* Blocks entered at this point, innermost last, left before a return:
+     * v = -1 for an arena block, else the subject of a `with` (left with
+     * its leave() method). */
+    struct { int v; Ty ty; } *exits;
+    int nexits, cap_exits;
     int info;     /* index into L.fns; -1 for luma_main */
     /* Temporaries that live to the end of their full expression (hold_temp) */
     int *held;
@@ -1045,6 +1049,78 @@ static Val lower_rc_call(L *l, const Expr *e, int hint) {
     return (Val){d, T_ANY};
 }
 
+static void push_exit(L *l, int v, Ty ty) {
+    Fn *f = l->f;
+    if (f->nexits == f->cap_exits) {
+        f->cap_exits = f->cap_exits ? 2 * f->cap_exits : 4;
+        f->exits = xrealloc(f->exits, (size_t)f->cap_exits * sizeof *f->exits);
+    }
+    f->exits[f->nexits].v = v;
+    f->exits[f->nexits].ty = ty;
+    f->nexits++;
+}
+
+/* subject.enter() / subject.leave() for `with` (no arguments; the result is
+ * discarded). Statically when the subject's struct is known, else a dynamic
+ * method call. */
+static bool call_hook(L *l, Val subj, const char *name, int line, int col) {
+    int si = static_struct(l, subj.ty);
+    if (si >= 0) {
+        int fi = find_impl_fn(l, si, name);
+        if (fi < 0 || !l->fns[fi].has_self || l->fns[fi].arity != 1) {
+            char sn[600];
+            ir_struct_display(l->structs[si].name, sn, sizeof sn);
+            lerr(l, line, col, "with needs a value with enter() and leave() methods: '%s' has no method %s(self)", sn, name);
+            return false;
+        }
+        call_fn(l, &l->fns[fi], &subj, NULL, DISCARD, line, col);
+        return !l->failed;
+    }
+    IrInstr *in = emit(l, IR_CALLM, line);
+    in->dst = IR_NONE;
+    in->a = subj.v;
+    in->name = xstrdup(name);
+    return true;
+}
+
+/* Leaves the blocks entered since exit index `from` (innermost first). */
+static void leave_exits(L *l, int from, int line) {
+    for (int i = l->f->nexits; i-- > from && !l->failed;) {
+        if (l->f->exits[i].v < 0)
+            emit_call(l, IR_NONE, runtime_fn(l, &l->arena_leave_fn, "luma_arena_leave", 0), NULL, 0, line);
+        else
+            call_hook(l, (Val){l->f->exits[i].v, l->f->exits[i].ty}, "leave", line, 0);
+    }
+}
+
+/* with SUBJECT { body }: subject.enter(), the body, subject.leave() on every
+ * way out (the end, or a return inside). Its value is the subject. */
+static Val lower_with(L *l, const Expr *e, int hint) {
+    Val s = lower_expr(l, e->left, -1);
+    if (s.v < 0) return NO_VAL;
+    if (!ir_ty_inter(s.ty, TY_STRUCT)) {
+        char tn[300];
+        ty_name(l, s.ty, tn, sizeof tn);
+        lerr(l, e->left->line, e->left->col, "with needs a struct instance with enter() and leave() methods, got %s", tn);
+        return NO_VAL;
+    }
+    int t = temp(l); /* the subject, held for the whole block */
+    emit_mov(l, t, s.v, e->line);
+    Val subj = {t, s.ty};
+    if (!call_hook(l, subj, "enter", e->line, e->col)) return NO_VAL;
+    push_exit(l, t, s.ty);
+    lower_stmt(l, e->body);
+    l->f->nexits--;
+    if (l->failed) return NO_VAL;
+    if (!ir_block_terminated(&fn(l)->blocks[l->f->cur]) && !call_hook(l, subj, "leave", e->line, e->col)) return NO_VAL;
+    if (hint == DISCARD) return NO_VAL;
+    if (hint >= 0) {
+        emit_mov(l, hint, t, e->line);
+        return (Val){hint, s.ty};
+    }
+    return subj;
+}
+
 /* arena { body }  /  arena name { body }: everything allocated by hand in
  * the body (and in what it calls) goes into the arena. Its value is the
  * arena (a new one: freed when its last reference goes away). */
@@ -1082,9 +1158,9 @@ static Val lower_arena(L *l, const Expr *e, int hint) {
         ty = ty_struct_of(sid);
     }
     emit_call(l, IR_NONE, runtime_fn(l, &l->arena_enter_fn, "luma_arena_enter", 1), &a, 1, e->line);
-    l->f->narenas++;
+    push_exit(l, -1, 0);
     lower_stmt(l, e->body);
-    l->f->narenas--;
+    l->f->nexits--;
     if (l->failed) return NO_VAL;
     if (!ir_block_terminated(&fn(l)->blocks[l->f->cur]))
         emit_call(l, IR_NONE, runtime_fn(l, &l->arena_leave_fn, "luma_arena_leave", 0), NULL, 0, e->line);
@@ -1647,6 +1723,8 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
         return lower_struct_literal(l, e, hint, expect);
     case EXPR_ARENA:
         return lower_arena(l, e, hint);
+    case EXPR_WITH:
+        return lower_with(l, e, hint);
     }
     return NO_VAL;
 }
@@ -1747,8 +1825,7 @@ static void lower_stmt_at(L *l, const Stmt *s) {
             snprintf(what, sizeof what, "return value of '%s'", fi->name);
             flow(l, v, fi->ret, what, s->expr ? s->expr->line : s->line, s->expr ? s->expr->col : s->col);
         }
-        for (int i = 0; i < l->f->narenas; i++) /* leave the arena blocks we are in */
-            emit_call(l, IR_NONE, runtime_fn(l, &l->arena_leave_fn, "luma_arena_leave", 0), NULL, 0, s->line);
+        leave_exits(l, 0, s->line); /* leave the arena and with blocks we are in */
         emit(l, IR_RET, s->line)->a = v.v;
         start_dead_block(l);
         return;
@@ -1899,6 +1976,7 @@ static void end_function(L *l, int line, int col) {
     free(f->order);
     free(f->is_var);
     free(f->held);
+    free(f->exits);
     memset(f, 0, sizeof *f);
 }
 
@@ -2183,6 +2261,8 @@ static void collect_impl_fns(L *l, const Stmt *s, int si, const TArg *tenv, int 
         info.ret = resolve_type(l, &f->type);
         IrGlobal *g = &l->m->globals[info.global];
         g->ty = info.ret;
+        for (size_t k = 0; k < f->nparams && k < 64; k++)
+            if (f->param_move && f->param_move[k]) g->moves |= (uint64_t)1 << k;
         bool typed = false;
         for (size_t k = 0; k < f->nparams; k++) typed |= info.ptypes[k] != T_ANY;
         if (typed) {
@@ -2452,6 +2532,8 @@ static void collect_declarations(L *l, const Program *prog) {
             /* the signature is part of the IR: callers and returns must uphold it */
             IrGlobal *g = &l->m->globals[info.global];
             g->ty = info.ret;
+            for (size_t k = 0; k < s->nparams && k < 64; k++)
+                if (s->param_move && s->param_move[k]) g->moves |= (uint64_t)1 << k;
             bool typed = false;
             for (size_t k = 0; k < s->nparams; k++) typed |= info.ptypes[k] != T_ANY;
             if (typed) {

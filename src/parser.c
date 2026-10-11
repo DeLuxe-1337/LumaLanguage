@@ -3,6 +3,7 @@
  * cannot overflow the C stack. */
 #include "parser.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@ typedef struct {
     int block_depth;   /* > 0 inside a block or function body */
     bool in_function;
     bool failed;
+    size_t with_start; /* token where the subject of the innermost `with` starts (SIZE_MAX: none) */
 } Parser;
 
 static Token *cur(Parser *p) {
@@ -143,11 +145,41 @@ static Expr *arena_expr(Parser *p) {
     return e;
 }
 
+
+/* with SUBJECT { body }. A struct literal right at the start of the subject
+ * must be followed by the body's "{" (`with Indent { by: 2 } { ... }`);
+ * otherwise `with a { ... }` is the variable a and a block. */
+static Expr *with_expr(Parser *p) {
+    Token *kw = cur(p);
+    advance(p);
+    Expr *e = new_expr(EXPR_WITH, kw);
+    size_t saved = p->with_start;
+    p->with_start = p->pos;
+    e->left = expression(p);
+    p->with_start = saved;
+    if (!e->left) {
+        expr_free(e);
+        return NULL;
+    }
+    Token *open = cur(p);
+    if (!consume(p, TOK_LEFT_BRACE, "'{' after the subject of 'with'")) {
+        expr_free(e);
+        return NULL;
+    }
+    e->body = block_body(p, open);
+    if (!e->body) {
+        expr_free(e);
+        return NULL;
+    }
+    return e;
+}
+
 static Expr *primary(Parser *p) {
     Token *t = cur(p);
     Expr *e;
     switch (t->kind) {
     case TOK_ARENA: return arena_expr(p);
+    case TOK_WITH: return with_expr(p);
     case TOK_TRUE: advance(p); return new_expr(EXPR_TRUE, t);
     case TOK_FALSE: advance(p); return new_expr(EXPR_FALSE, t);
     case TOK_NIL: advance(p); return new_expr(EXPR_NIL, t);
@@ -256,9 +288,19 @@ static bool peek_is(Parser *p, size_t k, TokenKind kind) {
  * initializer (IDENTIFIER then ":", "," or "}"). */
 static bool at_struct_literal(Parser *p) {
     if (!check(p, TOK_IDENTIFIER) || !peek_is(p, 1, TOK_LEFT_BRACE)) return false;
-    if (peek_is(p, 2, TOK_RIGHT_BRACE)) return true;
-    return peek_is(p, 2, TOK_IDENTIFIER) &&
-           (peek_is(p, 3, TOK_COLON) || peek_is(p, 3, TOK_COMMA) || peek_is(p, 3, TOK_RIGHT_BRACE));
+    if (!peek_is(p, 2, TOK_RIGHT_BRACE) &&
+        !(peek_is(p, 2, TOK_IDENTIFIER) &&
+          (peek_is(p, 3, TOK_COLON) || peek_is(p, 3, TOK_COMMA) || peek_is(p, 3, TOK_RIGHT_BRACE))))
+        return false;
+    if (p->pos != p->with_start) return true;
+    /* the subject of `with`: a literal only if its "}" is followed by "{" */
+    int depth = 0;
+    for (size_t k = 1; p->pos + k < p->toks->len; k++) {
+        TokenKind kk = p->toks->items[p->pos + k].kind;
+        if (kk == TOK_LEFT_BRACE) depth++;
+        else if (kk == TOK_RIGHT_BRACE && --depth == 0) return peek_is(p, k + 1, TOK_LEFT_BRACE);
+    }
+    return false;
 }
 
 /* NAME { field: value, short, ... } */
@@ -545,6 +587,10 @@ static bool parse_params(Parser *p, Stmt *s, bool require_types) {
                 error_at(p, cur(p), "too many parameters (maximum is 255)");
                 return false;
             }
+            /* `move p`: "move" is a keyword only here, before a parameter name */
+            bool mv = !require_types && check(p, TOK_IDENTIFIER) && cur(p)->lexeme_len == 4 &&
+                      memcmp(cur(p)->lexeme, "move", 4) == 0 && peek_is(p, 1, TOK_IDENTIFIER);
+            if (mv) advance(p);
             Token *pt = cur(p);
             if (!consume(p, TOK_IDENTIFIER, "parameter name")) return false;
             if (s->nparams == cap) {
@@ -553,8 +599,10 @@ static bool parse_params(Parser *p, Stmt *s, bool require_types) {
                 s->param_line = xrealloc(s->param_line, cap * sizeof *s->param_line);
                 s->param_col = xrealloc(s->param_col, cap * sizeof *s->param_col);
                 s->param_types = xrealloc(s->param_types, cap * sizeof *s->param_types);
+                s->param_move = xrealloc(s->param_move, cap * sizeof *s->param_move);
             }
             size_t i = s->nparams++;
+            s->param_move[i] = mv;
             s->params[i] = xstrndup(pt->lexeme, pt->lexeme_len);
             s->param_line[i] = pt->line;
             s->param_col[i] = pt->col;
@@ -752,8 +800,9 @@ static Stmt *statement(Parser *p) {
     case TOK_WHILE: advance(p); s = while_statement(p, t); break;
     case TOK_FOR: advance(p); s = for_statement(p, t); break;
     case TOK_LEFT_BRACE: advance(p); s = block_body(p, t); break;
-    case TOK_ARENA: { /* arena { ... } as a statement: no ';' needed after the block */
-        Expr *e = arena_expr(p);
+    case TOK_ARENA:
+    case TOK_WITH: { /* arena { ... } / with x { ... } as a statement: no ';' needed after the block */
+        Expr *e = t->kind == TOK_ARENA ? arena_expr(p) : with_expr(p);
         if (!e) { s = NULL; break; }
         s = new_stmt(STMT_EXPR, t);
         s->expr = e;
@@ -904,7 +953,7 @@ bool parse(const char *path, TokenList *tokens, Program *out) {
         fprintf(stderr, "%s: error: internal: token stream not terminated\n", path);
         return false;
     }
-    Parser p = {path, tokens, 0, 0, 0, false, false};
+    Parser p = {path, tokens, 0, 0, 0, false, false, SIZE_MAX};
     while (!check(&p, TOK_EOF)) {
         Stmt *s = declaration(&p);
         if (!s) {
@@ -958,6 +1007,7 @@ void stmt_free(Stmt *s) {
     free(s->tparams);
     free(s->params);
     free(s->param_types);
+    free(s->param_move);
     typeref_free(&s->type);
     free(s->param_line);
     free(s->param_col);
@@ -1057,6 +1107,13 @@ static void dump_expr(const Expr *e) {
         dump_stmt(e->body, 2);
         printf(")");
         break;
+    case EXPR_WITH:
+        printf("(with ");
+        dump_expr(e->left);
+        putchar('\n');
+        dump_stmt(e->body, 2);
+        printf(")");
+        break;
     case EXPR_STRUCT:
         printf("(new %s", e->name);
         for (size_t i = 0; i < e->nargs; i++) {
@@ -1096,7 +1153,7 @@ static void dump_tparams(const Stmt *s) {
 static void dump_params(const Stmt *s) {
     printf("(");
     for (size_t i = 0; i < s->nparams; i++) {
-        printf("%s%s", i ? " " : "", s->params[i]);
+        printf("%s%s%s", i ? " " : "", s->param_move && s->param_move[i] ? "move " : "", s->params[i]);
         if (s->param_types) dump_type(&s->param_types[i]);
     }
     printf(")");

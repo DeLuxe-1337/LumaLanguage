@@ -1,0 +1,24 @@
+// move parameters: the call takes over the caller's variable
+struct Point { x: int, y: int }
+struct Owner { p: Point }
+impl Owner {
+  fun new(move p: Point): Owner { return Owner { p: p }; }
+  fun take(self, move q: Point) { free(self.p); self.p = q; }
+}
+fun consume(move p: Point): int { var x = p.x; free(p); return x; }
+
+fun demo(): int {
+  var a = Point { x: 1, y: 2 };
+  var o = Owner::new(a);            // a is moved: using it again is an error
+  a = Point { x: 3, y: 4 };         // a new value revives the variable
+  o.take(a);
+  var b = Point { x: 5, y: 6 };
+  var r = consume(b) + o.p.x;
+  free(o.p);
+  free(o);
+  return r;
+}
+print(demo());
+// globals are not tracked (like use after free through aliases)
+var g = Point { x: 7, y: 8 };
+print(consume(g));

@@ -73,6 +73,36 @@ static int moved_into_rc(const IrModule *m, const IrInstr *in) {
     return -1;
 }
 
+/* A call of a Luma function moves the arguments of its `move` parameters
+ * (docs/DESIGN.md "Memory"). Writes the moved vregs to out (at most
+ * in->nargs) and returns how many. */
+static int moved_args(const IrModule *m, const IrInstr *in, int *out) {
+    if (in->op != IR_CALL || m->globals[in->global].kind != IRG_FUNC) return 0;
+    uint64_t mv = m->globals[in->global].moves;
+    int n = 0;
+    for (int i = 0; i < in->nargs && i < 64; i++)
+        if ((mv >> i & 1) && in->args[i] >= 0) out[n++] = in->args[i];
+    return n;
+}
+
+/* "Rc::new" for the symbol m.Rc..Point.new, "f" for fn.f */
+static void fn_display(const char *sym, char *buf, size_t n) {
+    if (strncmp(sym, "fn.", 3) == 0) {
+        snprintf(buf, n, "%s", sym + 3);
+        return;
+    }
+    if (strncmp(sym, "m.", 2) == 0) {
+        const char *st = sym + 2, *dot = strchr(st, '.'), *last = strrchr(sym, '.');
+        if (dot) {
+            snprintf(buf, n, "%.*s::%s", (int)(dot - st), st, last + 1);
+            return;
+        }
+    }
+    snprintf(buf, n, "%s", sym);
+}
+
+static int *mover; /* per vreg: the global of the function a move went to (-1: Rc::new) */
+
 #define DISPOSED (1 << 24) /* state bit: freed by dispose() rather than free() */
 
 /* One step of the must-be-freed analysis. state[v] = line of the free()
@@ -95,7 +125,12 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
             char at[64];
             if (in->col > 0) snprintf(at, sizeof at, "%d:%d", in->line, in->col);
             else snprintf(at, sizeof at, "%d", in->line);
-            if (state[v] < 0)
+            if (state[v] < 0 && mover[v] >= 0) {
+                char fd[300];
+                fn_display(m->globals[mover[v]].name, fd, sizeof fd);
+                fprintf(stderr, "%s:%s: error: '%s' is %s after it was moved into %s() on line %d\n", path, at, name,
+                        freeing ? "freed" : "used", fd, -state[v]);
+            } else if (state[v] < 0)
                 fprintf(stderr, "%s:%s: error: '%s' was moved into an Rc on line %d; use the Rc instead%s\n", path, at,
                         name, -state[v], freeing ? " (the Rc frees it)" : "");
             else if (freeing)
@@ -112,7 +147,16 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
     if (freeing && in->args[0] >= 0)
         state[in->args[0]] = (in->line > 0 ? in->line : 1) | (strcmp(free_word(m, in), "dispose") == 0 ? DISPOSED : 0);
     int mv = moved_into_rc(m, in);
-    if (mv >= 0) state[mv] = -(in->line > 0 ? in->line : 1);
+    if (mv >= 0) {
+        state[mv] = -(in->line > 0 ? in->line : 1);
+        mover[mv] = -1;
+    }
+    int movedv[64];
+    int nm = in->nargs <= 64 ? moved_args(m, in, movedv) : 0;
+    for (int i = 0; i < nm; i++) {
+        state[movedv[i]] = -(in->line > 0 ? in->line : 1);
+        mover[movedv[i]] = in->global;
+    }
     return ok || !report;
 }
 
@@ -122,8 +166,14 @@ static bool check_func_frees(const IrModule *m, const IrFunc *f, const char *pat
     bool any_free = false;
     for (int b = 0; b < nb && !any_free; b++)
         for (int k = 0; k < f->blocks[b].n; k++)
-            if (is_free_call(m, &f->blocks[b].instrs[k]) || moved_into_rc(m, &f->blocks[b].instrs[k]) >= 0) any_free = true;
+            if (is_free_call(m, &f->blocks[b].instrs[k]) || moved_into_rc(m, &f->blocks[b].instrs[k]) >= 0 ||
+                (f->blocks[b].instrs[k].op == IR_CALL && m->globals[f->blocks[b].instrs[k].global].kind == IRG_FUNC &&
+                 m->globals[f->blocks[b].instrs[k].global].moves))
+                any_free = true;
     if (!any_free) return true;
+    int *mover_saved = mover;
+    mover = xmalloc((size_t)nv * sizeof *mover);
+    for (int v = 0; v < nv; v++) mover[v] = -1;
     Cfg cfg;
     cfg_build(f, &cfg);
     int *out = xcalloc((size_t)nb * (size_t)nv, sizeof *out);
@@ -172,6 +222,8 @@ static bool check_func_frees(const IrModule *m, const IrFunc *f, const char *pat
     free(out);
     free(done);
     free(st);
+    free(mover);
+    mover = mover_saved;
     cfg_free(&cfg);
     return ok;
 }

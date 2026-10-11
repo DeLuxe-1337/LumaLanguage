@@ -1,0 +1,4 @@
+struct T { x: int }
+impl T { fun enter(self) { print("in"); } }
+fun dyn(v) { return v; }
+with dyn(T { x: 1 }) { print("body"); }

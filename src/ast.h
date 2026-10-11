@@ -77,6 +77,7 @@ typedef enum {
     EXPR_ASSOC,   /* name::str(args...)   (name = the struct, str = the function) */
     EXPR_STRUCT,  /* name { fields[i]: args[i], ... } */
     EXPR_ARENA,   /* arena { body }  (a new arena; its value)   arena name { body }  (allocate into name) */
+    EXPR_WITH,    /* with left { body }: left.enter(), body, left.leave(); its value is left */
 } ExprKind;
 
 typedef struct Stmt Stmt;
@@ -94,7 +95,7 @@ struct Expr {
     size_t nargs;
     char **fields;  /* EXPR_STRUCT: field name per argument (owned) */
     int *field_line, *field_col;
-    Stmt *body;     /* EXPR_ARENA: the block (owned); name = the existing arena, or NULL */
+    Stmt *body;     /* EXPR_ARENA / EXPR_WITH: the block (owned); name = the existing arena, or NULL */
 };
 
 /* A type annotation as written. name == NULL means "no annotation". */
@@ -131,6 +132,7 @@ struct Stmt {
     char **params;  /* STMT_FUN / STMT_EXTERN / STMT_STRUCT (owned) */
     int *param_line, *param_col;
     TypeRef *param_types; /* STMT_FUN / STMT_EXTERN: one per param */
+    bool *param_move;     /* STMT_FUN: `move p` (the call takes the caller's variable) */
     size_t nparams;
     TypeRef type;   /* STMT_VAR: declared type; STMT_FUN / STMT_EXTERN: return type */
     char **tparams; /* STMT_STRUCT / STMT_IMPL: type parameters of a generic struct (owned) */

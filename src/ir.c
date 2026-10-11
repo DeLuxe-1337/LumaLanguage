@@ -674,7 +674,7 @@ static void print_func(const IrModule *m, const IrFunc *f, Buf *out) {
     char tn[300];
     buf_printf(out, "fn @%s(", g->name);
     for (int i = 0; i < f->nparams; i++) {
-        buf_printf(out, "%s%%%s", i ? ", " : "", f->vregs[i]);
+        buf_printf(out, "%s%s%%%s", i ? ", " : "", i < 64 && (g->moves >> i & 1) ? "move " : "", f->vregs[i]);
         if (ir_param_ty(g, i) != TY_ANY) {
             ir_ty_name(m, ir_param_ty(g, i), tn, sizeof tn);
             buf_printf(out, ": %s", tn);

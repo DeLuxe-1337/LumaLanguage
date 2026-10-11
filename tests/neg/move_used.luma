@@ -1,0 +1,7 @@
+struct P { x: int }
+fun take(move p: P) { free(p); }
+fun f() {
+  var q = P { x: 1 };
+  take(q);
+  print(q.x);
+}

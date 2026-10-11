@@ -1,0 +1,8 @@
+struct P { x: int }
+struct B { p: P }
+impl B { fun new(move p: P): B { return B { p: p }; } }
+fun f() {
+  var q = P { x: 1 };
+  var b = B::new(q);
+  free(q);
+}

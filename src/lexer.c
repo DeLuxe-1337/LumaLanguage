@@ -58,7 +58,7 @@ static const struct {
     {"false", TOK_FALSE},
     {"for", TOK_FOR},       {"fun", TOK_FUN},     {"if", TOK_IF},         {"impl", TOK_IMPL},    {"nil", TOK_NIL},
     {"or", TOK_OR},         {"return", TOK_RETURN}, {"struct", TOK_STRUCT}, {"super", TOK_SUPER},
-    {"this", TOK_THIS},     {"true", TOK_TRUE},   {"var", TOK_VAR},       {"while", TOK_WHILE},
+    {"this", TOK_THIS},     {"true", TOK_TRUE},   {"var", TOK_VAR},       {"while", TOK_WHILE}, {"with", TOK_WITH},
 };
 
 static bool lex_string(Lexer *lx, Token *tok) {
@@ -249,7 +249,7 @@ const char *token_kind_name(TokenKind k) {
         "SEMICOLON", "SLASH", "STAR", "COLON", "QUESTION", "COLON_COLON", "BANG", "BANG_EQUAL", "EQUAL", "EQUAL_EQUAL", "GREATER",
         "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "AND", "ARENA", "CLASS",
         "ELSE", "EXTERN", "FALSE", "FOR", "FUN", "IF", "IMPL", "NIL", "OR", "RETURN", "STRUCT", "SUPER", "THIS", "TRUE",
-        "VAR", "WHILE", "EOF",
+        "VAR", "WHILE", "WITH", "EOF",
     };
     return (unsigned)k < sizeof names / sizeof *names ? names[k] : "?";
 }

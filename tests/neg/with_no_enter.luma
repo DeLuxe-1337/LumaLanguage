@@ -1,0 +1,3 @@
+struct T { x: int }
+var t: T = T { x: 1 };
+with t { print(1); }

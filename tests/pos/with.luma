@@ -1,0 +1,54 @@
+// with SUBJECT { body }: subject.enter(), the body, subject.leave()
+var depth = 0;
+var log = "";
+fun note(s: str) { log = log + s + " "; }
+
+struct Indent { by: int, name: str }
+impl Indent {
+  fun enter(self) { depth = depth + self.by; note("+" + self.name); }
+  fun leave(self) { depth = depth - self.by; note("-" + self.name); }
+}
+
+struct Tree { label: str, child: Tree?, next: Tree? }
+
+fun show(t: Tree?) {
+  while (t != nil) {
+    print(depth, t.label);
+    with Indent { by: 2, name: t.label } { show(t.child); }
+    t = t.next;
+  }
+}
+
+var leaf = Tree { label: "c", child: nil, next: nil };
+show(Tree { label: "a", child: Tree { label: "b", child: leaf, next: nil }, next: Tree { label: "d", child: nil, next: nil } });
+print(depth, log);
+log = "";
+
+// a return from inside leaves every block it is in, innermost first
+fun find(n: int): int {
+  with Indent { by: 1, name: "outer" } {
+    with Indent { by: 1, name: "inner" } {
+      if (n > 0) return depth;
+    }
+    note("after");
+  }
+  return -1;
+}
+print(find(1), depth, log);
+log = "";
+print(find(0), depth, log);
+log = "";
+
+// the subject is evaluated once; reassigning a variable inside changes nothing
+var i = Indent { by: 5, name: "i" };
+with i {
+  i = Indent { by: 100, name: "other" };
+  print(depth);
+}
+print(depth, log);
+log = "";
+
+// as an expression, with yields its subject; untyped subjects work too
+fun dyn(v) { return v; }
+var s = with dyn(Indent { by: 3, name: "dyn" }) { print(depth); };
+print(depth, s.name, log);
