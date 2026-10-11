@@ -21,6 +21,7 @@ The intermediate representation (LIR) has its own specification in
 INPUT.luma
    │  src/lexer.c        bytes → tokens (Lox token set)
    │  src/parser.c       tokens → AST (src/ast.h); `for` is desugared to `while`
+   │  src/prelude.c      + the prelude's AST (std/prelude.luma, built in), as far as used
    ▼
    │  src/lower.c        AST → LIR: static scoping, short-circuit logic   ──► OUT.lir
    ▼           (INPUT.lir enters here: src/ir_parse.c)
@@ -276,22 +277,227 @@ as `.Lstruct.K`, field and method names as `.Lname.NAME`.
 in `--mm=manual` (or automatically for instances that never leave their
 function), reference counting in `--mm=rc`. See "Memory" below.
 
-## Memory (milestones 7 and 8)
+## Generic structs and hooks (milestone 9)
 
-Memory is manual by default, with two library-like tools for the cases
-where manual freeing is awkward: `Rc<T>` for shared ownership and arenas for
-bulk lifetimes. Strings are always automatic.
+Milestone 9 moved `Rc<T>` and `Arena` out of the compiler and into Luma
+code (the prelude, below). That took five general features, which any
+program can use for its own types:
+
+| Feature | Syntax | Gives |
+|---|---|---|
+| Generic structs | `struct Box<T> { value: T }`, `impl Box<T> { … }` | One typed struct per list of type arguments |
+| Shared structs | `shared struct S { … }` | Every instance is reference counted |
+| Lifecycle hook | `fun drop(self)` | Code that runs when an instance dies |
+| Forwarding hook | `fun deref(self)` | Fields and methods the struct lacks come from what `deref` returns |
+| Ownership and scope | `move` parameters; `with x { … }` | The call takes the caller's variable; `enter`/`leave` around a block |
+
+Plus a printing hook, `fun show(self): str`, and the builtins `dispose(x)`
+and `refcount(x)`. The test of the design: with the C special cases for
+`Rc` and `Arena` deleted, every milestone-8 memory test still produces the
+same memcheck report, except where noted below.
+
+### Generic structs
+
+```js
+struct Pair<A, B> { first: A, second: B }
+impl Pair<A, B> {
+  fun swap(self): Pair<B, A> { return Pair { first: self.second, second: self.first }; }
+}
+var p: Pair<int, str> = Pair { first: 1, second: "one" };
+var q = p.swap();                       // Pair<str, int>
+```
+
+- Each distinct list of type arguments is an *instance*: a struct of its
+  own, named as written (`Pair<int,str>` in LIR, `Pair<int, str>` in
+  messages), with its own copy of every method. Instances are created on
+  first use (an annotation, a literal, an associated call), so unused ones
+  cost nothing.
+- Type arguments are written only in annotations. In expressions they are
+  inferred: from the type the value flows into when that is an instance of
+  the same generic, else from the static types of field values or
+  arguments matched against the declared field and parameter types. A
+  parameter nothing determines is `any`. `a < b > c` therefore stays an
+  expression.
+- Instances are distinct types: `Box<int>` is not a `Box<any>`. Untyped
+  slots accept both.
+- Function symbols mangle the name: `m.Box..int.get` for `Box<int>`'s `get`.
+- Nesting deeper than 32 levels is a compile error, not an endless
+  expansion.
+
+### Shared structs, `drop` and `dispose`
+
+`shared` decides *when* an instance dies; `drop` decides *what happens* then.
+
+- **`shared struct S`**: the memory pass counts every `new` of `S`,
+  whatever the escape analysis says, and the runtime never places one in an
+  arena. `free(s)` is a compile error when the type is known, and a runtime
+  error otherwise: `'S' is a shared struct; it is freed when its last
+  reference goes away`.
+- **`fun drop(self)`** runs exactly once per instance, just before its fields
+  are released and its memory freed: when a counted instance's count reaches
+  0, when `free` or `dispose` frees a manual one, or when its arena is
+  destroyed (newest object first). `--mm=none` frees nothing, so it never
+  calls `drop`.
+  - It takes only `self` and returns nothing. Storing, returning or
+    otherwise keeping `self` is a compile error. At run time the count is
+    held at 1 while `drop` runs; anything else afterwards is a runtime error
+    (`T.drop() kept a reference to self`).
+  - The runtime calls it through a `drop` entry in the descriptor, from the
+    same release worklist as before, so dropping a million-node chain still
+    uses constant C stack.
+  - **Timing.** For counted objects "the last reference goes away" means
+    after the last use (the compiler releases there, as Swift does), so a
+    `drop` with visible effects can run earlier at `-O2` than at `-O0`.
+    `free`, `dispose`, the end of an arena and `with` are fixed points.
+  - The optimizer forwards loads of globals and fields across instructions
+    only when no struct in the module has a `drop`: a release the memory
+    pass inserts later could run one.
+- **`dispose(x)`** frees `x` when it is a manual instance outside an arena
+  and does nothing otherwise (strings, numbers, counted, shared and arena
+  objects are released with whatever held them). It is the `free` generic
+  code can call on a `T`. The use-after-free check treats it like `free`.
+- **`refcount(x)`** is a counted object's count, 0 for anything else.
+
+### `deref`
+
+When `x.f`, `x.f = v` or `x.m(…)` names a member that `x`'s struct lacks
+and the struct has `fun deref(self)`, the access applies to what `deref`
+returns. The struct's own members always win.
+
+- **Statically**, when `x`'s type is an exact struct and `deref` declares
+  its return type, the access is resolved at compile time, following up to
+  8 steps; a cycle is a compile error. If `deref`'s body is exactly
+  `return self.f;` (and every value of `f` passes the declared return
+  type), the compiler emits a `getfield` instead of a call: `Rc` access
+  costs what it did when `Rc` was built in.
+- **Dynamically**, `luma_getfield` and `luma_setfield` retry through
+  `deref` on a miss. `luma_method` returns a trampoline that the compiled
+  code calls at once with the receiver and arguments; it follows `deref`
+  and calls the method. A dynamic `getfield` now returns a reference of its
+  own (it may come from a temporary `deref` returned), so the memory pass
+  no longer treats it as borrowed.
+- Messages name the chain: `Struct 'Rc<P>' has no field 'y' (nor does 'P',
+  through deref).`
+- After an access through `deref`, lowering emits `keep %owner` so the
+  owner (and what it owns) lives until the value read is held.
+
+### `show`, `with` and `move`
+
+- **`fun show(self): str`** is how `print` shows an instance, at the top
+  level and inside other values. Only that exact signature is the hook (a
+  method named `show` without `: str` is ordinary); the compiler records it
+  in the descriptor. Printing then runs Luma code, so the optimizer and the
+  memory pass treat `luma_write` as a call that may write fields and free
+  objects in modules that have a `show`.
+- **`with E { B }`** evaluates `E` once into a hidden variable, calls its
+  `enter()`, runs `B`, and calls `leave()` on every way out: the end of the
+  block, or a `return` inside it (nested blocks leave innermost first). As
+  an expression it yields `E`. The calls are static when `E`'s struct is
+  known and dynamic method calls otherwise. A struct literal at the very
+  start of the subject must be followed by the body's `{`
+  (`with Indent { by: 2 } { … }`), so `with a { … }` is a variable and a block.
+- **`fun f(move p)`**: a call whose target is known statically moves an
+  argument that is a local variable. Using or freeing the variable
+  afterwards, on every path, is a compile error: `'q' is used after it was
+  moved into take() on line 5`. Assigning it a new value revives it.
+  Globals, fields and aliases are not tracked (as for use after free).
+  `move` is a keyword only before a parameter name; LIR writes it as
+  `fn @f(move %p)`.
+
+### Temporaries live to the end of their full expression
+
+A method may return a value its receiver owns:
+
+```js
+fun make(n: int): Owner<Leaf> { return Owner { held: Leaf { n: n } }; }
+print(make(3).peek().n);   // Owner.drop disposes of the Leaf peek returned
+```
+
+Ownership alone releases `make(3)` right after `peek()`, its last use, and
+its `drop` frees the `Leaf` before `.n` reads it. So, as in C++, a temporary
+lives to the end of its full expression: the receiver of a method call or
+field access, and the arguments of a call, get a `keep` there when they are
+not plain variables and may be instances. The right operand of `and`/`or`
+ends its temporaries in its own block, and statements inside an expression
+(an arena or `with` body) start their own full expressions.
+
+### The prelude (`std/prelude.luma`)
+
+```js
+shared struct Rc<T> { __value: T }
+impl Rc<T> {
+  fun new(move v: T): Rc<T> { return Rc { __value: v }; }
+  fun get(self): T { return self.__value; }
+  fun count(self): int { return refcount(self); }
+  fun deref(self): T { return self.__value; }
+  fun drop(self) { dispose(self.__value); }
+  fun show(self): str { return "Rc(" + __show(self.__value) + ")"; }
+}
+
+shared struct Arena { __state: int }
+impl Arena {
+  fun new(): Arena { return Arena { __state: __arena_create() }; }
+  fun enter(self) { __arena_push(self); }
+  fun leave(self) { __arena_pop(); }
+  fun drop(self) { __arena_destroy(self.__state); }
+  fun show(self): str { return "Arena"; }
+}
+```
+
+- **Built in.** The Makefile turns the file into a C string linked into
+  `luma` (`build/obj/prelude_src.c`), so compiled programs still need only
+  `libluma_rt.a`. `LUMA_PRELUDE=path` replaces it.
+- **Merged as far as used.** `lower_program` parses it and appends to the
+  program the prelude structs (with their `impl`s) that the program
+  mentions: in a type, a struct literal or a `X::f` call; an `arena` block
+  mentions `Arena`. Prelude code that mentions another prelude struct pulls
+  it in too. Appending keeps the program's struct ids, and so memcheck's
+  lists, in the same order as before. Hello world's assembly is unchanged.
+- **Reserved names.** A program that declares a struct, `impl`, function,
+  variable or C function named like a prelude struct gets `'Rc' is defined
+  by the prelude`; names starting with `__` are reserved.
+- **Intrinsics.** `__name(…)` calls, allowed only in prelude code, are runtime
+  calls: `__arena_create` (`luma_arena_create`), `__arena_push`
+  (`luma_arena_enter`), `__arena_pop` (`luma_arena_leave`),
+  `__arena_destroy` (`luma_arena_destroy`) and `__show` (`luma_show`: a
+  value as `print` shows it inside a struct, as a string). Their results are
+  `any`, like every runtime call's.
+- **Diagnostics.** The prelude's line numbers are offset by 1,000,000 after
+  parsing. Lowering and the memory pass print such a location as
+  `<prelude>:LINE:COL`.
+- **Field naming.** `Rc`'s field is `__value`, so it never shadows a field
+  of the value (`r.value` reaches the value's `value`). Its methods do
+  shadow: `r.get()` is `Rc::get(r)`.
+
+What changed for programs, compared with the built-in `Rc` of milestone 8:
+
+| | Milestone 8 | Milestone 9 |
+|---|---|---|
+| `Rc::new(v)` on an untyped value | a box for `v`'s runtime struct (`Rc<Point>`) | `Rc<any>` (fields and methods still reach the value) |
+| `Rc<int>` | meant `Rc<any>` | a real `Rc<int>` |
+| `r.get()` with a `get` on the value | the value's `get` | `Rc.get` (the value); the value's own is `r.deref().get()` |
+| `Rc::count(r)` | the handles | the handles plus the call's own |
+| `print(r)` | `Rc(…)` from C | `Rc(…)` from `Rc.show`, which builds its text as strings |
+| errors | Rc-specific messages | the general ones (`shared struct`, `move`, `has no field … through deref`) |
+
+## Memory (milestones 7 to 9)
+
+Memory is manual by default, with two tools for the cases where manual
+freeing is awkward: `Rc<T>` for shared ownership and arenas for bulk
+lifetimes. Since milestone 9 both are Luma code in the prelude (above),
+built on `shared`, `drop`, `deref` and `with`. Strings are always automatic.
 
 | | `--mm=manual` (default) | `--mm=none` |
 |---|---|---|
 | Strings, temporaries | freed at their last use | never freed |
 | Struct instances | freed by `free(x)`; also by the compiler when it proves they never leave their function | never freed |
-| `Rc::new(x)` boxes | freed with their value when the last handle goes | never freed |
+| Shared structs (`Rc::new(x)` boxes, arenas) | freed when the last reference goes; their `drop` frees what they own | never freed |
 | Structs allocated inside `arena { … }` | freed together when the arena ends | never freed |
 | `free(x)` | frees `x` and releases the strings in its fields; does nothing for an arena object | checks its argument, frees nothing |
 
 The same program compiles in both modes, and its output never depends on
-the mode. `--mm=none` is the fastest choice for short-lived programs, and a
+the mode (except through a `drop` with visible effects, which `none` never
+runs). `--mm=none` is the fastest choice for short-lived programs, and a
 baseline to compare memcheck reports against.
 
 **Why `Rc` is a type, not a mode.** Milestone 7 also had `--mm=rc`, which
@@ -307,15 +513,15 @@ reference-counted every object in the program. It was removed in milestone
   (below) already counts strings and non-escaping instances, so an `Rc` box
   is one more counted object.
 
-`--mm=rc` and `memory rc` in LIR are now errors that point to `Rc::new`.
+`--mm=rc` and `memory rc` in LIR are errors that point to `Rc::new`.
 
 **`free(x)`** is a builtin, like `print`.
 - `x` must be a struct instance or `nil`. `free(nil)` does nothing.
 - `free("text")` and `free(1)` are compile errors when the type is known. At
   run time they are errors in every mode:
   `free() expects a struct instance, got str (strings are freed automatically).`
-- `free(r)` of an `Rc` or of an arena handle is a compile error (and a
-  runtime error when the type is only known then): they free themselves.
+- `free(r)` of a shared struct (an `Rc`, an arena) is a compile error, and a
+  runtime error when the type is only known then: they free themselves.
 - After `free(x)`, using `x` (or freeing it again) is an error in every mode:
   - A compile error when it happens on every path, checked on the lowered IR
     before optimization: `'p' is used after free(p) on line 4`.
@@ -332,49 +538,18 @@ print(a.x);         // 10
 a = nil; b = nil;   // the last handle frees the box and the Point
 ```
 
-- `Rc::new(x)` **moves** `x` into a new box. Using the variable `x`
-  afterwards is a compile error, by the same check as use after free:
-  `'p' was moved into an Rc on line 3; use the Rc instead (the Rc frees it)`.
-  Aliases of `x` are not tracked; freeing the value through one is a use
-  after free when the box later frees it (memcheck reports it).
-- A handle is a counted reference. Copying it (assignment, a field, an
-  argument) shares the box; the box is freed when its count reaches 0, and
-  it then frees its value: a manual instance is freed like `free` would, and
-  anything else (a string, another `Rc`, a counted instance) is released.
-- **Auto-deref.** `r.f`, `r.f = v` and `r.m(…)` on a handle access the value.
-  Statically (when the type is `Rc<S>`) this is a `getfield` of the box's
-  `value` field followed by the access on `S`. Dynamically the runtime's
-  field and method lookups look through boxes, and method tables of
-  `Rc<S>` hold generated forwarders `m.Rc.S.f` that unwrap and call `S`'s
-  method.
-- `Rc::get(r)` returns the value; `Rc::count(r)` the number of handles.
-  `count` is a debugging aid: a temporary the optimizer keeps in a register
-  also holds a handle, so the number can differ between `-O0` and `-O2`
-  inside one function. Counts held by fields and globals are exact.
-- Types: `Rc<S>` for a struct `S`, or `Rc<any>` for anything else (`Rc<int>`
-  and `Rc<str>` mean `Rc<any>`: the box is untyped). `Rc` alone and
-  `Rc<Unknown>` are compile errors. Cycles of boxes leak (memcheck lists
-  them).
-
-**Representation.** `Rc` is a builtin struct, added to the module only when
-the program uses it: `Rc` (`value: any`) and one `Rc.S` (`value: S`, shown
-as `Rc<S>`) for every user struct `S`. The descriptor records the kind
-(`user`, `rc`, `arena`) and, for a user struct, its `Rc.S` descriptor, so
-`luma_rc_new` can build the precise box for a value whose type is only known
-at run time. A box is always a counted object (`new Rc.S … ; counted`).
-
-**Keeping the box alive.** Auto-deref reads a field of the value through
-the box. If the box is a temporary, its last use is that read, so ownership
-would release it (and with it the value) before the field's value is used:
-
-```js
-print(Rc::new(Holder { s: cat("x", "y"), next: nil }).s);
-```
-
-Lowering therefore emits `keep %box` after the access: an instruction with
-no code whose only effect is to be a use, so liveness keeps the box (and the
-value it owns) until the field has been retained. The differential tester
-found this.
+- `Rc::new(x)` **moves** `x` into a new box (a `move` parameter): using the
+  variable `x` afterwards is a compile error. Aliases of `x` are not
+  tracked; freeing the value through one is a use after free when the box
+  later frees it (memcheck reports it).
+- A handle is a counted reference. Copying it shares the box; the box is
+  freed when its count reaches 0, and its `drop` disposes of the value: a
+  manual instance is freed like `free` would, anything else is released.
+- Field access and method calls reach the value through `deref`, whose
+  `return self.__value;` compiles to a field read.
+- `Rc::count(r)` is a debugging aid: the call's own handle, and temporaries
+  the optimizer keeps in registers, count too.
+- Cycles of boxes leak (memcheck lists them).
 
 ### Arenas
 
@@ -388,16 +563,17 @@ arena a { list = chain(10); }   // allocate into it again
 a = nil;                    // the last handle frees everything in it
 ```
 
-- An arena block pushes the arena on a runtime stack and pops it at the end
-  (and on `return` from inside it). While an arena is on top, every struct
-  instance that would be *manual* goes into it. Counted instances (the
-  non-escaping ones), strings and `Rc` boxes are allocated normally: they
-  already have a precise lifetime, and an arena could not free a string
-  that outlived it.
-- The handle is a counted object of the builtin struct `Arena`. The arena is
-  destroyed when the last handle goes: the block's own temporary, the
-  stack's reference, or a variable. Destruction walks the arena's objects,
-  releases what their fields hold, and frees the chunks.
+- `arena { B }` is `with Arena::new() { B }` and `arena a { B }` is
+  `with a { B }`. `enter()` pushes the arena on the runtime's stack and
+  `leave()` pops it (also on `return` from inside). While an arena is on
+  top, every struct instance that would be *manual* goes into it. Counted
+  instances (the non-escaping ones), strings and shared structs are
+  allocated normally: they already have a precise lifetime, and an arena
+  could not free a string that outlived it.
+- The handle is a shared `Arena`. The arena is destroyed when the last
+  reference goes (the `with` block's own, the stack's, or a variable's):
+  its `drop` calls `__arena_destroy`, which runs the objects' `drop`s
+  (newest first), releases what their fields hold, and frees the chunks.
 - `free(x)` of an arena object does nothing, so code that frees its
   structures works unchanged inside an arena.
 - References that outlive their arena dangle, as in any region system.
@@ -406,8 +582,10 @@ a = nil;                    // the last handle frees everything in it
 
 **Runtime.** Objects are bump-allocated from 64 KB chunks (an object larger
 than a chunk gets its own). An arena object's descriptor pointer has bit 0
-set; everything reads descriptors through `desc_of()`. Under memcheck each
-object is recorded, and the chunks are quarantined rather than freed.
+set; everything reads descriptors through `desc_of()`. The runtime keeps a
+list of live arenas; memcheck treats an arena's objects as reachable from
+its handle. Under memcheck each object is recorded, and the chunks are
+quarantined rather than freed.
 
 ### Ownership and reference counts
 
@@ -585,8 +763,14 @@ faster too (e.g. loop_sum 1.00 s → 0.69 s).
 
 ### Limits and next steps
 
-- Cycles of `Rc` boxes leak; memcheck lists them. Planned options: `Weak<T>`
-  handles, or a cycle collector over boxes (trial deletion).
+- Cycles of `Rc` boxes leak; memcheck lists them. `Weak<T>` (a prelude type
+  over a weak-count intrinsic) is the natural next addition; a cycle
+  collector over boxes (trial deletion) the alternative.
+- Generic functions (`fun id<T>(x: T): T`) and constraints on type
+  parameters (traits) do not exist yet; hooks are matched by name and
+  signature.
+- C types are not field types yet, so a struct can't hold a `ptr` for its
+  `drop` to release.
 - Arena references are not checked at compile time; a reference that
   outlives its arena dangles. A region check (values allocated in a
   scoped arena must not reach a global or an outer variable) is the next
@@ -1012,11 +1196,19 @@ Memory management is covered by:
 - `tests/mem`: exact `LUMA_MEMCHECK` reports for both modes at every level
   (strings, Rc graphs and cycles, a program that frees everything, a use
   after free through a typed alias, a million-node Rc list, arenas, a
-  reference that outlives its arena, borrowed reads);
+  reference that outlives its arena, borrowed reads, `drop` for each way an
+  instance dies);
 - every positive program run again under `manual` and `none` with memcheck
   on;
-- compile errors (`tests/neg/free_*`, `rc_*`, `arena_*`), runtime errors
-  (`tests/rt/free_*`, `rc_*`, `arena_*`, `use_after_free`), and unit tests of the memory pass on hand-written LIR;
+- compile errors (`tests/neg/free_*`, `rc_*`, `arena_*`, `drop_*`,
+  `shared_free`, `move_*`, `with_*`, `deref_*`, `prelude_*`), runtime errors
+  (`tests/rt/free_*`, `rc_*`, `arena_*`, `drop_*`, `deref_*`,
+  `use_after_free`), and unit tests of the memory pass on hand-written LIR;
+- milestone 9's features at every level in both modes: `tests/pos/generics`,
+  `deref`, `with`, `move`, `custom_types` (an owner type, a shared type, show
+  hooks and a scope, written the way the prelude writes Rc and Arena), and
+  e2e checks of the prelude itself (pruning, `<prelude>:LINE` errors,
+  `LUMA_PRELUDE`);
 - the difftest, which runs each program under one mode with memcheck and
   compares the objects alive at exit with the reference interpreter's
   prediction (none: every instance, box and arena; manual: the Rc boxes

@@ -9,9 +9,11 @@ The syntax started from Lox and has grown its own features:
 
 - `print` is a builtin function
 - types are optional and gradual
-- structs with `impl` blocks (methods and associated functions, Rust-style)
-- memory management you choose per build: manual (`free`), reference
-  counting, or none, with the compiler freeing what it can prove dead
+- structs with `impl` blocks (methods and associated functions, Rust-style),
+  generic structs, and hooks (`drop`, `deref`, `show`, `enter`/`leave`) that
+  let a type define how it lives, forwards and prints
+- manual memory management (`free`), with the compiler freeing what it can
+  prove dead; `Rc<T>` and arenas are written in Luma itself, in the prelude
 - C functions are called directly through `extern fun`
 
 Nothing is final before Luma bootstraps.
@@ -116,19 +118,21 @@ Its input language, encodings and relocation rules are specified in
 | | |
 |---|---|
 | Values | 63-bit integers, strings, `true`, `false`, `nil`, struct instances |
-| Builtin types | `Rc<T>` (a counted box: `Rc::new`, `Rc::get`, `Rc::count`) and `Arena` (the value of `arena { … }`); see below. |
-| Structs | `struct P { x: int, y }` declares fields (typed or untyped). `P { x: 1, y }` builds one (every field, any order, `y` is shorthand for `y: y`). Instances are references: assignment shares, `==` is identity, and they are always truthy. `print` shows `P { x: 1, y: "s" }`. |
+| Structs | `struct P { x: int, y }` declares fields (typed or untyped). `P { x: 1, y }` builds one (every field, any order, `y` is shorthand for `y: y`). Instances are references: assignment shares, `==` is identity, and they are always truthy. `print` shows `P { x: 1, y: "s" }`. `shared struct` makes every instance reference counted. |
+| Generics | `struct Box<T> { value: T }` and `impl Box<T> { … }`: one struct per list of type arguments (`Box<int>`, `Pair<str, Point?>`), inferred in expressions, written in annotations (below). |
+| Hooks | Methods with special meaning: `drop(self)` runs when an instance dies, `deref(self)` answers fields and methods the struct lacks, `show(self): str` is how `print` shows it, `enter(self)`/`leave(self)` are called by `with`. |
+| Prelude | `Rc<T>` and `Arena` are Luma code in [std/prelude.luma](std/prelude.luma), built into `luma` and compiled only when a program uses them. |
 | `impl` | `impl P { fun m(self, a) { … } fun new(…) { … } }` adds methods (first parameter `self`, untyped) and associated functions (no `self`). Call them as `p.m(1)`, `P::new(…)` or `P::m(p, 1)`. Several `impl` blocks per struct are allowed. When the object's static type is exactly `P`, field access and method calls are compiled statically; otherwise they are looked up by name at runtime, with the same error messages. |
-| Functions | `fun name(a, b) { … return v; }` at top level, called as `name(x, y)`. Recursion and mutual recursion work, and functions can be called before their definition. Up to 6 parameters. Arity is checked at compile time. A missing `return` returns `nil`. |
-| Builtins | `print(a, b, …)` writes its arguments separated by spaces, then a newline, and returns `nil`. All arguments are evaluated before anything is written. |
+| Functions | `fun name(a, b) { … return v; }` at top level, called as `name(x, y)`. Recursion and mutual recursion work, and functions can be called before their definition. Up to 6 parameters. Arity is checked at compile time. A missing `return` returns `nil`. `fun f(move p)`: the call takes over the caller's variable (using it afterwards is a compile error). |
+| Builtins | `print(a, b, …)` writes its arguments separated by spaces, then a newline, and returns `nil`. All arguments are evaluated before anything is written. `free(x)`, `dispose(x)` and `refcount(x)`: see Memory. |
 | Types | Optional annotations: `var n: int`, `fun f(a: str, b): bool?`. The types are `int str bool nil any`, struct names, and `T?` (T or nil). Mismatches the compiler can prove are compile errors; values whose type is only known at runtime are checked by a guard at the annotated boundary. Unannotated code stays fully dynamic. |
 | C FFI | `extern fun name(p: ctype, …): ctype;` with `i8`…`i64`, `u8`…`u64`, `bool`, `cstr`, `cstr?`, `ptr` and `void`. Values are converted and range-checked at the call. Link libraries with `-l NAME -L DIR`, or pass `.o`/`.a`/`.so` files. |
-| Statements | `var`, expression statements, `{ }` blocks, `if`/`else`, `while`, `for`, `return` |
+| Statements | `var`, expression statements, `{ }` blocks, `if`/`else`, `while`, `for`, `return`, `with x { … }`, `arena { … }` |
 | Operators | `= or and == != < <= > >= + - * / ! -` (unary), and `+` on two strings concatenates them |
 | Variables | Top-level variables are globals that functions can read and write. Variables in blocks and functions are local, with lexical scoping checked at compile time. |
 | Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Integer overflow, type errors, reading a global before it is assigned, and stack overflow are runtime errors (exit status 1). `/` is floor division. |
-| Memory | Manual by default (below): `free(x)` for struct instances, `Rc::new(x)` for shared ownership, `arena { … }` for bulk lifetimes; strings are automatic. `--mm=none` never frees, and `free` then does nothing, so a program compiles in both modes. Using a variable after `free` or after moving it into an Rc, on every path, is a compile error. |
-| Not yet | first-class functions and closures, traits/interfaces, floats (including C `f32`/`f64`), C structs and callbacks, `break`, collecting reference cycles |
+| Memory | Manual by default (below): `free(x)` for struct instances, `Rc::new(x)` for shared ownership, `arena { … }` for bulk lifetimes; strings are automatic. `--mm=none` never frees, and `free` then does nothing, so a program compiles in both modes. Using a variable after `free`, or after a `move` parameter took it, on every path, is a compile error. |
+| Not yet | first-class functions and closures, generic functions, traits/interfaces, floats (including C `f32`/`f64`), C structs and callbacks, `break`, collecting reference cycles |
 
 ## Memory management
 
@@ -165,7 +169,7 @@ print(greet("luma") + "!", dist2(3, 4));   // both strings are freed after print
 var shared: Rc<Point>? = Rc::new(Point { x: 1, y: 2 });
 var other = shared;                   // a second handle to the same Point
 other.x = 10;                         // fields and methods go through the box
-print(shared.x, shared.len2(), Rc::count(shared));
+print(shared.x, shared.len2(), Rc::count(shared));   // 2 handles + the call's
 other = nil;
 shared = nil;                         // count reaches 0: both are freed
 
@@ -190,7 +194,7 @@ Output, with `LUMA_MEMCHECK=1`:
 
 ```
 hello, luma! 25
-10 104 2
+10 104 3
 999
 9
 luma: memcheck: --mm=manual, 1023 allocated, 1023 freed, 0 leaked, 0 reachable from globals
@@ -203,17 +207,23 @@ the rest.
 |---|---|
 | Strings and temporaries | automatically, at their last use |
 | Struct instances | by `free(x)`; instances that provably never leave their function are freed for you |
-| `Rc::new(x)` | when the last handle goes away; the box owns `x` (using `x` afterwards is a compile error) |
+| `Rc::new(x)` | when the last handle goes away; the box owns `x` (`x` is a `move` parameter: using it afterwards is a compile error) |
 | Inside `arena { … }` | every struct allocated in the block, including in functions it calls, at the end of the block (or when the last handle of a named arena goes away). `free()` on them does nothing |
 
 - `Rc<T>` handles are counted references: copying one shares the box, and
-  field access and method calls go through it (`r.x`, `r.len2()`).
-  `Rc::get(r)` returns the value, `Rc::count(r)` the number of handles (a
-  debugging aid: temporaries the optimizer keeps alive count too). Cycles of
-  Rc boxes leak.
-- `var a = arena { … };` keeps the arena; `arena a { … }` allocates into it
-  again. Strings and Rc boxes are never placed in an arena. A reference
-  that outlives its arena is a use after free (`LUMA_MEMCHECK=1` reports it).
+  field access and method calls go through it (`r.x`, `r.len2()`, by its
+  `deref`). Rc's own methods win over the value's: `r.get()` is
+  `Rc::get(r)`, the value. `Rc::count(r)` is the number of handles (a
+  debugging aid: the call's own, and temporaries the optimizer keeps alive,
+  count too). Cycles of Rc boxes leak. `Rc::new` of an untyped value makes
+  an `Rc<any>`.
+- `arena { … }` is `with Arena::new() { … }`. `var a = arena { … };` keeps
+  the arena; `arena a { … }` allocates into it again. Strings and shared
+  structs (Rc boxes) are never placed in an arena. A reference that
+  outlives its arena is a use after free (`LUMA_MEMCHECK=1` reports it).
+- `dispose(x)` frees `x` if it is an instance managed by hand and does
+  nothing for anything else (for generic code that owns a `T`);
+  `refcount(x)` reads a counted object's count.
 - `--mm=none` frees nothing, which is useful to compare against.
 
 The compiler inserts the retain/release operations itself, after
@@ -241,6 +251,63 @@ The 6 leaked objects are two Rc cycles (a box that refers to itself, and a ring 
 
 The design, the analyses and the runtime are described in
 [docs/DESIGN.md](docs/DESIGN.md) ("Memory").
+
+## Generics, hooks and the prelude
+
+`Rc<T>` and `Arena` are not built into the compiler: they are ordinary Luma
+in [std/prelude.luma](std/prelude.luma), using features any program can use.
+This program defines its own owner type the same way:
+
+```js
+struct Node { label: str, next: Node? }
+impl Node { fun shout(self): str { return self.label + "!"; } }
+
+// A unique owner: freeing it frees what it holds. Like Rc<T>, minus sharing.
+struct Owned<T> { value: T }
+impl Owned<T> {
+  fun new(move v: T): Owned<T> { return Owned { value: v }; }
+  fun deref(self): T { return self.value; }       // o.label is o.value.label
+  fun drop(self) { dispose(self.value); }         // free(o) frees the Node too
+  fun show(self): str { return "Owned(" + self.value.label + ")"; }
+}
+
+var o = Owned::new(Node { label: "root", next: nil });
+print(o, o.label, o.shout());
+free(o);
+
+// A scope: with calls enter() before the block and leave() after it.
+var depth = 0;
+struct Indent { by: int }
+impl Indent {
+  fun enter(self) { depth = depth + self.by; }
+  fun leave(self) { depth = depth - self.by; }
+}
+with Indent { by: 2 } { print("depth", depth); }
+print("depth", depth);
+```
+
+Output:
+
+```
+Owned(root) root root!
+depth 2
+depth 0
+```
+
+| Feature | Meaning |
+|---|---|
+| `struct Box<T> { … }`, `impl Box<T> { … }` | A struct per list of type arguments, inferred from field values and arguments (`Owned::new(node)` is an `Owned<Node>`) |
+| `shared struct S` | Every instance is reference counted; `free()` of one is an error |
+| `fun drop(self)` | Runs once when an instance dies: its count reaches 0, `free`/`dispose`, or its arena ends. For counted objects that is after their last use, so it can run earlier at `-O2` than at `-O0` |
+| `fun deref(self)` | A field or method the struct lacks is looked up on what `deref` returns (statically when types are known, else at run time); `return self.f;` compiles to a plain field read |
+| `fun show(self): str` | What `print` shows for an instance, also inside other values |
+| `fun enter(self)`, `fun leave(self)` | Called around `with x { … }`, also when a `return` leaves the block |
+| `fun f(move p)` | The call takes the caller's variable |
+
+Temporaries live to the end of their full expression, so
+`make().peek().n` can't read a value whose owner's `drop` already ran. Names
+starting with `__` are reserved for the prelude's runtime intrinsics.
+`LUMA_PRELUDE=path` replaces the prelude (for working on it).
 
 ## Inspecting the intermediate files
 
@@ -326,6 +393,7 @@ src/        lexer, parser + ast, lower (AST→LIR), ir/ir_parse/ir_verify/ir_typ
             cfg + opt* (optimizer), mem (memory analyses), x86_gen (optimizing LIR→asm), x86_isel (naive LIR→asm),
             asm, obj (object model), elf_writer, value.h (shared value tags), main (luma), lasm
 runtime/    luma_rt.c: the C runtime linked into every program
+std/        prelude.luma: Rc<T> and Arena, written in Luma (built into luma)
 examples/   hello.luma, fizzbuzz.luma, ffi.luma, selftest.luma
 tests/      unit/, pos/, neg/, rt/, mem/, ir/, ffi/, asm/, run_e2e.sh, difftest.py
 bench/      benchmark programs and run.py

@@ -1,12 +1,14 @@
-# LIR: the Luma intermediate representation (spec v0.7)
+# LIR: the Luma intermediate representation (spec v0.8)
 
 **Status:** implemented in milestone 2 and extended since: section 15 (v0.2,
 milestone 3), section 16 (v0.3, milestone 4), section 17 (v0.4, milestone
 5: types, `check`, the optimizer and the optimizing backend), section 18
 (v0.5, milestone 6: structs, field access and method calls) and section 19
-(v0.6, milestone 7: memory modes, retain/release) and section 20 (v0.7,
+(v0.6, milestone 7: memory modes, retain/release), section 20 (v0.7,
 milestone 8: `Rc` and `Arena` builtin structs, `keep`, `memory rc`
-removed). The decisions
+removed) and section 21 (v0.8, milestone 9: generic instances, shared
+structs, `move` parameters, `drop`/`show` hooks; the builtin structs of
+section 20 removed). The decisions
 in section 13 are resolved, and the places where the implementation refined
 the original draft are listed in section 14.
 **Scope:** this spec covers:
@@ -892,6 +894,10 @@ Every program also defines `luma_mm` (`.quad` mode) and `luma_globals`
 
 ## 20. v0.7 additions (milestone 8)
 
+(Superseded in part by section 21: the builtin structs `Rc`, `Rc.S` and
+`Arena`, their kinds and the descriptor's `kind` and `rc` words were
+removed in v0.8. `keep` and the removal of `memory rc` stand.)
+
 ### `memory rc` removed
 
 `memory rc` is a parse error (`memory mode 'rc' was removed: use Rc::new
@@ -963,4 +969,85 @@ Each descriptor gains two words after the method table:
 
 An instance's descriptor word has bit 0 set when the instance lives in an
 arena; the runtime masks it.
+
+## 21. v0.8 additions (milestone 9)
+
+Milestone 9 moved `Rc<T>` and `Arena` into Luma code (the prelude,
+docs/DESIGN.md). In LIR they are ordinary structs and functions; nothing
+in the IR knows their names.
+
+### Generic instances
+
+A generic struct appears only as its instances, one struct per list of
+type arguments, named as written without spaces:
+
+```
+struct Pair<int,str> {first: int, second: str}
+struct Rc<Point> {__value: Point}
+  %v = getfield %p, Pair<int,str>.first
+```
+
+- A struct name is an identifier optionally followed by `<`…`>`; inside the
+  brackets, names, `?`, `,` and nested brackets. No `.` outside them.
+- A field reference splits at the last `.`: `Rc<Point>.__value`.
+- Messages show a space after each comma (`Pair<int, str>`), and so does
+  the descriptor's name.
+- Function symbols mangle the instance name: `m.Pair..int.str.swap`.
+
+### Shared structs
+
+```
+shared struct T {x: int}
+```
+
+Every `new` of a shared struct is counted (the memory pass marks it
+`; counted` whatever escape analysis says), and the runtime never places
+one in an arena. The descriptor's `flags` word has bit 0 set.
+
+### `move` parameters
+
+```
+fn @m.Rc..Point.new(move %v: Point): Rc<Point> { ... }
+```
+
+`IrGlobal.moves` has bit i set for a `move` parameter i. The use-after-free
+check (section 19) treats a call of such a function as moving a local
+variable passed there: a later use or free of it, on every path, is a
+compile error. The flag changes no code.
+
+### Struct descriptors
+
+```
+.Lstruct.K:    .quad K+1, .Lsname.K, <nfields>, .Lsfields.K, .Lsftys.K, <nmethods>, .Lsmeth.K, <drop>, <show>, <flags>
+```
+
+- `<drop>`: the struct's method `drop` (called when an instance dies), or 0.
+- `<show>`: its method `show` when it takes only self and is declared to
+  return `str` (print shows the string it returns), or 0.
+- `<flags>`: 1 for a shared struct.
+- The v0.7 words `<kind>` and `<rc>` are gone.
+
+### Ownership changes
+
+- A dynamic `getfield` (no struct, `.name`) returns a reference of its own:
+  the runtime may have read it through a `deref` result. Static `getfield`
+  and `load` still return the slot's reference.
+- When a module has a struct with `drop`, the optimizer does not forward
+  loads of globals and fields across instructions (a release inserted later
+  may run Luma code). When it has a `show` hook, `luma_write`, `luma_print`
+  and `luma_show` count as calls that may run Luma code.
+
+### Runtime functions used by lowering
+
+| Function | Called for |
+|---|---|
+| `luma_dispose(v)` | `dispose(v)` |
+| `luma_refcount(v)` | `refcount(v)` |
+| `luma_arena_create()`, `luma_arena_enter(a)`, `luma_arena_leave()`, `luma_arena_destroy(state)` | the prelude's arena intrinsics |
+| `luma_show(v)` | the prelude's `__show(v)`: `v` as print shows it inside a struct, as a new string |
+
+`luma_rc_new`, `luma_rc_get` and `luma_rc_count` were removed.
+`luma_method` may return a trampoline for a receiver that lacks the method
+but has `deref`; compiled code calls it at once with the receiver and the
+arguments, as it would the method.
 
