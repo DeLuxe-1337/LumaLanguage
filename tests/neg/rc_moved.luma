@@ -1,0 +1,7 @@
+struct P { x: int }
+fun f() {
+  var p = P { x: 1 };
+  var r = Rc::new(p);
+  print(p.x);
+}
+f();

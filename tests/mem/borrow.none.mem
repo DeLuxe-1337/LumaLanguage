@@ -1,0 +1,2 @@
+luma: memcheck: --mm=none, 12 allocated, 0 freed, 12 leaked, 0 reachable from globals
+luma: memcheck: leaked: 4 Holder, 3 Rc<Holder>, 5 str

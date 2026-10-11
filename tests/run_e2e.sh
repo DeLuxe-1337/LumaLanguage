@@ -270,7 +270,7 @@ done
 printf '== memory management ==\n'
 for src in tests/mem/*.luma; do
     name=$(basename "$src" .luma)
-    for mm in manual rc none; do
+    for mm in manual none; do
         [ -f "tests/mem/$name.$mm.mem" ] || continue
         want_out="tests/mem/$name.out"
         [ -f "tests/mem/$name.$mm.out" ] && want_out="tests/mem/$name.$mm.out"
@@ -291,9 +291,9 @@ for src in tests/mem/*.luma; do
     done
 done
 
-# Every positive program under the other memory modes, with memcheck on (a
-# use of freed memory would be a runtime error): same output, exit 0.
-for mm in rc none; do
+# Every positive program again with memcheck on (a use of freed memory would
+# be a runtime error), and under --mm=none: same output, exit 0.
+for mm in manual none; do
     for src in tests/pos/*.luma; do
         name=$(basename "$src" .luma)
         lvl=2
@@ -316,11 +316,17 @@ check "--mm=manual writes OUT.mem.lir; the print temporary is released" sh -c \
 check "--mm=none: no OUT.mem.lir, no reference counting" sh -c \
     "rm -f $OUT/tn.mem.lir && $LUMA --mm=none $OUT/temps.luma -o $OUT/tn && [ ! -e $OUT/tn.mem.lir ] && ! grep -q 'luma_r[ce]' $OUT/tn.s"
 check "typed integer code gets no retain/release (fib)" sh -c \
-    "$LUMA --mm=rc bench/fib_typed.luma -o $OUT/fibrc && ! awk '/^fn @fn.fib/,/^}/' $OUT/fibrc.mem.lir | grep -q 'retain\|release'"
-check "--dump-mem-ir prints the memory-lowered IR" sh -c "$LUMA --mm=rc $OUT/temps.luma -S -o $OUT/t2 --dump-mem-ir | grep -q '^memory rc'"
+    "$LUMA bench/fib_typed.luma -o $OUT/fibrc && ! awk '/^fn @fn.fib/,/^}/' $OUT/fibrc.mem.lir | grep -q 'retain\|release'"
+check "--dump-mem-ir prints the memory-lowered IR" sh -c "$LUMA $OUT/temps.luma -S -o $OUT/t2 --dump-mem-ir | grep -q '^memory manual'"
 check "retain/release cannot be written in LIR" sh -c \
-    "printf 'module \"m\"\nmemory rc\nfn @luma_main() {\ne:\n  %%x = const nil\n  retain %%x\n  ret %%x\n}\n' > $OUT/rr.lir && ! $LUMA $OUT/rr.lir -o $OUT/rr 2>$OUT/e && grep -q 'inserted by the compiler' $OUT/e"
+    "printf 'module \"m\"\nmemory manual\nfn @luma_main() {\ne:\n  %%x = const nil\n  retain %%x\n  ret %%x\n}\n' > $OUT/rr.lir && ! $LUMA $OUT/rr.lir -o $OUT/rr 2>$OUT/e && grep -q 'inserted by the compiler' $OUT/e"
 check "unknown --mm mode is reported" sh -c "! $LUMA --mm=gc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'unknown memory mode' $OUT/e"
+printf 'struct P { x: int }\nvar a = nil;\nvar b = nil;\nfun setup() { a = Rc::new(P { x: 1 }); b = a; }\nfun count() { return Rc::count(a); }\nsetup();\nprint(count());\nb = nil;\nprint(count());\n' >"$OUT/rcc.luma"
+for lvl in 0 2; do
+    check "Rc::count sees the handles held by globals (-O$lvl)" sh -c \
+        "$LUMA -O$lvl $OUT/rcc.luma -o $OUT/rcc$lvl && [ \"\$($OUT/rcc$lvl | tr '\\n' ' ')\" = '2 1 ' ]"
+done
+check "--mm=rc points to Rc::new" sh -c "! $LUMA --mm=rc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'use Rc::new' $OUT/e"
 
 # ---------------------------------------------------------- C FFI
 printf '== C FFI (extern fun) ==\n'

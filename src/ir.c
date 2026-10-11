@@ -43,6 +43,11 @@ void ir_ty_describe(const IrModule *m, IrTy t, const char *sep, char *buf, size_
     int c = scomp(t);
     const char *sname = c == -1 ? "struct"
                       : (c >= 0 && m && c < m->nstructs) ? m->structs[c].name : c >= 0 ? "?struct" : NULL;
+    char disp[300];
+    if (c >= 0 && sname && strcmp(sep, "|") != 0) { /* messages use Rc<Point>, the text form Rc.Point */
+        ir_struct_display(sname, disp, sizeof disp);
+        sname = disp;
+    }
     if ((t & TY_ANY) == TY_ANY && c == -1) { snprintf(buf, n, "any"); return; }
     if ((t & TY_ANY) == 0) { snprintf(buf, n, "never"); return; }
     /* T? : exactly one non-nil member plus nil */
@@ -104,11 +109,24 @@ bool ir_ty_parse(const IrModule *m, const char *s, IrTy *out) {
 
 /* ---- structs ---- */
 
+IrStructKind ir_struct_kind_of(const char *name) {
+    if (strcmp(name, "Rc") == 0 || strncmp(name, "Rc.", 3) == 0) return IR_STRUCT_RC;
+    if (strcmp(name, "Arena") == 0) return IR_STRUCT_ARENA;
+    return IR_STRUCT_USER;
+}
+
+void ir_struct_display(const char *name, char *buf, size_t n) {
+    if (strcmp(name, "Rc") == 0) snprintf(buf, n, "Rc<any>");
+    else if (strncmp(name, "Rc.", 3) == 0) snprintf(buf, n, "Rc<%s>", name + 3);
+    else snprintf(buf, n, "%s", name);
+}
+
 int ir_add_struct(IrModule *m, const char *name) {
     m->structs = xrealloc(m->structs, (size_t)(m->nstructs + 1) * sizeof *m->structs);
     IrStruct *st = &m->structs[m->nstructs];
     memset(st, 0, sizeof *st);
     st->name = xstrdup(name);
+    st->kind = ir_struct_kind_of(name);
     return m->nstructs++;
 }
 
@@ -186,7 +204,7 @@ int ir_instr_uses(IrInstr *in, int **ptrs) {
     int n = 0;
     switch (in->op) {
     case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
-    case IR_RETAIN: case IR_RELEASE:
+    case IR_RETAIN: case IR_RELEASE: case IR_KEEP:
         ptrs[n++] = &in->a;
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
@@ -498,7 +516,7 @@ bool ir_block_terminated(const IrBlock *b) { return b->n > 0 && ir_op_is_termina
 bool ir_op_is_binary(IrOp op) { return op >= IR_ADD && op <= IR_GE; }
 bool ir_op_is_unary(IrOp op) { return op == IR_NEG || op == IR_NOT; }
 
-const char *ir_mm_name(IrMemMode mm) { return mm == IR_MM_RC ? "rc" : mm == IR_MM_MANUAL ? "manual" : "none"; }
+const char *ir_mm_name(IrMemMode mm) { return mm == IR_MM_MANUAL ? "manual" : "none"; }
 
 const char *ir_op_name(IrOp op) {
     switch (op) {
@@ -526,6 +544,7 @@ const char *ir_op_name(IrOp op) {
     case IR_GETFIELD: return "getfield";
     case IR_SETFIELD: return "setfield";
     case IR_CALLM: return "callm";
+    case IR_KEEP: return "keep";
     case IR_RETAIN: return "retain";
     case IR_RELEASE: return "release";
     case IR_PHI: return "phi";
@@ -587,7 +606,7 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
     case IR_CONST_TRUE: buf_printf(out, "const true"); break;
     case IR_CONST_FALSE: buf_printf(out, "const false"); break;
     case IR_CONST_DATA: buf_printf(out, "const @%s", gname(m, in->global)); break;
-    case IR_MOV: case IR_NEG: case IR_NOT: case IR_RETAIN: case IR_RELEASE:
+    case IR_MOV: case IR_NEG: case IR_NOT: case IR_RETAIN: case IR_RELEASE: case IR_KEEP:
         buf_printf(out, "%s %%%s", ir_op_name(in->op), vname(f, in->a));
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:

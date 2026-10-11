@@ -338,7 +338,7 @@ static bool take_field_ref(P *p, IrInstr *in) {
     }
     char sname[256];
     snprintf(sname, sizeof sname, "%s", p->tok.text);
-    char *dot = strchr(sname, '.');
+    char *dot = strrchr(sname, '.'); /* (builtin struct names contain dots: Rc.Point.value) */
     *dot = '\0';
     int sid = ir_find_struct(p->m, sname);
     if (sid < 0) {
@@ -521,6 +521,15 @@ static bool parse_instr(P *p, int fi, int bi) {
         next(p);
         return parse_callm_tail(p, fi, bi, IR_NONE, line);
     }
+    if (is_ident(p, "keep")) {
+        next(p);
+        int v;
+        if (!take_vreg(p, f, &v)) return false;
+        IrInstr *in = ir_emit(f, bi, IR_KEEP);
+        in->a = v;
+        in->line = line;
+        return true;
+    }
     if (is_ident(p, "retain") || is_ident(p, "release")) {
         perr(p, line, "'%s' is inserted by the compiler's memory pass and cannot be written in LIR "
                       "(declare `memory manual` or `memory rc` instead)", p->tok.text);
@@ -694,7 +703,7 @@ static bool prescan_structs(P *p) {
             j += 6;
             while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
             size_t k = j;
-            while (k < p->len && name_char((unsigned char)p->src[k], k == j) && p->src[k] != '.') k++;
+            while (k < p->len && name_char((unsigned char)p->src[k], k == j)) k++;
             char name[256];
             if (k == j || k - j >= sizeof name) {
                 perr(p, line, "expected a struct name");
@@ -702,6 +711,10 @@ static bool prescan_structs(P *p) {
             }
             memcpy(name, p->src + j, k - j);
             name[k - j] = '\0';
+            if (strchr(name, '.') && (strncmp(name, "Rc.", 3) != 0 || strchr(name + 3, '.'))) {
+                perr(p, line, "struct names cannot contain '.' (except the builtin Rc.S)");
+                return false;
+            }
             if (ir_find_struct(p->m, name) >= 0) {
                 perr(p, line, "duplicate struct '%s'", name);
                 return false;
@@ -817,8 +830,10 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
         next(&p);
         if (is_ident(&p, "none")) out->mm = IR_MM_NONE;
         else if (is_ident(&p, "manual")) out->mm = IR_MM_MANUAL;
-        else if (is_ident(&p, "rc")) out->mm = IR_MM_RC;
-        else { perr(&p, p.tok.line, "expected a memory mode (none, manual or rc)"); goto fail; }
+        else if (is_ident(&p, "rc")) {
+            perr(&p, p.tok.line, "memory mode 'rc' was removed: use Rc::new for shared ownership (memory manual)");
+            goto fail;
+        } else { perr(&p, p.tok.line, "expected a memory mode (none or manual)"); goto fail; }
         next(&p);
         if (!expect_nl(&p)) goto fail;
     }

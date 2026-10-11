@@ -54,7 +54,7 @@ static const struct {
     const char *word;
     TokenKind kind;
 } KEYWORDS[] = {
-    {"and", TOK_AND},       {"class", TOK_CLASS}, {"else", TOK_ELSE},     {"extern", TOK_EXTERN},
+    {"and", TOK_AND},       {"arena", TOK_ARENA}, {"class", TOK_CLASS}, {"else", TOK_ELSE},     {"extern", TOK_EXTERN},
     {"false", TOK_FALSE},
     {"for", TOK_FOR},       {"fun", TOK_FUN},     {"if", TOK_IF},         {"impl", TOK_IMPL},    {"nil", TOK_NIL},
     {"or", TOK_OR},         {"return", TOK_RETURN}, {"struct", TOK_STRUCT}, {"super", TOK_SUPER},
@@ -247,7 +247,7 @@ const char *token_kind_name(TokenKind k) {
     static const char *const names[] = {
         "LEFT_PAREN", "RIGHT_PAREN", "LEFT_BRACE", "RIGHT_BRACE", "COMMA", "DOT", "MINUS", "PLUS",
         "SEMICOLON", "SLASH", "STAR", "COLON", "QUESTION", "COLON_COLON", "BANG", "BANG_EQUAL", "EQUAL", "EQUAL_EQUAL", "GREATER",
-        "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "AND", "CLASS",
+        "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "AND", "ARENA", "CLASS",
         "ELSE", "EXTERN", "FALSE", "FOR", "FUN", "IF", "IMPL", "NIL", "OR", "RETURN", "STRUCT", "SUPER", "THIS", "TRUE",
         "VAR", "WHILE", "EOF",
     };

@@ -69,7 +69,7 @@ None of these are part of the pipeline.
 |---|---|
 | `OUT.lir` | Front end (`lexer`, `parser`) and lowering (`lower.c`). This is Luma's IR in its text form; see [docs/IR.md](docs/IR.md). |
 | `OUT.opt.lir` | The optimizer (`opt*.c`, at `-O2`, the default): constant propagation and branch folding, CSE, loop-invariant code motion, dead-code elimination and CFG cleanup on SSA form. It must pass the IR verifier again. |
-| `OUT.mem.lir` | The memory pass (`mem.c`, with `--mm=manual` or `rc`): which allocations are reference counted, and every `retain` and `release` the compiler inserted. |
+| `OUT.mem.lir` | The memory pass (`mem.c`, with `--mm=manual`): which allocations are reference counted, and every `retain` and `release` the compiler inserted. |
 | `OUT.s` | The backend, after the IR verifier passes. At `-O1`/`-O2` this is `x86_gen.c`: linear-scan register allocation, inline integer fast paths with out-of-line runtime calls, compare/branch fusion and tail calls. At `-O0` it is the naive `x86_isel.c`, with one stack slot per value. The output is readable Intel-syntax assembly, with each LIR instruction shown as a comment. |
 | `OUT.o` | Luma's assembler (`asm.c`) and ELF writer (`elf_writer.c`). The assembler reads `OUT.s` back from disk. |
 | `OUT` | The system linker: `cc -o OUT OUT.o build/libluma_rt.a`. |
@@ -88,7 +88,7 @@ Options:
 --dump-ir       print the LIR module
 --dump-opt-ir   print the optimized LIR module
 -O0 / -O1 / -O2 naive backend / optimizing backend / optimizer + optimizing backend (default)
---mm=MODE       memory management: manual (default), rc or none (see below)
+--mm=MODE       memory management: manual (default) or none (see below)
 --dump-mem-ir   print the IR after the memory pass
 -v              print each stage and the exact link command
 -l LIB, -L DIR  link a C library / add a library search directory
@@ -116,6 +116,7 @@ Its input language, encodings and relocation rules are specified in
 | | |
 |---|---|
 | Values | 63-bit integers, strings, `true`, `false`, `nil`, struct instances |
+| Builtin types | `Rc<T>` (a counted box: `Rc::new`, `Rc::get`, `Rc::count`) and `Arena` (the value of `arena { … }`); see below. |
 | Structs | `struct P { x: int, y }` declares fields (typed or untyped). `P { x: 1, y }` builds one (every field, any order, `y` is shorthand for `y: y`). Instances are references: assignment shares, `==` is identity, and they are always truthy. `print` shows `P { x: 1, y: "s" }`. |
 | `impl` | `impl P { fun m(self, a) { … } fun new(…) { … } }` adds methods (first parameter `self`, untyped) and associated functions (no `self`). Call them as `p.m(1)`, `P::new(…)` or `P::m(p, 1)`. Several `impl` blocks per struct are allowed. When the object's static type is exactly `P`, field access and method calls are compiled statically; otherwise they are looked up by name at runtime, with the same error messages. |
 | Functions | `fun name(a, b) { … return v; }` at top level, called as `name(x, y)`. Recursion and mutual recursion work, and functions can be called before their definition. Up to 6 parameters. Arity is checked at compile time. A missing `return` returns `nil`. |
@@ -126,7 +127,7 @@ Its input language, encodings and relocation rules are specified in
 | Operators | `= or and == != < <= > >= + - * / ! -` (unary), and `+` on two strings concatenates them |
 | Variables | Top-level variables are globals that functions can read and write. Variables in blocks and functions are local, with lexical scoping checked at compile time. |
 | Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Integer overflow, type errors, reading a global before it is assigned, and stack overflow are runtime errors (exit status 1). `/` is floor division. |
-| Memory | Chosen per build with `--mm` (below). `free(x)` frees a struct instance in `manual` mode and is accepted (and does nothing) in the others, so a program compiles in every mode. Using a variable after `free` on every path is a compile error. |
+| Memory | Manual by default (below): `free(x)` for struct instances, `Rc::new(x)` for shared ownership, `arena { … }` for bulk lifetimes; strings are automatic. `--mm=none` never frees, and `free` then does nothing, so a program compiles in both modes. Using a variable after `free` or after moving it into an Rc, on every path, is a compile error. |
 | Not yet | first-class functions and closures, traits/interfaces, floats (including C `f32`/`f64`), C structs and callbacks, `break`, collecting reference cycles |
 
 ## Memory management
@@ -159,18 +160,68 @@ for (var i = 0; i < 3; i = i + 1) list = Node { value: i, label: greet("node"), 
 destroy(list);
 list = nil;
 print(greet("luma") + "!", dist2(3, 4));   // both strings are freed after print
+
+// Rc: shared ownership. The last handle frees the box and the Point in it.
+var shared: Rc<Point>? = Rc::new(Point { x: 1, y: 2 });
+var other = shared;                   // a second handle to the same Point
+other.x = 10;                         // fields and methods go through the box
+print(shared.x, shared.len2(), Rc::count(shared));
+other = nil;
+shared = nil;                         // count reaches 0: both are freed
+
+// Arenas: everything allocated inside is freed together at the end.
+fun chain(n: int): Node? {
+  var head: Node? = nil;
+  for (var i = 0; i < n; i = i + 1) head = Node { value: i, label: "n", next: head };
+  return head;
+}
+arena {
+  var c = chain(1000);                // 1000 Nodes, no free() needed
+  print(c.value);
+}
+var a = arena { };                    // a named arena, kept by its handle
+arena a { list = chain(10); }         // re-enter it later
+print(list.value);
+list = nil;
+a = nil;                              // the last handle frees the 10 Nodes
 ```
 
-| `--mm=` | Struct instances | Strings and temporaries |
-|---|---|---|
-| `manual` (default) | yours to `free()`; instances that provably never leave their function are freed for you | freed automatically at their last use |
-| `rc` | reference counted (ARC-style); cycles leak | reference counted |
-| `none` | never freed | never freed |
+Output, with `LUMA_MEMCHECK=1`:
+
+```
+hello, luma! 25
+10 104 2
+999
+9
+luma: memcheck: --mm=manual, 1023 allocated, 1023 freed, 0 leaked, 0 reachable from globals
+```
+
+Memory is manual: what you allocate you free, and the compiler takes care of
+the rest.
+
+| | Freed |
+|---|---|
+| Strings and temporaries | automatically, at their last use |
+| Struct instances | by `free(x)`; instances that provably never leave their function are freed for you |
+| `Rc::new(x)` | when the last handle goes away; the box owns `x` (using `x` afterwards is a compile error) |
+| Inside `arena { … }` | every struct allocated in the block, including in functions it calls, at the end of the block (or when the last handle of a named arena goes away). `free()` on them does nothing |
+
+- `Rc<T>` handles are counted references: copying one shares the box, and
+  field access and method calls go through it (`r.x`, `r.len2()`).
+  `Rc::get(r)` returns the value, `Rc::count(r)` the number of handles (a
+  debugging aid: temporaries the optimizer keeps alive count too). Cycles of
+  Rc boxes leak.
+- `var a = arena { … };` keeps the arena; `arena a { … }` allocates into it
+  again. Strings and Rc boxes are never placed in an arena. A reference
+  that outlives its arena is a use after free (`LUMA_MEMCHECK=1` reports it).
+- `--mm=none` frees nothing, which is useful to compare against.
 
 The compiler inserts the retain/release operations itself, after
 optimization, using liveness and ownership:
 - Parameters are borrowed, so passing an object costs nothing.
 - A last use moves a reference instead of copying it.
+- Reading a field or global that nothing can free before the value is used
+  borrows it, with no retain/release.
 - Values whose type can't be a heap object get no operations at all: typed
   integer code compiles exactly as before.
 
@@ -178,13 +229,15 @@ optimization, using liveness and ownership:
 see what it leaves behind:
 
 ```
-$ luma --mm=rc tests/mem/graphs.luma -o graphs && LUMA_MEMCHECK=1 ./graphs
+$ luma tests/mem/graphs.luma -o graphs && LUMA_MEMCHECK=1 ./graphs
 124750
 9 7
-luma: memcheck: --mm=rc, 1016 allocated, 1009 freed, 3 leaked, 4 reachable from globals
-luma: memcheck: leaked: 3 Pair
-luma: memcheck: reachable from globals: 1 Node, 3 Pair
+luma: memcheck: --mm=manual, 2032 allocated, 2018 freed, 6 leaked, 8 reachable from globals
+luma: memcheck: leaked: 3 Pair, 3 Rc<Pair>
+luma: memcheck: reachable from globals: 1 Node, 3 Pair, 1 Rc<Node>, 3 Rc<Pair>
 ```
+
+The 6 leaked objects are two Rc cycles (a box that refers to itself, and a ring of two) with their values; see `tests/mem/graphs.luma`.
 
 The design, the analyses and the runtime are described in
 [docs/DESIGN.md](docs/DESIGN.md) ("Memory").
@@ -222,7 +275,7 @@ machine (`make bench`, best of 5, wall time):
 | strings (3M concatenations) | 0.09 s | 0.008 s | 11.7×* |
 | structs (20M method calls, list walks) | 1.52 s | 0.11 s | 14.3× |
 
-These are in the default `--mm=manual`. At `-O2` the three memory modes are
+These are in the default `--mm=manual`. At `-O2` the two memory modes are
 within a few percent of each other on every benchmark (`docs/DESIGN.md`,
 "Memory").
 

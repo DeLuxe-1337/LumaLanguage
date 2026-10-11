@@ -1,10 +1,12 @@
-# LIR: the Luma intermediate representation (spec v0.6)
+# LIR: the Luma intermediate representation (spec v0.7)
 
 **Status:** implemented in milestone 2 and extended since: section 15 (v0.2,
 milestone 3), section 16 (v0.3, milestone 4), section 17 (v0.4, milestone
 5: types, `check`, the optimizer and the optimizing backend), section 18
 (v0.5, milestone 6: structs, field access and method calls) and section 19
-(v0.6, milestone 7: memory modes, retain/release). The decisions
+(v0.6, milestone 7: memory modes, retain/release) and section 20 (v0.7,
+milestone 8: `Rc` and `Arena` builtin structs, `keep`, `memory rc`
+removed). The decisions
 in section 13 are resolved, and the places where the implementation refined
 the original draft are listed in section 14.
 **Scope:** this spec covers:
@@ -808,9 +810,9 @@ memory manual
 
 An optional line right after `module` gives the module's memory-management
 mode: `none` (the default when the line is absent, so older LIR files keep
-their meaning), `manual` or `rc`. `luma` writes `memory manual` for a
-`.luma` input unless `--mm` says otherwise, and `--mm` overrides the line of
-a `.lir` input. The mode does not change what any instruction in the text
+their meaning) or `manual` (`rc` was removed in v0.7, section 20). `luma`
+writes `memory manual` for a `.luma` input unless `--mm` says otherwise, and
+`--mm` overrides the line of a `.lir` input. The mode does not change what any instruction in the text
 form means. It decides what the memory pass inserts afterwards, and how
 `store` and `setfield` treat the value they overwrite (below).
 
@@ -819,11 +821,11 @@ form means. It decides what the memory pass inserts afterwards, and how
 The text form of LIR, as written to `OUT.lir` and `OUT.opt.lir` and as
 accepted by the parser, never contains reference-counting operations. The
 memory pass (`mem.c`, docs/DESIGN.md "Memory") runs after the optimizer, on
-the final IR, when the mode is `manual` or `rc`. It:
+the final IR, when the mode is `manual`. It:
 
-1. decides for every `new` whether its instances are counted (always in
-   `rc`; in `manual` when escape analysis proves they never leave their
-   function); and
+1. decides for every `new` whether its instances are counted (when escape
+   analysis proves they never leave their function, and always for the
+   builtin `Rc` and `Arena` structs); and
 2. inserts `retain` and `release` so that every counted reference held by a
    vreg, a field or a global is released exactly once.
 
@@ -851,7 +853,7 @@ counted object (immediates, string literals, uncounted instances). In
 - `store`, `setfield` and the arguments of `new` take over the reference to
   their value. `mov` and `check` move or copy a reference.
 
-**Overwritten slots.** In modes `manual` and `rc`:
+**Overwritten slots.** In mode `manual`:
 - `store` and static `setfield` release the value they overwrite when the
   pass has set their flag (`IrInstr.imm` = 1: the slot's type may hold a
   counted object). The global's slot may be 0 (never assigned), which is
@@ -887,4 +889,78 @@ accepted.
 Every program also defines `luma_mm` (`.quad` mode) and `luma_globals`
 (`.quad count` followed by the address of each global variable's slot) in
 `.data`. These are `R_X86_64_64` relocations like the struct descriptors.
+
+## 20. v0.7 additions (milestone 8)
+
+### `memory rc` removed
+
+`memory rc` is a parse error (`memory mode 'rc' was removed: use Rc::new
+...`), as is `--mm=rc`. Shared ownership is the `Rc` builtin struct below.
+`luma_mm` is 0 (`none`) or 1 (`manual`).
+
+### Builtin structs
+
+Lowering adds these structs to the module, after the user's, only when the
+program uses `Rc` or `arena`:
+
+```
+struct Rc {value}               ; Rc<any>
+struct Rc.Point {value: Point}  ; Rc<Point>, one per user struct
+struct Arena {state: int}
+```
+
+- A struct name may contain one `.` only in the form `Rc.S`; `S` must be a
+  user struct of the module. In a field reference the struct name ends at
+  the last `.`: `getfield %r, Rc.Point.value`.
+- The kind follows from the name: `Rc` and `Rc.S` are *rc*, `Arena` is
+  *arena*, everything else is *user*. Error messages and type
+  descriptions show `Rc.S` as `Rc<S>`, and `Rc` as `Rc<any>`.
+- Builtin structs have no methods in LIR. `Arena.state` is managed by the
+  runtime (a pointer to the arena's state with bit 0 set, or fixnum 0 before
+  it is first entered); `const 0` then `new Arena(%z)` creates one.
+- The memory pass always counts `new` of a builtin struct.
+
+### `keep`
+
+```
+%6 = getfield %5, Rc.Holder.value
+%7 = getfield %6, Holder.s
+keep %5
+```
+
+`keep %v` reads `%v` and does nothing else: no destination, no code. It
+exists for liveness: lowering emits it after an access through an `Rc` box,
+so the box (and the value it owns) stays alive until the access's result
+has been taken over (docs/DESIGN.md, "Memory"). The optimizer treats it as
+an effect (it is never removed), it may appear in hand-written LIR, and the
+backends allow it between a compare and the `br` it is fused with.
+
+### Runtime functions used by lowering
+
+| Function | Called for |
+|---|---|
+| `luma_rc_new(v)` | `Rc::new(v)` when `v`'s struct is not known statically: builds the `Rc.S` box for `v`'s struct, or `Rc` |
+| `luma_rc_get(r)`, `luma_rc_count(r)` | `Rc::get`, `Rc::count` (checks that `r` is a box) |
+| `luma_arena_enter(a)` | start of `arena { … }`: pushes `a` |
+| `luma_arena_leave()` | end of the block, and before a `ret` inside it: pops |
+
+`luma_getfield`, `luma_setfield` and `luma_method` look through a box to its
+value. Method tables of `Rc.S` hold generated functions `m.Rc.S.f` that read
+`value` and call `S`'s method `f`.
+
+### Data emitted for structs
+
+Each descriptor gains two words after the method table:
+
+```
+.Lstruct.K:    .quad K+1, .Lsname.K, <nfields>, .Lsfields.K, .Lsftys.K, <nmethods>, .Lsmeth.K, <kind>, <rc>
+```
+
+- `<kind>` is 0 (user), 1 (rc) or 2 (arena).
+- `<rc>` is `.Lstruct.J` for the `Rc.S` struct of a user struct `S` when the
+  module has one, else 0.
+- `.Lsname.K` is the display name (`Rc<Point>`).
+
+An instance's descriptor word has bit 0 set when the instance lives in an
+arena; the runtime masks it.
 

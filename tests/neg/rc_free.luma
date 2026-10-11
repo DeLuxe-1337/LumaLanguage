@@ -1,0 +1,3 @@
+struct P { x: int }
+var r: Rc<P> = Rc::new(P { x: 1 });
+free(r);

@@ -1,0 +1,3 @@
+luma: memcheck: --mm=none, 2 allocated, 0 freed, 1 leaked, 1 reachable from globals
+luma: memcheck: leaked: 1 Arena
+luma: memcheck: reachable from globals: 1 Node

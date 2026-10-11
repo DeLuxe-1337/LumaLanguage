@@ -1,0 +1,1 @@
+luma: memcheck: --mm=manual, 11 allocated, 11 freed, 0 leaked, 0 reachable from globals

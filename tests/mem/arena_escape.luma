@@ -1,0 +1,13 @@
+// A bug memcheck catches: an instance allocated in an arena outlives it by
+// being stored in a global. Once the arena is gone the instance is freed;
+// under LUMA_MEMCHECK=1 using it is a runtime error. (--mm=none frees
+// nothing, so the program runs.)
+struct Node { value: int, next: Node? }
+
+var keep: Node? = nil;
+arena {
+  keep = Node { value: 1, next: nil };
+  print(keep.value);
+}
+print("arena gone");
+print(keep.value);

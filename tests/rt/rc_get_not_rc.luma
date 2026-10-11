@@ -1,0 +1,2 @@
+fun dyn(x) { return x; }
+print(Rc::get(dyn(1)));

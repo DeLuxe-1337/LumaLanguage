@@ -118,10 +118,36 @@ static bool parse_args(Parser *p, Expr *c);
 static bool at_struct_literal(Parser *p);
 static Expr *struct_literal(Parser *p);
 
+static Stmt *block_body(Parser *p, const Token *open);
+
+/* arena { ... }   or   arena NAME { ... }   (the keyword is the current token) */
+static Expr *arena_expr(Parser *p) {
+    Token *kw = cur(p);
+    advance(p);
+    Expr *e = new_expr(EXPR_ARENA, kw);
+    if (check(p, TOK_IDENTIFIER)) {
+        Token *n = cur(p);
+        advance(p);
+        e->name = xstrndup(n->lexeme, n->lexeme_len);
+    }
+    Token *open = cur(p);
+    if (!consume(p, TOK_LEFT_BRACE, e->name ? "'{' after the arena's name" : "'{' or an arena's name after 'arena'")) {
+        expr_free(e);
+        return NULL;
+    }
+    e->body = block_body(p, open);
+    if (!e->body) {
+        expr_free(e);
+        return NULL;
+    }
+    return e;
+}
+
 static Expr *primary(Parser *p) {
     Token *t = cur(p);
     Expr *e;
     switch (t->kind) {
+    case TOK_ARENA: return arena_expr(p);
     case TOK_TRUE: advance(p); return new_expr(EXPR_TRUE, t);
     case TOK_FALSE: advance(p); return new_expr(EXPR_FALSE, t);
     case TOK_NIL: advance(p); return new_expr(EXPR_NIL, t);
@@ -452,7 +478,8 @@ static Expr *expression(Parser *p) { return assignment(p); }
 static Stmt *declaration(Parser *p);
 static Stmt *statement(Parser *p);
 
-/* type → ( IDENTIFIER | "nil" ) "?"?   Names are validated by lowering. */
+/* type → ( IDENTIFIER ( "<" IDENTIFIER ">" )? | "nil" ) "?"?
+ * Names are validated by lowering; Rc<T> is the only generic type. */
 static bool parse_type(Parser *p, TypeRef *out) {
     Token *t = cur(p);
     if (t->kind != TOK_IDENTIFIER && t->kind != TOK_NIL) {
@@ -463,6 +490,16 @@ static bool parse_type(Parser *p, TypeRef *out) {
     out->name = xstrndup(t->lexeme, t->lexeme_len);
     out->line = t->line;
     out->col = t->col;
+    if (t->kind == TOK_IDENTIFIER && match(p, TOK_LESS)) {
+        Token *a = cur(p);
+        if (!consume(p, TOK_IDENTIFIER, "a type name after '<'")) return false;
+        out->arg = xstrndup(a->lexeme, a->lexeme_len);
+        if (check(p, TOK_GREATER_EQUAL)) {
+            error_at(p, cur(p), "write a space between '>' and '=' (e.g. Rc<Point> = ...)");
+            return false;
+        }
+        if (!consume(p, TOK_GREATER, "'>' after the type argument")) return false;
+    }
     out->nullable = match(p, TOK_QUESTION);
     return true;
 }
@@ -685,6 +722,14 @@ static Stmt *statement(Parser *p) {
     case TOK_WHILE: advance(p); s = while_statement(p, t); break;
     case TOK_FOR: advance(p); s = for_statement(p, t); break;
     case TOK_LEFT_BRACE: advance(p); s = block_body(p, t); break;
+    case TOK_ARENA: { /* arena { ... } as a statement: no ';' needed after the block */
+        Expr *e = arena_expr(p);
+        if (!e) { s = NULL; break; }
+        s = new_stmt(STMT_EXPR, t);
+        s->expr = e;
+        match(p, TOK_SEMICOLON);
+        break;
+    }
     default: {
         const char *u = unsupported_keyword(t->kind);
         if (u) { error_at(p, t, u); s = NULL; break; }
@@ -851,6 +896,7 @@ void expr_free(Expr *e) {
     free(e->field_col);
     free(e->str);
     free(e->name);
+    stmt_free(e->body);
     free(e);
 }
 
@@ -865,11 +911,15 @@ void stmt_free(Stmt *s) {
     stmt_free(s->body);
     for (size_t i = 0; i < s->nparams; i++) {
         free(s->params[i]);
-        if (s->param_types) free(s->param_types[i].name);
+        if (s->param_types) {
+            free(s->param_types[i].name);
+            free(s->param_types[i].arg);
+        }
     }
     free(s->params);
     free(s->param_types);
     free(s->type.name);
+    free(s->type.arg);
     free(s->param_line);
     free(s->param_col);
     free(s);
@@ -914,6 +964,8 @@ static void dump_string(const char *s, size_t n) {
     putchar('"');
 }
 
+static void dump_stmt(const Stmt *s, int indent);
+
 static void dump_expr(const Expr *e) {
     switch (e->kind) {
     case EXPR_INT: printf("%lld", (long long)e->ival); break;
@@ -952,6 +1004,11 @@ static void dump_expr(const Expr *e) {
         dump_expr(e->right);
         putchar(')');
         break;
+    case EXPR_ARENA:
+        printf("(arena%s%s\n", e->name ? " " : "", e->name ? e->name : "");
+        dump_stmt(e->body, 2);
+        printf(")");
+        break;
     case EXPR_STRUCT:
         printf("(new %s", e->name);
         for (size_t i = 0; i < e->nargs; i++) {
@@ -965,7 +1022,10 @@ static void dump_expr(const Expr *e) {
 }
 
 static void dump_type(const TypeRef *t) {
-    if (t->name) printf(":%s%s", t->name, t->nullable ? "?" : "");
+    if (!t->name) return;
+    printf(":%s", t->name);
+    if (t->arg) printf("<%s>", t->arg);
+    printf("%s", t->nullable ? "?" : "");
 }
 
 static void dump_params(const Stmt *s) {

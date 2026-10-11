@@ -29,7 +29,7 @@ INPUT.luma
    │  src/opt*.c         -O2: SSA optimizer (src/cfg.c analyses)          ──► OUT.opt.lir
    │  src/ir_verify.c    the optimized IR must verify too
    ▼
-   │  src/mem.c          --mm=manual|rc: escape analysis, retain/release      ──► OUT.mem.lir
+   │  src/mem.c          --mm=manual: escape analysis, retain/release         ──► OUT.mem.lir
    ▼
    │  src/x86_gen.c      -O1/-O2: LIR → x86-64, register allocated        ──► OUT.s
    │  src/x86_isel.c     -O0: LIR → x86-64, one stack slot per vreg
@@ -276,31 +276,138 @@ as `.Lstruct.K`, field and method names as `.Lname.NAME`.
 in `--mm=manual` (or automatically for instances that never leave their
 function), reference counting in `--mm=rc`. See "Memory" below.
 
-## Memory (milestone 7)
+## Memory (milestones 7 and 8)
 
-Every compilation chooses one memory-management mode with `--mm`:
+Memory is manual by default, with two library-like tools for the cases
+where manual freeing is awkward: `Rc<T>` for shared ownership and arenas for
+bulk lifetimes. Strings are always automatic.
 
-| Mode | Struct instances | Strings | `free(x)` |
-|---|---|---|---|
-| `manual` (default) | yours: freed by `free(x)`; the compiler also frees instances it can prove never leave their function | freed automatically at their last use | frees `x` and releases the strings in its fields |
-| `rc` | reference counted: freed when the last reference goes away; cycles leak | reference counted | checks its argument, frees nothing |
-| `none` | never freed | never freed | checks its argument, frees nothing |
+| | `--mm=manual` (default) | `--mm=none` |
+|---|---|---|
+| Strings, temporaries | freed at their last use | never freed |
+| Struct instances | freed by `free(x)`; also by the compiler when it proves they never leave their function | never freed |
+| `Rc::new(x)` boxes | freed with their value when the last handle goes | never freed |
+| Structs allocated inside `arena { … }` | freed together when the arena ends | never freed |
+| `free(x)` | frees `x` and releases the strings in its fields; does nothing for an arena object | checks its argument, frees nothing |
 
-The same program compiles in every mode, and its output never depends on
-the mode. `--mm=none` is the old behaviour and the fastest choice for
-short-lived programs. Programs written for `manual` run unchanged under `rc`,
-which is a way to find out whether they free everything.
+The same program compiles in both modes, and its output never depends on
+the mode. `--mm=none` is the fastest choice for short-lived programs, and a
+baseline to compare memcheck reports against.
+
+**Why `Rc` is a type, not a mode.** Milestone 7 also had `--mm=rc`, which
+reference-counted every object in the program. It was removed in milestone
+8:
+- It changed the meaning of `free` (a no-op) and of every struct for the
+  whole build, so a program could not mix the two styles, and a library
+  could not say which one it expected.
+- Reference counting is the right tool for a few shared objects, not for
+  every allocation. As a wrapper, the cost is paid only where it is asked
+  for, and is visible in the type (`Rc<Point>`).
+- The machinery is the same: the compiler's retain/release insertion
+  (below) already counts strings and non-escaping instances, so an `Rc` box
+  is one more counted object.
+
+`--mm=rc` and `memory rc` in LIR are now errors that point to `Rc::new`.
 
 **`free(x)`** is a builtin, like `print`.
 - `x` must be a struct instance or `nil`. `free(nil)` does nothing.
 - `free("text")` and `free(1)` are compile errors when the type is known. At
   run time they are errors in every mode:
   `free() expects a struct instance, got str (strings are freed automatically).`
+- `free(r)` of an `Rc` or of an arena handle is a compile error (and a
+  runtime error when the type is only known then): they free themselves.
 - After `free(x)`, using `x` (or freeing it again) is an error in every mode:
   - A compile error when it happens on every path, checked on the lowered IR
     before optimization: `'p' is used after free(p) on line 4`.
   - Through an alias it is undefined behaviour in `manual` mode, as in C.
     `LUMA_MEMCHECK=1` turns it into a runtime error (below).
+
+### `Rc<T>`
+
+```js
+var a: Rc<Point>? = Rc::new(Point { x: 1, y: 2 });
+var b = a;          // a second handle to the same box
+b.x = 10;           // field access and method calls go through the box
+print(a.x);         // 10
+a = nil; b = nil;   // the last handle frees the box and the Point
+```
+
+- `Rc::new(x)` **moves** `x` into a new box. Using the variable `x`
+  afterwards is a compile error, by the same check as use after free:
+  `'p' was moved into an Rc on line 3; use the Rc instead (the Rc frees it)`.
+  Aliases of `x` are not tracked; freeing the value through one is a use
+  after free when the box later frees it (memcheck reports it).
+- A handle is a counted reference. Copying it (assignment, a field, an
+  argument) shares the box; the box is freed when its count reaches 0, and
+  it then frees its value: a manual instance is freed like `free` would, and
+  anything else (a string, another `Rc`, a counted instance) is released.
+- **Auto-deref.** `r.f`, `r.f = v` and `r.m(…)` on a handle access the value.
+  Statically (when the type is `Rc<S>`) this is a `getfield` of the box's
+  `value` field followed by the access on `S`. Dynamically the runtime's
+  field and method lookups look through boxes, and method tables of
+  `Rc<S>` hold generated forwarders `m.Rc.S.f` that unwrap and call `S`'s
+  method.
+- `Rc::get(r)` returns the value; `Rc::count(r)` the number of handles.
+  `count` is a debugging aid: a temporary the optimizer keeps in a register
+  also holds a handle, so the number can differ between `-O0` and `-O2`
+  inside one function. Counts held by fields and globals are exact.
+- Types: `Rc<S>` for a struct `S`, or `Rc<any>` for anything else (`Rc<int>`
+  and `Rc<str>` mean `Rc<any>`: the box is untyped). `Rc` alone and
+  `Rc<Unknown>` are compile errors. Cycles of boxes leak (memcheck lists
+  them).
+
+**Representation.** `Rc` is a builtin struct, added to the module only when
+the program uses it: `Rc` (`value: any`) and one `Rc.S` (`value: S`, shown
+as `Rc<S>`) for every user struct `S`. The descriptor records the kind
+(`user`, `rc`, `arena`) and, for a user struct, its `Rc.S` descriptor, so
+`luma_rc_new` can build the precise box for a value whose type is only known
+at run time. A box is always a counted object (`new Rc.S … ; counted`).
+
+**Keeping the box alive.** Auto-deref reads a field of the value through
+the box. If the box is a temporary, its last use is that read, so ownership
+would release it (and with it the value) before the field's value is used:
+
+```js
+print(Rc::new(Holder { s: cat("x", "y"), next: nil }).s);
+```
+
+Lowering therefore emits `keep %box` after the access: an instruction with
+no code whose only effect is to be a use, so liveness keeps the box (and the
+value it owns) until the field has been retained. The differential tester
+found this.
+
+### Arenas
+
+```js
+arena {                     // every struct allocated in here,
+  var c = chain(1000);      // including by functions it calls,
+  print(c.value);           // is freed at the end of the block
+}
+var a = arena { };          // an expression: the arena's handle
+arena a { list = chain(10); }   // allocate into it again
+a = nil;                    // the last handle frees everything in it
+```
+
+- An arena block pushes the arena on a runtime stack and pops it at the end
+  (and on `return` from inside it). While an arena is on top, every struct
+  instance that would be *manual* goes into it. Counted instances (the
+  non-escaping ones), strings and `Rc` boxes are allocated normally: they
+  already have a precise lifetime, and an arena could not free a string
+  that outlived it.
+- The handle is a counted object of the builtin struct `Arena`. The arena is
+  destroyed when the last handle goes: the block's own temporary, the
+  stack's reference, or a variable. Destruction walks the arena's objects,
+  releases what their fields hold, and frees the chunks.
+- `free(x)` of an arena object does nothing, so code that frees its
+  structures works unchanged inside an arena.
+- References that outlive their arena dangle, as in any region system.
+  `LUMA_MEMCHECK=1` reports the use (`tests/mem/arena_escape.luma`).
+  Compile-time region checking is future work.
+
+**Runtime.** Objects are bump-allocated from 64 KB chunks (an object larger
+than a chunk gets its own). An arena object's descriptor pointer has bit 0
+set; everything reads descriptors through `desc_of()`. Under memcheck each
+object is recorded, and the chunks are quarantined rather than freed.
 
 ### Ownership and reference counts
 
@@ -349,18 +456,31 @@ Refinements:
 - An operand that dies at an operation that only succeeds on fixnums (`sub`,
   `mul`, `div`, `mod`, `neg`, ordered compares) needs no release: if
   execution gets past it, the value was a fixnum.
+- **Borrowed reads.** A `load` or `getfield` needs no retain/release when
+  the slot is guaranteed to keep the value alive until its last use:
+  - every use is a borrowing use in the same block;
+  - no instruction up to the last use can free anything (stores, field
+    writes, retain/release, calls to Luma functions and methods, and runtime
+    calls other than printing and the `Rc` queries);
+  - for `getfield`, the object is still held after the last use. If the
+    object is itself a borrowed read, this is checked for the reference it
+    was read from, recursively (`r.next.s` relies on `r`).
+  `print(p.name)` thus costs no count traffic. `tests/mem/borrow.luma`
+  covers each condition, and mutations that drop one are caught by it.
 
 **Which vregs need operations at all.** Only vregs that may hold a counted
 object get any. That excludes:
 - ints, booleans and nil, by flow-insensitive type inference over every
   definition;
 - vregs that only ever hold string literals (static, never counted);
-- in `manual` mode, struct types that never have counted instances.
+- struct types that never have counted instances (no non-escaping
+  allocation site, never boxed). `Rc` and `Arena` objects are always
+  counted.
 
 Typed integer code is therefore unchanged: `fib(n: int)` has no reference
 counting at all.
 
-**Escape analysis (`manual` mode).** An allocation site's instances are
+**Escape analysis.** An allocation site's instances are
 counted, and so freed automatically, when they provably never leave the
 local values of their function. The analysis is interprocedural and works as
 follows:
@@ -392,7 +512,8 @@ fun dist2(a: int, b: int): int {
   count of 0 means *not counted*: string literals, everything in `none`, and
   manual struct instances.
 - **Allocation.** Strings created at run time are counted unless the mode is
-  `none`. `luma_new_struct(desc, counted)` gets `counted` from the compiler.
+  `none`. `luma_new_struct(desc, counted)` gets `counted` from the compiler;
+  an uncounted instance goes to the innermost active arena, if any.
 - **Freeing.** At count 0 the object is destroyed: its fields are released,
   and objects whose count reaches 0 in turn go on a worklist. Destruction is
   iterative, so dropping the head of a million-node list frees the whole
@@ -402,7 +523,9 @@ fun dist2(a: int, b: int): int {
   reference still reads a header with count 0, and the compiler's own
   retain/release on it stays a no-op instead of corrupting another object.
 - **Functions:** `luma_retain`, `luma_release` (-O0), `luma_rc_free` (the
-  last reference; called by the inline fast paths), `luma_free`.
+  last reference; called by the inline fast paths), `luma_free`,
+  `luma_rc_new`/`luma_rc_get`/`luma_rc_count`,
+  `luma_arena_enter`/`luma_arena_leave`.
 - **Double free.** A freed object's header type becomes `LUMA_TYPE_FREED`.
   `free` of such an object reports `Double free: this object was already
   freed.`, and any runtime operation on it reports `Use after free.`
@@ -417,9 +540,9 @@ fun dist2(a: int, b: int): int {
   listed separately from those lost:
 
 ```
-luma: memcheck: --mm=rc, 1016 allocated, 1009 freed, 3 leaked, 4 reachable from globals
-luma: memcheck: leaked: 3 Pair
-luma: memcheck: reachable from globals: 1 Node, 3 Pair
+luma: memcheck: --mm=manual, 2032 allocated, 2018 freed, 6 leaked, 8 reachable from globals
+luma: memcheck: leaked: 3 Pair, 3 Rc<Pair>
+luma: memcheck: reachable from globals: 1 Node, 3 Pair, 1 Rc<Node>, 3 Rc<Pair>
 ```
 
 ### Code generation
@@ -444,30 +567,34 @@ high half. At `-O0`, every operation is a call to `luma_retain` or
 Benchmarks at `-O2` (wall time, best of 5; differences of about 10% are
 within run-to-run noise on the build machine):
 
-| Benchmark | `none` | `manual` | `rc` |
-|---|---|---|---|
-| collatz | 0.33 s | 0.32 s | 0.32 s |
-| fib(37), untyped | 0.10 s | 0.12 s | 0.13 s |
-| fib(37), typed | 0.12 s | 0.11 s | 0.11 s |
-| loop_sum | 0.11 s | 0.11 s | 0.11 s |
-| primes | 0.58 s | 0.53 s | 0.58 s |
-| strings (3M concatenations) | 0.007 s | 0.008 s | 0.008 s |
-| structs (20M method calls, list walks) | 0.10 s | 0.11 s | 0.11 s |
+| Benchmark | `none` | `manual` |
+|---|---|---|
+| collatz | 0.36 s | 0.34 s |
+| fib(37), untyped | 0.11 s | 0.11 s |
+| fib(37), typed | 0.10 s | 0.10 s |
+| loop_sum | 0.10 s | 0.11 s |
+| primes | 0.58 s | 0.54 s |
+| strings (3M concatenations) | 0.007 s | 0.008 s |
+| structs (20M method calls, list walks) | 0.10 s | 0.10 s |
 
-The structs benchmark got faster than before this milestone (0.14 s),
-because devirtualized calls now skip the checking `.dyn` wrapper. The
-runtime's generic operations now test for two fixnums before anything else,
-which made the `-O0` column faster too (e.g. loop_sum 1.00 s → 0.69 s).
+(Milestone 8; `rc` mode measured within 10% of `manual` before it was
+removed.) In milestone 7 the structs benchmark went from 0.14 s to 0.11 s,
+because devirtualized calls skip the checking `.dyn` wrapper, and the
+runtime's generic operations test for two fixnums first, which made `-O0`
+faster too (e.g. loop_sum 1.00 s → 0.69 s).
 
 ### Limits and next steps
 
-- Reference cycles leak in `rc` mode; memcheck lists them. Planned options:
-  weak fields, or a cycle collector over counted objects (trial deletion).
+- Cycles of `Rc` boxes leak; memcheck lists them. Planned options: `Weak<T>`
+  handles, or a cycle collector over boxes (trial deletion).
+- Arena references are not checked at compile time; a reference that
+  outlives its arena dangles. A region check (values allocated in a
+  scoped arena must not reach a global or an outer variable) is the next
+  step.
 - The escape analysis only follows values through vregs. An instance stored
   in a field of another local instance counts as escaping.
-- The ownership pass is per function and does not remove retain/release
-  pairs across instructions (beyond moves on last use); there is no
-  "borrow" of field values across code that cannot write them.
+- Borrowed reads are per block. Retain/release pairs across blocks or
+  across calls that cannot free the slot are not removed.
 - Strings and counted objects are allocated with `malloc` directly; a size-
   class allocator would make the frequent small allocations cheaper.
 
@@ -882,29 +1009,41 @@ call, or a reassignment of the object each makes `tests/pos/struct_aliasing`
 fail.
 
 Memory management is covered by:
-- `tests/mem`: exact `LUMA_MEMCHECK` reports for every mode at every level
-  (strings, object graphs and cycles, a program that frees everything, a
-  use after free through a typed alias, a million-node list);
-- every positive program run again under `rc` and `none` with memcheck on;
-- compile errors (`tests/neg/free_*`), runtime errors (`tests/rt/free_*`,
-  `use_after_free`), and unit tests of the memory pass on hand-written LIR;
-- the difftest, which runs each program under one mode with memcheck. In
-  `rc` and `none` it compares the number of struct instances alive at exit
-  with the reference interpreter's prediction (none: all of them; rc: those
-  reachable from globals, plus garbage cycles and what they reference).
-  Programs `free()` fresh local instances and store instances in untyped
+- `tests/mem`: exact `LUMA_MEMCHECK` reports for both modes at every level
+  (strings, Rc graphs and cycles, a program that frees everything, a use
+  after free through a typed alias, a million-node Rc list, arenas, a
+  reference that outlives its arena, borrowed reads);
+- every positive program run again under `manual` and `none` with memcheck
+  on;
+- compile errors (`tests/neg/free_*`, `rc_*`, `arena_*`), runtime errors
+  (`tests/rt/free_*`, `rc_*`, `arena_*`, `use_after_free`), and unit tests of the memory pass on hand-written LIR;
+- the difftest, which runs each program under one mode with memcheck and
+  compares the objects alive at exit with the reference interpreter's
+  prediction (none: every instance, box and arena; manual: the Rc boxes
+  reachable from globals or kept by garbage cycles, between a lower and an
+  upper bound that accounts for unfreed plain instances, and no arena).
+  Programs `free()` fresh local instances, use `Rc<S>` types, `Rc::new`,
+  auto-deref and arena blocks, and store boxes and instances in untyped
   fields to build graphs and cycles. `DIFFTEST_VALGRIND=1` runs every
   executable under valgrind.
 
 Planted bugs in the memory pass were each caught: no edge releases, no
 release of unused results, no retain of `getfield` results, consuming
 without retaining, no release when a global or a field is overwritten, no
-retain of reassigned parameters. The tests also found two real bugs during
-development:
+retain of reassigned parameters, and for borrowed reads ignoring the
+object's lifetime, ignoring instructions that may free, and checking a
+borrowed object instead of the reference it was read from. The tests also
+found real bugs during development:
 - parameters were never considered live at entry, because the CFG liveness
   defines them there;
 - a method wrapper's argument check retained a value whose copy was
-  borrowed, which leaked one count per dynamic call.
+  borrowed, which leaked one count per dynamic call;
+- a temporary `Rc` box was released right after auto-deref read its value's
+  field, before the field was used (fixed with `keep`, above);
+- field forwarding carried a value across `luma_arena_leave`, hiding a use
+  after free at `-O2` (forwarding now stops at runtime calls that can free);
+- `print(Rc::new(h).s)` at top level borrowed `s` from a value that was
+  itself borrowed from a dying box.
 
 Structs are covered by `tests/pos/structs.luma` and `struct_aliasing.luma`
 (exact output at every level), 20 `tests/neg/struct_*` compile errors, 10

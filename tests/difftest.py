@@ -26,15 +26,17 @@ Every program is compiled and run at each level in DIFFTEST_LEVELS
 IR optimizer plus the optimizing backend).
 
 Memory: each program is compiled with one --mm mode (DIFFTEST_MM, default by
-seed: manual, rc, manual, rc, none) and run with LUMA_MEMCHECK=1, so a use
-of freed memory becomes a runtime error and shows up as a mismatch. Under
---mm=rc and --mm=none the reference interpreter also predicts which struct
-instances are still allocated at exit (none: all of them; rc: those
-reachable from globals, plus garbage cycles and what they reference), and
-the counts per struct must equal memcheck's report. Programs call free() on
-fresh local instances (safe in every mode) and occasionally on a hidden
-non-struct (a runtime error). DIFFTEST_VALGRIND=1 also runs every
-executable under valgrind.
+seed: manual four times out of five, else none) and run with
+LUMA_MEMCHECK=1, so a use of freed memory becomes a runtime error and shows
+up as a mismatch. Programs share Rc boxes (Rc<S> variables, parameters,
+returns, boxes stored in the boxed values' untyped fields, so also cycles),
+reach fields and methods through boxes, call free() on fresh local
+instances, and allocate inside arena blocks. The reference interpreter
+predicts which objects are still allocated at exit and the counts must equal
+memcheck's report: under --mm=none every struct instance, Rc box and arena;
+under --mm=manual every Rc box reachable from a global or kept alive by a
+garbage cycle (and no arena). DIFFTEST_VALGRIND=1 also runs every executable
+under valgrind.
 
 usage: tests/difftest.py [COUNT] [SEED]      (run from the repository root)
 """
@@ -56,7 +58,7 @@ VALGRIND = os.environ.get("DIFFTEST_VALGRIND") == "1"
 
 
 def mm_for(seed):
-    return MM_FIXED or ("manual", "rc", "manual", "rc", "none")[seed % 5]
+    return MM_FIXED or ("manual", "manual", "manual", "manual", "none")[seed % 5]
 
 
 class LumaError(Exception):
@@ -85,6 +87,10 @@ def truthy(v):
     return not (v is None or v is False)
 
 
+class Arena:
+    pass
+
+
 class Obj:
     """A struct instance: reference semantics, fields in declaration order."""
 
@@ -93,10 +99,27 @@ class Obj:
         self.fields = fields   # dict, insertion order = declaration order
 
 
+class RcBox:
+    """Rc::new(value): a shared box; fields and methods go to its value."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+def rc_name(box):
+    return "Rc<%s>" % box.value.sname if isinstance(box.value, Obj) else "Rc<any>"
+
+
+def deref(o):
+    while isinstance(o, RcBox):
+        o = o.value
+    return o
+
+
 def equal(a, b):
     if type(a) is not type(b):
         return False
-    if isinstance(a, Obj):
+    if isinstance(a, (Obj, RcBox)):
         return a is b          # identity
     return a == b
 
@@ -108,6 +131,10 @@ def show(v, quoted=False):
         return "true"
     if v is False:
         return "false"
+    if isinstance(v, RcBox):
+        return "Rc(%s)" % show(v.value, True)
+    if isinstance(v, Arena):
+        return "Arena"
     if isinstance(v, Obj):
         if not v.fields:
             return "%s {}" % v.sname
@@ -126,6 +153,8 @@ def type_of(v):
         return "int"
     if isinstance(v, Obj):
         return v.sname
+    if isinstance(v, RcBox):
+        return rc_name(v)
     return "str"
 
 
@@ -178,6 +207,8 @@ def render_e(e):
         return "((%s).%s = %s)" % (render_e(e[1]), e[2], render_e(e[3]))
     if k == "callm":
         return "(%s).%s(%s)" % (render_e(e[1]), e[2], ", ".join(render_e(a) for a in e[3]))
+    if k == "rcnew":
+        return "Rc::new(%s)" % render_e(e[1])
     return "(%s %s %s)" % (render_e(e[2]), e[1], render_e(e[3]))
 
 
@@ -202,6 +233,8 @@ def render_s(s, ind=0):
         return p + "var %s%s = %s;\n" % (s[1], ann(s[3]), render_e(s[2]))
     if k == "block":
         return p + "{\n" + "".join(render_s(x, ind + 1) for x in s[1]) + p + "}\n"
+    if k == "arena":
+        return p + "arena {\n" + "".join(render_s(x, ind + 1) for x in s[1]) + p + "}\n"
     if k == "if":
         out = p + "if (%s)\n" % render_e(s[1]) + render_s(s[2], ind + 1)
         if s[3] is not None:
@@ -239,6 +272,11 @@ class Interp:
                     self.methods[(f[1], m[1])] = ("fun", "%s::%s" % (f[1], m[1])) + m[2:]
         self.depth = 0
         self.objects = []   # every struct instance created, for the memory oracle
+        self.boxes = []     # every Rc box
+        self.arenas = 0     # arena blocks run
+        self.arena_depth = 0
+        self.arena_objs = set()   # ids of instances allocated inside an arena block
+        self.freed = set()        # ids of instances passed to free()
 
     def guard(self, value, annotation, what):
         if annotation and type_of(value) != annotation:
@@ -283,14 +321,20 @@ class Interp:
                 fields[f] = vals[f]
             o = Obj(e[1], fields)
             self.objects.append(o)
+            if self.arena_depth:
+                self.arena_objs.add(id(o))
             return o
+        if k == "rcnew":
+            b = RcBox(self.ev(e[1]))
+            self.boxes.append(b)
+            return b
         if k == "get":
-            o = self.ev(e[1])
+            o = deref(self.ev(e[1]))
             if not isinstance(o, Obj):
                 raise LumaError("Only struct instances have fields, got %s." % type_of(o))
             return o.fields[e[2]]
         if k == "set":
-            o = self.ev(e[1])
+            o = deref(self.ev(e[1]))
             v = self.ev(e[3])
             if not isinstance(o, Obj):
                 raise LumaError("Only struct instances have fields, got %s." % type_of(o))
@@ -299,7 +343,7 @@ class Interp:
             o.fields[e[2]] = v
             return v
         if k == "callm":
-            o = self.ev(e[1])
+            o = deref(self.ev(e[1]))
             args = [self.ev(a) for a in e[3]]
             if not isinstance(o, Obj):
                 raise LumaError("Only struct instances have methods, got %s." % type_of(o))
@@ -307,9 +351,14 @@ class Interp:
             return self.invoke(fn, [o] + args, self_ann=o.sname)
         if k == "call" and e[1] == "free":
             v = self.ev(e[2][0])
+            if isinstance(v, RcBox):
+                raise LumaError("free() expects a struct instance, got %s (an Rc frees its value when its last "
+                                "reference goes away)." % rc_name(v))
             if v is not None and not isinstance(v, Obj):
                 raise LumaError("free() expects a struct instance, got %s%s." %
                                 (type_of(v), " (strings are freed automatically)" if isinstance(v, str) else ""))
+            if isinstance(v, Obj):
+                self.freed.add(id(v))
             return None
         if k == "call":
             fn = self.funs[e[1]]
@@ -387,12 +436,15 @@ class Interp:
             v = self.ev(s[2])
             self.scopes[-1][s[1]] = [v, s[3]]
             self.guard(v, s[3], "variable '%s'" % s[1])
-        elif k == "block":
+        elif k == "block" or k == "arena":
+            self.arenas += k == "arena"
+            self.arena_depth += k == "arena"
             self.scopes.append({})
             try:
                 self.run(s[1])
             finally:
                 self.scopes.pop()
+                self.arena_depth -= k == "arena"
         elif k == "if":
             if truthy(self.ev(s[1])):
                 self.ex(s[2])
@@ -443,6 +495,7 @@ class Gen:
         self.ret_ann = None  # ... and its annotation
         self.structs = {}    # S -> {"fields": [(field, type, ann)], "methods": [(m, [ptypes], [panns], ret)]}
         self.methods_ok = False  # may expressions call methods? (only from main code: no recursion)
+        self.self_struct = None  # inside a method of S: `self` may be the receiver of field accesses
 
     def fresh(self, prefix):
         self.n += 1
@@ -456,6 +509,8 @@ class Gen:
 
     def literal(self, t):
         r = self.r
+        if t.startswith("Rc<"):
+            return ("rcnew", self.literal(t[3:-1]))
         if t in self.structs:
             fields = list(self.structs[t]["fields"])
             r.shuffle(fields)   # any order in the literal
@@ -489,11 +544,11 @@ class Gen:
             calls = [(S, m) for S, d in self.structs.items() for m in d["methods"] if m[3] == t] if self.methods_ok else []
             if calls and (not gets or r.random() < 0.4):
                 S, (m, ptypes, panns, _) = r.choice(calls)
-                return ("callm", self.expr(S, depth - 1, exclude), m,
+                return ("callm", self.receiver(S, depth - 1, exclude)[0], m,
                         [self.slot_expr(pt, pa, depth - 1, exclude) for pt, pa in zip(ptypes, panns)])
             if gets:
                 S, f, a = r.choice(gets)
-                obj = self.expr(S, depth - 1, exclude)
+                obj = self.receiver(S, depth - 1, exclude)[0]
                 if r.random() < 0.15:   # an assignment to the field, used as a value
                     return ("set", obj, f, self.slot_expr(t, a, depth - 1, exclude))   # (its value is the expression's)
                 return ("get", obj, f)
@@ -507,6 +562,11 @@ class Gen:
             fields = list(self.structs[t]["fields"])
             r.shuffle(fields)
             return ("new", t, [(f, self.slot_expr(ft, fa, depth - 1, exclude)) for f, ft, fa in fields])
+        if t.startswith("Rc<"):   # always a fresh instance: Rc::new moves its argument
+            S = t[3:-1]
+            fields = list(self.structs[S]["fields"])
+            r.shuffle(fields)
+            return ("rcnew", ("new", S, [(f, self.slot_expr(ft, fa, depth - 1, exclude)) for f, ft, fa in fields]))
         if t == "int":
             if c < 0.3:
                 return ("un", "-", self.expr("int", depth - 1, exclude))
@@ -537,14 +597,27 @@ class Gen:
             return ("call", "dyn", [self.expr(wrong, depth - 1, exclude)])
         return self.expr(t, depth, exclude)
 
+    def receiver(self, S, depth, exclude=()):
+        """An object whose fields and methods are those of S: an S, an Rc<S>
+        (reached through the box), or `self` inside a method of S. `self`
+        never appears anywhere else, so a method called through a box cannot
+        keep the box's value beyond the box. Returns (expr, is_box)."""
+        c = self.r.random()
+        if self.self_struct == S and c < 0.3:
+            return ("var", "self"), False
+        if c < 0.55:
+            return self.expr("Rc<%s>" % S, depth, exclude), True
+        return self.expr(S, depth, exclude), False
+
     def field_value(self, S, f, t, annotation, depth, exclude=()):
         """A value to store into field f. An untyped nil field sometimes gets a
-        struct instance instead: the field is `any` to the compiler, and reads
-        of it still behave like nil for the generator's purposes (printing,
-        equality, truthiness). This builds object graphs, including cycles,
-        for the memory oracle."""
+        struct instance or an Rc box instead: the field is `any` to the
+        compiler, and reads of it still behave like nil for the generator's
+        purposes (printing, equality, truthiness). This builds object graphs,
+        including cycles of boxes, for the memory oracle."""
         if t == "nil" and annotation is None and self.structs and self.r.random() < 0.5:
-            return self.expr(self.r.choice(sorted(self.structs)), depth, exclude)
+            S2 = self.r.choice(sorted(self.structs))
+            return self.expr("Rc<%s>" % S2 if self.r.random() < 0.5 else S2, depth, exclude)
         return self.slot_expr(t, annotation, depth, exclude)
 
     def ann_of(self, name):
@@ -555,7 +628,8 @@ class Gen:
 
     def any_type(self):
         if self.structs and self.r.random() < 0.15:
-            return self.r.choice(sorted(self.structs))
+            S = self.r.choice(sorted(self.structs))
+            return "Rc<%s>" % S if self.r.random() < 0.4 else S
         return self.r.choice(("int", "int", "int", "str", "str", "bool", "nil"))
 
     def annotation(self, t):
@@ -601,7 +675,7 @@ class Gen:
             S = r.choice(sorted(self.structs))
             if self.structs[S]["fields"]:
                 f, ft, fa = r.choice(self.structs[S]["fields"])
-                return ("expr", ("set", self.expr(S, 2), f, self.field_value(S, f, ft, fa, 2)))
+                return ("expr", ("set", self.receiver(S, 2)[0], f, self.field_value(S, f, ft, fa, 2)))
         if c < 0.655 and self.structs:   # a fresh local instance, read, then freed
             S = r.choice(sorted(self.structs))
             t = self.fresh("t")
@@ -613,6 +687,15 @@ class Gen:
                 body.append(("print", [("get", ("var", t), f) for f, _, _ in self.structs[S]["fields"]]))
             body.append(("expr", ("call", "free", [("var", t)])))
             return ("block", body)
+        if c < 0.657 and self.structs:   # an arena block: its instances are freed at its end
+            S = r.choice(sorted(self.structs))
+            t = self.fresh("t")
+            fields = list(self.structs[S]["fields"])
+            r.shuffle(fields)
+            body = [("var", t, ("new", S, [(f, self.literal(ft)) for f, ft, _ in fields]), None)]
+            if self.structs[S]["fields"]:
+                body.append(("print", [("get", ("var", t), f) for f, _, _ in self.structs[S]["fields"]]))
+            return ("arena", body)
         if c < 0.66 and r.random() < 0.1:   # free() of something that is not a struct instance
             return ("expr", ("call", "free", [("call", "dyn", [self.literal(r.choice(("int", "str", "bool")))])]))
         if c < 0.67:
@@ -675,10 +758,12 @@ class Gen:
         ret = self.any_type()
         rann = self.annotation(ret)
         saved = (self.scopes, self.callable, self.ret_type, self.ret_ann)
-        self.scopes = [dict(self.scopes[0]), dict({"self": (S, S)}, **{p: (t, a) for p, t, a in zip(params, ptypes, panns)})]
+        self.scopes = [dict(self.scopes[0]), {p: (t, a) for p, t, a in zip(params, ptypes, panns)}]
         self.callable = len(self.funs)
         self.ret_type, self.ret_ann = ret, rann
+        self.self_struct = S
         body = self.stmts(r.randint(1, 3), 2) + [("return", self.slot_expr(ret, rann, 2))]
+        self.self_struct = None
         self.scopes, self.callable, self.ret_type, self.ret_ann = saved
         self.structs[S]["methods"].append((name, ptypes, panns, ret))
         return ("fun", name, ["self"] + params, body, [None] + panns, rann)
@@ -702,47 +787,72 @@ def generate(seed):
 
 
 def live_at_exit(it, mm):
-    """Struct instances still allocated when the program ends, by struct name."""
-    objs = it.objects
+    """Objects still allocated when the program ends, by type name, as a pair
+    of dicts (lower, upper) that the actual counts must lie between.
+
+    --mm=none frees nothing: every struct instance, Rc box and arena (exact).
+    --mm=manual: the Rc boxes still referenced. A box is alive while a global
+    (directly or through other objects) or a live holder refers to it, or when
+    it is part of a garbage cycle. Plain instances the program never frees can
+    hold boxes too, but the compiler frees some of them automatically, so for
+    those the lower bound assumes freed and the upper bound alive."""
     if mm == "none":
-        live = objs
-    else:
-        def succ(o, allowed):
-            return [v for v in o.fields.values() if isinstance(v, Obj) and id(v) in allowed]
-        everything = {id(o) for o in objs}
-        reach, stack = set(), [c[0] for c in it.scopes[0].values() if isinstance(c[0], Obj)]
+        counts = {}
+        for o in it.objects:
+            counts[o.sname] = counts.get(o.sname, 0) + 1
+        for b in it.boxes:
+            counts[rc_name(b)] = counts.get(rc_name(b), 0) + 1
+        if it.arenas:
+            counts["Arena"] = it.arenas
+        return counts, counts
+    contents = {id(b.value) for b in it.boxes if isinstance(b.value, Obj)}
+
+    def succ(x):
+        if isinstance(x, RcBox):
+            return [x.value] if isinstance(x.value, (Obj, RcBox)) else []
+        return [v for v in x.fields.values() if isinstance(v, (Obj, RcBox))]
+
+    def closure(start, allowed=lambda x: True):
+        seen, stack, out = set(), list(start), []
         while stack:
-            o = stack.pop()
-            if id(o) not in reach:
-                reach.add(id(o))
-                stack.extend(succ(o, everything))
-        garbage = [o for o in objs if id(o) not in reach]
-        gids = {id(o) for o in garbage}
-        def on_cycle(o):   # does o reach itself through garbage?
-            seen, stack = set(), list(succ(o, gids))
+            x = stack.pop()
+            if id(x) in seen or not allowed(x):
+                continue
+            seen.add(id(x))
+            out.append(x)
+            stack.extend(succ(x))
+        return seen, out
+
+    def boxes_alive(plain_roots):
+        roots = [c[0] for c in it.scopes[0].values() if isinstance(c[0], (Obj, RcBox))] + plain_roots
+        reach, _ = closure(roots)
+        # garbage that can keep a box alive: other garbage boxes and their values
+        def allowed(x):
+            return id(x) not in reach and (isinstance(x, RcBox) or id(x) in contents)
+        def on_cycle(b):
+            seen, stack = set(), [y for y in succ(b) if allowed(y)]
             while stack:
                 x = stack.pop()
-                if x is o:
+                if x is b:
                     return True
                 if id(x) not in seen:
                     seen.add(id(x))
-                    stack.extend(succ(x, gids))
+                    stack.extend(y for y in succ(x) if allowed(y))
             return False
-        surv, stack = set(), [o for o in garbage if on_cycle(o)]
-        while stack:
-            o = stack.pop()
-            if id(o) not in surv:
-                surv.add(id(o))
-                stack.extend(succ(o, gids))
-        live = [o for o in objs if id(o) in reach or id(o) in surv]
-    counts = {}
-    for o in live:
-        counts[o.sname] = counts.get(o.sname, 0) + 1
-    return counts
+        surv, _ = closure([b for b in it.boxes if id(b) not in reach and on_cycle(b)], allowed)
+        counts = {}
+        for b in it.boxes:
+            if id(b) in reach or id(b) in surv:
+                counts[rc_name(b)] = counts.get(rc_name(b), 0) + 1
+        return counts
+
+    unfreed_plain = [o for o in it.objects if id(o) not in contents and id(o) not in it.freed and id(o) not in it.arena_objs]
+    return boxes_alive([]), boxes_alive(unfreed_plain)
 
 
 def memcheck_counts(lines):
-    """Struct counts from memcheck's 'leaked:' and 'reachable from globals:' lines."""
+    """Object counts (not strings) from memcheck's 'leaked:' and 'reachable from
+    globals:' lines."""
     counts = {}
     for line in lines:
         for tag in ("luma: memcheck: leaked: ", "luma: memcheck: reachable from globals: "):
@@ -769,7 +879,7 @@ def one(seed, workdir):
     want_err = "" if err is None else "luma: runtime error: %s\n" % err
     want_rc = 0 if err is None else 1
     mm = mm_for(seed)
-    want_live = live_at_exit(it, mm) if err is None and mm != "manual" else None
+    want_live = live_at_exit(it, mm) if err is None else None
 
     path = os.path.join(workdir, "p.luma")
     with open(path, "w") as f:
@@ -817,8 +927,15 @@ def compile_and_run(src, path, workdir, level, mm, want_out, want_err, want_rc, 
     if (got_out, got_err, r.returncode) != (want_out, want_err, want_rc):
         return ("expected rc=%d out=%r err=%r\n     got rc=%d out=%r err=%r"
                 % (want_rc, want_out, want_err, r.returncode, got_out, got_err))
-    if want_live is not None and memcheck_counts(mc) != want_live:
-        return "struct instances alive at exit: expected %r, memcheck reports %r\n%s" % (want_live, memcheck_counts(mc), "\n".join(mc))
+    if want_live is not None:
+        lower, upper = want_live
+        got = memcheck_counts(mc)
+        if mm == "manual":   # boxes (and arenas: none should be left)
+            got = {k: v for k, v in got.items() if k.startswith("Rc<") or k == "Arena"}
+        names = set(got) | set(upper)
+        if any(not (lower.get(k, 0) <= got.get(k, 0) <= upper.get(k, 0)) for k in names):
+            return ("objects alive at exit: expected between %r and %r, memcheck reports %r\n%s"
+                    % (lower, upper, got, "\n".join(mc)))
     return None
 
 

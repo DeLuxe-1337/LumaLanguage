@@ -72,6 +72,7 @@ typedef enum {
                        or dynamic (sid < 0: looked up by `name` at run time) (v0.5) */
     IR_SETFIELD,    /* a.field = b   (no dst; static or dynamic as for getfield) (v0.5) */
     IR_CALLM,       /* [dst =] method `name` of a's struct, called with (a, args...) (v0.5) */
+    IR_KEEP,        /* a must stay alive until here (no code; no dst; v0.7): after an access through an Rc */
     IR_RETAIN,      /* reference count of a += 1 if a is a counted object (no dst; v0.6, inserted by mem.c) */
     IR_RELEASE,     /* reference count of a -= 1 if a is a counted object; frees it at 0 (no dst; v0.6) */
     IR_PHI,         /* dst = args[k] when entered from block phi_blocks[k] (SSA form; optimizer-internal) */
@@ -151,8 +152,19 @@ typedef struct {
 /* A struct type (v0.5). Instances are heap objects: a header word (type id 2
  * and the struct's index + 1 in bits 8-31), a pointer to the struct's
  * descriptor, then one word per field in declaration order. */
+/* Builtin struct kinds (v0.7). Their names are reserved, and the kind
+ * follows from the name: "Rc" (a box holding any non-struct value),
+ * "Rc.S" (a box holding an instance of struct S; written Rc<S> in Luma) and
+ * "Arena". docs/DESIGN.md "Memory". */
+typedef enum { IR_STRUCT_USER = 0, IR_STRUCT_RC = 1, IR_STRUCT_ARENA = 2 } IrStructKind;
+IrStructKind ir_struct_kind_of(const char *name);
+/* The name used in messages and printed values: "Rc.Point" -> "Rc<Point>",
+ * "Rc" -> "Rc<any>"; other names unchanged. */
+void ir_struct_display(const char *name, char *buf, size_t n);
+
 typedef struct {
     char *name;
+    IrStructKind kind;
     int nfields;
     char **fields;    /* field names (owned) */
     IrTy *ftys;       /* declared field types (owned) */
@@ -164,7 +176,7 @@ typedef struct {
 
 /* Memory-management mode (v0.6; `memory none|manual|rc` in the text form;
  * docs/IR.md section 19). The values match the runtime's LUMA_MM_*. */
-typedef enum { IR_MM_NONE = 0, IR_MM_MANUAL = 1, IR_MM_RC = 2 } IrMemMode;
+typedef enum { IR_MM_NONE = 0, IR_MM_MANUAL = 1 } IrMemMode;
 const char *ir_mm_name(IrMemMode mm);
 
 typedef struct IrModule {

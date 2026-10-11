@@ -1,0 +1,5 @@
+struct P { x: int }
+fun dyn(x) { return x; }
+var r = Rc::new(P { x: 1 });
+print(r);
+free(dyn(r));

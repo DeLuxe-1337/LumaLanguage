@@ -1,0 +1,4 @@
+fun dyn(x) { return x; }
+var a = dyn(arena {});
+print(a);
+free(a);

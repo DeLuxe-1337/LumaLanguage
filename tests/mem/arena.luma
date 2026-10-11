@@ -1,0 +1,68 @@
+// Arenas: everything a block allocates by hand (in this function or the ones
+// it calls) goes into the arena and is freed at once when the arena's last
+// reference goes away. Strings in their fields are released then too.
+struct Node { value: int, label: str, next: Node? }
+
+fun cat(a, b) { return a + b; }
+
+fun build(n: int): Node? {
+  var list: Node? = nil;
+  for (var i = 0; i < n; i = i + 1) list = Node { value: i, label: cat("n", "#"), next: list };
+  return list;
+}
+
+fun sum(list: Node?): int {
+  var s = 0;
+  while (list != nil) { s = s + list.value; list = list.next; }
+  return s;
+}
+
+// scoped: the 1000 nodes built inside are freed when the block ends
+var total = 0;
+arena {
+  var list = build(1000);
+  total = sum(list);              // an int leaves the arena freely
+}
+print(total);
+
+// code written to free by hand works unchanged inside an arena: free() of
+// an instance that lives in one does nothing
+fun destroy(list: Node?) {
+  while (list != nil) {
+    var next = list.next;
+    free(list);
+    list = next;
+  }
+}
+arena {
+  var l = build(100);
+  destroy(l);
+}
+
+// an arena as a value: filled in two visits, then dropped
+var level = arena {};
+var map: Node? = nil;
+arena level { map = build(10); }
+arena level { map.next.value = 99; build(5); }
+print(sum(map), level);
+map = nil;
+level = nil;                      // frees all 15 nodes
+
+// a return from inside an arena block leaves the arena first
+fun first_label(n: int): str {
+  arena {
+    var l = build(n);
+    return cat(l.label, "!");     // a string survives the arena
+  }
+}
+print(first_label(3));
+
+// nested arenas
+arena {
+  var a = build(2);
+  arena {
+    var b = build(3);
+    print(sum(b));
+  }
+  print(sum(a));
+}

@@ -1,3 +1,3 @@
-luma: memcheck: --mm=none, 1016 allocated, 0 freed, 1012 leaked, 4 reachable from globals
-luma: memcheck: leaked: 1000 Node, 12 Pair
-luma: memcheck: reachable from globals: 1 Node, 3 Pair
+luma: memcheck: --mm=none, 2032 allocated, 0 freed, 2024 leaked, 8 reachable from globals
+luma: memcheck: leaked: 1000 Node, 12 Pair, 1000 Rc<Node>, 12 Rc<Pair>
+luma: memcheck: reachable from globals: 1 Node, 3 Pair, 1 Rc<Node>, 3 Rc<Pair>

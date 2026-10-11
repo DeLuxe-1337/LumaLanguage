@@ -1,0 +1,42 @@
+// Rc in detail: the value inside is reached through the box (fields,
+// methods, assignment), statically when the type is known and dynamically
+// otherwise; boxes of non-struct values; Rc::get; boxes in instances'
+// fields; what each frees. (Rc::count is left out: it counts the references
+// the program holds at that moment as compiled, and a reference ends at its
+// last use, so its value depends on the optimization level.)
+struct Point { x: int, y: int, label }
+struct Holder { item: Rc<Point>, extra }
+
+impl Point {
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+  fun move(self, dx: int) { self.x = self.x + dx; }
+}
+
+fun dyn(x) { return x; }
+fun cat(a, b) { return a + b; }
+
+fun counts() {
+  var p = Rc::new(Point { x: 3, y: 4, label: cat("a", "b") });
+  var q = p;
+  print(p.x, q.len2(), p.label);                  // two variables share the box
+  q.move(1);
+  p.y = 10;
+  print(Rc::get(p), q.y);
+  var d = dyn(p);                                 // through an untyped value
+  d.move(1);
+  d.label = cat("c", "d");
+  print(d.x, d.len2(), d.label);
+  var h = Holder { item: p, extra: Rc::new(cat("x", "y")) };
+  print(h.item.x, h.extra);
+  free(h);                                        // releases both boxes it held
+  print(p.x);
+}
+counts();
+
+// an Rc from a value whose struct is known only at run time
+var r = Rc::new(dyn(Point { x: 1, y: 1, label: nil }));
+print(r, r.len2());
+var s: Rc<any>? = Rc::new(cat("shared ", "text"));
+print(s, Rc::get(s));
+r = nil;
+s = nil;

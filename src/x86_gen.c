@@ -1089,6 +1089,7 @@ static void emit_instr(G *g, int b, int idx, const IrInstr *in) {
         break;
     }
     case IR_RETAIN: emit_retain(g, idx, in); break;
+    case IR_KEEP: break; /* only extends its operand's lifetime (and register) */
     case IR_RELEASE: emit_release(g, idx, in); break;
     case IR_CHECK: emit_check(g, idx, in); break;
     case IR_NEW: {
@@ -1312,7 +1313,7 @@ static void analyze(G *g) {
         if (c < 0 || uses[c] != 1 || g->loc[c].kind != LOC_NONE) continue;
         int j = bl->n - 2;
         while (j >= 0 && bl->instrs[j].dst != c &&
-               (bl->instrs[j].op == IR_MOV || is_const_op(bl->instrs[j].op) || bl->instrs[j].op == IR_RETAIN ||
+               (bl->instrs[j].op == IR_MOV || is_const_op(bl->instrs[j].op) || bl->instrs[j].op == IR_RETAIN || bl->instrs[j].op == IR_KEEP ||
                 bl->instrs[j].op == IR_RELEASE))
             j--;
         if (j < 0 || bl->instrs[j].dst != c) continue;

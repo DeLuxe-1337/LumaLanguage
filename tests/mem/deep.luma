@@ -1,11 +1,11 @@
-// Releasing the head of a million-node list frees the whole chain. The
-// runtime destroys objects iteratively, so the depth of the structure never
-// reaches the C stack.
-struct Node { value: int, next: Node? }
+// Dropping the last reference to the head of a million-node Rc list frees
+// every box and node. The runtime frees iteratively, so the depth of the
+// structure never reaches the C stack.
+struct Node { value: int, next: Rc<Node>? }
 
-fun build(n: int): Node? {
-  var list: Node? = nil;
-  for (var i = 0; i < n; i = i + 1) list = Node { value: i, next: list };
+fun build(n: int): Rc<Node>? {
+  var list: Rc<Node>? = nil;
+  for (var i = 0; i < n; i = i + 1) list = Rc::new(Node { value: i, next: list });
   return list;
 }
 

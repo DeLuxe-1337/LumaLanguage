@@ -58,8 +58,8 @@ static void usage(FILE *f) {
             "  --dump-opt-ir   print the optimized LIR module\n"
             "  -O0, -O1, -O2   optimization level (default -O2; see docs/DESIGN.md)\n"
             "  --mm=MODE       memory management: manual (default; free() for structs,\n"
-            "                  everything else automatic), rc (reference counting) or\n"
-            "                  none (never free); a .lir input keeps its `memory` line\n"
+            "                  Rc::new and arena blocks, strings automatic) or none\n"
+            "                  (never free); a .lir input keeps its `memory` line\n"
             "                  unless --mm is given. The memory pass writes OUT.mem.lir\n"
             "  --dump-mem-ir   print the LIR after the memory pass\n"
             "  -v              print each stage and the link command\n"
@@ -199,9 +199,11 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--dump-mem-ir") == 0) dump_mem_ir = true;
         else if (strncmp(a, "--mm=", 5) == 0) {
             if (strcmp(a + 5, "manual") == 0) mm = IR_MM_MANUAL;
-            else if (strcmp(a + 5, "rc") == 0) mm = IR_MM_RC;
             else if (strcmp(a + 5, "none") == 0) mm = IR_MM_NONE;
-            else { fprintf(stderr, "luma: error: unknown memory mode '%s' (manual, rc or none)\n", a + 5); return 2; }
+            else if (strcmp(a + 5, "rc") == 0) {
+                fprintf(stderr, "luma: error: --mm=rc was removed: use Rc::new(...) for values that need shared ownership\n");
+                return 2;
+            } else { fprintf(stderr, "luma: error: unknown memory mode '%s' (manual or none)\n", a + 5); return 2; }
         }
         else if (a[0] == '-' && a[1] == 'O' && a[2] >= '0' && a[2] <= '2' && !a[3]) opt_level = a[2] - '0';
         else if (strcmp(a, "-v") == 0) verbose = true;

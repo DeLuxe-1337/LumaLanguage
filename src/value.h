@@ -45,7 +45,11 @@ typedef uint64_t LumaValue;
 /* Memory-management modes (luma --mm=..., emitted as the luma_mm symbol). */
 #define LUMA_MM_NONE 0
 #define LUMA_MM_MANUAL 1
-#define LUMA_MM_RC 2
+
+/* Struct descriptor kinds (LumaStructDesc.kind; IrStructKind). */
+#define LUMA_STRUCT_USER 0
+#define LUMA_STRUCT_RC 1
+#define LUMA_STRUCT_ARENA 2
 
 /* A struct instance: header = LUMA_TYPE_STRUCT | (struct index + 1) << 8
  * | count << 32, then a pointer to the struct's descriptor, then one word

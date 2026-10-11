@@ -58,9 +58,20 @@ static bool is_free_call(const IrModule *m, const IrInstr *in) {
            strcmp(m->globals[in->global].name, "luma_free") == 0;
 }
 
+/* Rc::new(x) moves x into the box: `new Rc.S(%x)` or `call @luma_rc_new(%x)`.
+ * Returns the moved vreg or -1. */
+static int moved_into_rc(const IrModule *m, const IrInstr *in) {
+    if (in->op == IR_NEW && in->nargs == 1 && m->structs[in->sid].kind == IR_STRUCT_RC) return in->args[0];
+    if (in->op == IR_CALL && in->nargs == 1 && m->globals[in->global].kind == IRG_EXTERN &&
+        strcmp(m->globals[in->global].name, "luma_rc_new") == 0)
+        return in->args[0];
+    return -1;
+}
+
 /* One step of the must-be-freed analysis. state[v] = line of the free()
- * that freed v on every path, or 0. With report set, the first violation is
- * printed and false returned. */
+ * that freed v on every path (or minus the line of the Rc::new that moved
+ * it), or 0. With report set, the first violation is printed and false
+ * returned. */
 static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, int *state, bool report, const char *path) {
     int *ptrs[80];
     int **pp = in->nargs + 2 > 80 ? xmalloc((size_t)(in->nargs + 2) * sizeof *pp) : ptrs;
@@ -77,7 +88,10 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
             char at[64];
             if (in->col > 0) snprintf(at, sizeof at, "%d:%d", in->line, in->col);
             else snprintf(at, sizeof at, "%d", in->line);
-            if (freeing)
+            if (state[v] < 0)
+                fprintf(stderr, "%s:%s: error: '%s' was moved into an Rc on line %d; use the Rc instead%s\n", path, at,
+                        name, -state[v], freeing ? " (the Rc frees it)" : "");
+            else if (freeing)
                 fprintf(stderr, "%s:%s: error: '%s' is freed twice (free(%s) on line %d already freed it)\n", path, at,
                         name, name, state[v]);
             else
@@ -89,6 +103,8 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
     if (pp != ptrs) free(pp);
     if (in->dst >= 0) state[in->dst] = 0;
     if (freeing && in->args[0] >= 0) state[in->args[0]] = in->line > 0 ? in->line : 1;
+    int mv = moved_into_rc(m, in);
+    if (mv >= 0) state[mv] = -(in->line > 0 ? in->line : 1);
     return ok || !report;
 }
 
@@ -98,7 +114,7 @@ static bool check_func_frees(const IrModule *m, const IrFunc *f, const char *pat
     bool any_free = false;
     for (int b = 0; b < nb && !any_free; b++)
         for (int k = 0; k < f->blocks[b].n; k++)
-            if (is_free_call(m, &f->blocks[b].instrs[k])) any_free = true;
+            if (is_free_call(m, &f->blocks[b].instrs[k]) || moved_into_rc(m, &f->blocks[b].instrs[k]) >= 0) any_free = true;
     if (!any_free) return true;
     Cfg cfg;
     cfg_build(f, &cfg);
@@ -118,7 +134,7 @@ static bool check_func_frees(const IrModule *m, const IrFunc *f, const char *pat
                 if (!done[pb]) continue;
                 for (int v = 0; v < nv; v++) {
                     int x = out[(size_t)pb * nv + v];
-                    st[v] = first ? x : (st[v] && x ? st[v] : 0);
+                    st[v] = first ? x : (st[v] && x && (st[v] > 0) == (x > 0) ? st[v] : 0);
                 }
                 first = false;
             }
@@ -139,7 +155,7 @@ static bool check_func_frees(const IrModule *m, const IrFunc *f, const char *pat
             int pb = cfg.preds[b][p];
             for (int v = 0; v < nv; v++) {
                 int x = out[(size_t)pb * nv + v];
-                st[v] = first ? x : (st[v] && x ? st[v] : 0);
+                st[v] = first ? x : (st[v] && x && (st[v] > 0) == (x > 0) ? st[v] : 0);
             }
             first = false;
         }
@@ -230,8 +246,13 @@ static void escape_classes(const IrModule *m, const IrFunc *f, bool **pesc, int 
 /* Marks (imm = 1) the `new` instructions whose instances are reference
  * counted, and reports which structs ever have counted instances. */
 static void choose_counted(IrModule *m, bool *sid_counted) {
-    for (int s = 0; s < m->nstructs; s++) sid_counted[s] = false;
-    if (m->mm == IR_MM_NONE) return;
+    if (m->mm == IR_MM_NONE) {
+        for (int s = 0; s < m->nstructs; s++) sid_counted[s] = false;
+        return;
+    }
+    /* Rc boxes and arena handles are always counted (Rc::new of a dynamic
+     * value creates boxes in the runtime, where no `new` shows them) */
+    for (int s = 0; s < m->nstructs; s++) sid_counted[s] = m->structs[s].kind != IR_STRUCT_USER;
     bool **pesc = xcalloc((size_t)m->nfuncs + 1, sizeof *pesc);
     for (int i = 0; i < m->nfuncs; i++) pesc[i] = xcalloc((size_t)m->funcs[i].nparams + 1, sizeof **pesc);
     int maxv = 1;
@@ -259,7 +280,9 @@ static void choose_counted(IrModule *m, bool *sid_counted) {
             for (int k = 0; k < f->blocks[b].n; k++) {
                 IrInstr *in = &f->blocks[b].instrs[k];
                 if (in->op != IR_NEW) continue;
-                in->imm = m->mm == IR_MM_RC || (in->dst >= 0 && !esc[uf_find(parent, in->dst)]);
+                /* Rc boxes and arena handles are always counted: their lifetime
+                 * is the point; user structs when they never escape */
+                in->imm = m->structs[in->sid].kind != IR_STRUCT_USER || (in->dst >= 0 && !esc[uf_find(parent, in->dst)]);
                 if (in->imm) sid_counted[in->sid] = true;
             }
     }
@@ -282,7 +305,6 @@ typedef struct {
 static bool heap_ty(const Mem *mm, IrTy t) {
     if (t & TY_STR) return true;
     if (!(t & TY_STRUCT)) return false;
-    if (mm->m->mm == IR_MM_RC) return true;
     int sid = ty_sid(t);
     return sid >= 0 ? mm->sid_counted[sid] : mm->any_counted;
 }
@@ -398,7 +420,7 @@ static int fusable_compare(const IrBlock *bl) {
     int c = bl->instrs[bl->n - 1].a;
     int j = bl->n - 2;
     while (j >= 0 && bl->instrs[j].dst != c &&
-           (bl->instrs[j].op == IR_MOV || bl->instrs[j].op == IR_CONST_INT || bl->instrs[j].op == IR_CONST_NIL ||
+           (bl->instrs[j].op == IR_MOV || bl->instrs[j].op == IR_KEEP || bl->instrs[j].op == IR_CONST_INT || bl->instrs[j].op == IR_CONST_NIL ||
             bl->instrs[j].op == IR_CONST_TRUE || bl->instrs[j].op == IR_CONST_FALSE || bl->instrs[j].op == IR_CONST_DATA))
         j--;
     if (j < 0 || bl->instrs[j].dst != c) return -1;
@@ -413,6 +435,92 @@ static int fusable_compare(const IrBlock *bl) {
     }
     if (in->a == c || in->b == c) return -1;
     return j;
+}
+
+/* Can executing `in` free an object (or run Luma code that might)? Runtime
+ * operations only allocate; C functions never see Luma objects. */
+static bool may_free(const IrModule *m, const IrInstr *in) {
+    switch (in->op) {
+    case IR_STORE: case IR_SETFIELD: case IR_CALLM: case IR_RETAIN: case IR_RELEASE: return true;
+    case IR_CALL: {
+        const IrGlobal *g = &m->globals[in->global];
+        if (g->kind == IRG_CEXTERN) return false;
+        if (g->kind == IRG_FUNC) return true;
+        static const char *const SAFE[] = {"luma_write", "luma_write_space", "luma_write_newline", "luma_print",
+                                           "luma_rc_count", "luma_rc_get", "luma_rc_new"};
+        for (size_t i = 0; i < sizeof SAFE / sizeof *SAFE; i++)
+            if (strcmp(g->name, SAFE[i]) == 0) return false;
+        return true;
+    }
+    default: return false;
+    }
+}
+
+/* Borrowed reads: `%d = load @g` / `%d = getfield %o, ...` whose value is
+ * used only in the same block, only by borrowing uses, with nothing in
+ * between that could free an object, needs no retain/release: the slot
+ * keeps the value alive. (For getfield, %o must outlive the uses.) */
+static void find_borrowed_reads(const IrModule *m, const IrFunc *f, const Liveness *lv, const bool *managed,
+                                bool *borrowed) {
+    int nv = f->nvregs;
+    int *ndefs = xcalloc((size_t)nv + 1, sizeof *ndefs);
+    for (int b = 0; b < f->nblocks; b++)
+        for (int k = 0; k < f->blocks[b].n; k++)
+            if (f->blocks[b].instrs[k].dst >= 0) ndefs[f->blocks[b].instrs[k].dst]++;
+    UseCount *uc = NULL;
+    int ucap = 0;
+    /* base[v]: for a borrowed getfield, the object it was read from */
+    int *base = xmalloc(((size_t)nv + 1) * sizeof *base);
+    for (int v = 0; v <= nv; v++) base[v] = -1;
+    for (int b = 0; b < f->nblocks; b++) {
+        const IrBlock *bl = &f->blocks[b];
+        for (int k = 0; k < bl->n; k++) {
+            const IrInstr *in = &bl->instrs[k];
+            int d = in->dst;
+            if ((in->op != IR_LOAD && in->op != IR_GETFIELD) || d < 0 || !managed[d] || borrowed[d] || ndefs[d] != 1 ||
+                bit_get(live_out(lv, b), d))
+                continue;
+            int o = in->op == IR_GETFIELD ? in->a : -1;
+            /* a borrowed object is only as alive as what it was read from:
+             * walk up to the owning reference, which must outlive our uses */
+            while (o >= 0 && borrowed[o] && base[o] >= 0) o = base[o];
+            int last = -1;
+            bool ok = true;
+            for (int j = k + 1; j < bl->n && ok; j++) {
+                const IrInstr *x = &bl->instrs[j];
+                if (x->nargs + 2 > ucap) {
+                    ucap = x->nargs + 2;
+                    uc = xrealloc(uc, (size_t)ucap * sizeof *uc);
+                }
+                int nu = collect_uses(x, uc);
+                for (int i = 0; i < nu; i++)
+                    if (uc[i].v == d) {
+                        if (uc[i].consume) ok = false;
+                        last = j;
+                    }
+                if (x->dst == d || (o >= 0 && x->dst == o)) ok = false;
+            }
+            if (!ok || last < 0) continue;
+            for (int j = k + 1; j <= last && ok; j++) ok = !may_free(m, &bl->instrs[j]);
+            if (ok && o >= 0 && !borrowed[o]) { /* the object must still be held after the last use */
+                bool held = bit_get(live_out(lv, b), o);
+                for (int j = last + 1; j < bl->n && !held; j++) {
+                    const IrInstr *x = &bl->instrs[j];
+                    int nu = collect_uses(x, uc);
+                    for (int i = 0; i < nu; i++) held |= uc[i].v == o;
+                    if (x->dst == o) break;
+                }
+                ok = held;
+            }
+            if (ok) {
+                borrowed[d] = true;
+                if (in->op == IR_GETFIELD) base[d] = o;
+            }
+        }
+    }
+    free(base);
+    free(uc);
+    free(ndefs);
 }
 
 /* Is parameter p's incoming value used? (cfg liveness counts parameters as
@@ -527,6 +635,7 @@ static void lower_func(Mem *mm, IrFunc *f) {
     Word *live = xmalloc((size_t)(nw ? nw : 1) * sizeof *live);
     bool *entry_live = xcalloc((size_t)f->nparams + 1, sizeof *entry_live);
     for (int p = 0; p < f->nparams; p++) entry_live[p] = param_live_at_entry(f, &lv, p);
+    find_borrowed_reads(m, f, &lv, managed, borrowed);
 
     EdgeRel *edges = NULL;
     int nedges = 0;

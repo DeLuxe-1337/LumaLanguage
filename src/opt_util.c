@@ -46,6 +46,7 @@ bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty) {
 bool opt_has_effect(const IrModule *m, const IrInstr *in, const IrTy *vty) {
     switch (in->op) {
     case IR_CALL: case IR_STORE: case IR_JMP: case IR_BR: case IR_RET: return true;
+    case IR_KEEP: return true; /* it exists to keep its operand alive */
     /* a new object's identity is observable; fields are mutable memory */
     case IR_NEW: case IR_GETFIELD: case IR_SETFIELD: case IR_CALLM: return true;
     default: return opt_may_trap(m, in, vty);

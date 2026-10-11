@@ -1,0 +1,26 @@
+// Reads the compiler may borrow (no retain/release) and the two cases where
+// it must not: the value's holder dies at the read, or code that can free it
+// runs before the value is used.
+struct Holder { s: str, next }
+
+fun cat(a, b) { return a + b; }
+
+// h is freed automatically right after its last use, the read of h.s: the
+// string must survive until print has used it
+fun show() {
+  var h = Holder { s: cat("he", "llo"), next: nil };
+  print(h.s);
+}
+show();
+
+// print evaluates its arguments first: reset() replaces the global, which
+// frees the old string, before it is written
+var g = cat("a", "b");
+fun reset() { g = nil; return 1; }
+print(g, reset());
+
+// through an Rc: the box dies at the deref, its value's field is still read
+print(Rc::new(Holder { s: cat("x", "y"), next: nil }).s);
+var r = Rc::new(Holder { s: cat("in ", "rc"), next: Rc::new(Holder { s: cat("inner", "!"), next: nil }) });
+print(r.next.s, r.s);
+r = nil;

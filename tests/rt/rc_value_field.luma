@@ -1,0 +1,4 @@
+fun dyn(x) { return x; }
+var r = Rc::new(dyn(42));
+print(Rc::get(r));
+print(r.x);

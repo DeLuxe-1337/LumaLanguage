@@ -75,8 +75,10 @@ typedef enum {
     EXPR_METHOD,  /* left.name(args...) */
     EXPR_ASSOC,   /* name::str(args...)   (name = the struct, str = the function) */
     EXPR_STRUCT,  /* name { fields[i]: args[i], ... } */
+    EXPR_ARENA,   /* arena { body }  (a new arena; its value)   arena name { body }  (allocate into name) */
 } ExprKind;
 
+typedef struct Stmt Stmt;
 typedef struct Expr Expr;
 struct Expr {
     ExprKind kind;
@@ -91,11 +93,13 @@ struct Expr {
     size_t nargs;
     char **fields;  /* EXPR_STRUCT: field name per argument (owned) */
     int *field_line, *field_col;
+    Stmt *body;     /* EXPR_ARENA: the block (owned); name = the existing arena, or NULL */
 };
 
 /* A type annotation as written. name == NULL means "no annotation". */
 typedef struct {
     char *name;
+    char *arg;     /* the type argument of a generic type: Rc<Point> -> "Point" (owned), else NULL */
     bool nullable; /* written with a trailing '?' */
     int line, col;
 } TypeRef;
@@ -113,7 +117,6 @@ typedef enum {
     STMT_IMPL,  /* name (the struct), stmts (STMT_FUN: methods and associated functions) */
 } StmtKind;
 
-typedef struct Stmt Stmt;
 struct Stmt {
     StmtKind kind;
     int line, col;

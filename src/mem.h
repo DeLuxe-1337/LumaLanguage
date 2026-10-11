@@ -3,16 +3,16 @@
  * Three static analyses over LIR:
  *
  *   mem_check_frees  on the lowered IR (every mode): a variable that is used,
- *                    or freed again, after free() on every path that reaches
- *                    the use is a compile error.
- *   mem_lower        after optimization, before the backend (modes manual
- *                    and rc):
- *                    1. escape analysis (interprocedural): in --mm=manual a
- *                       struct allocation whose instances provably never
- *                       leave the function's local values (never stored,
- *                       returned, passed to free() or to a parameter that
- *                       escapes) is reference counted, i.e. freed
- *                       automatically; every allocation is in --mm=rc;
+ *                    or freed again, after free() -- or after Rc::new moved
+ *                    it into a box -- on every path that reaches the use is
+ *                    a compile error.
+ *   mem_lower        after optimization, before the backend (--mm=manual):
+ *                    1. escape analysis (interprocedural): a struct
+ *                       allocation whose instances provably never leave the
+ *                       function's local values (never stored, returned,
+ *                       passed to free() or to a parameter that escapes) is
+ *                       reference counted, i.e. freed automatically; Rc
+ *                       boxes and arena handles always are;
  *                    2. ownership: inserts `retain` / `release` so that every
  *                       counted reference held by a vreg, a field or a global
  *                       is released exactly once, at the vreg's last use

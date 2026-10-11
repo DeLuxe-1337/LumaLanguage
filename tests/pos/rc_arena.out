@@ -1,0 +1,12 @@
+499500
+136 Arena
+n#!
+3
+1
+3 25 ab
+Point { x: 4, y: 10, label: "ab" } 10
+5 125 cd
+5 Rc("xy")
+5
+Rc(Point { x: 1, y: 1, label: nil }) 2
+Rc("shared text") shared text

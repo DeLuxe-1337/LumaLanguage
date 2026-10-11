@@ -1,0 +1,1 @@
+luma: runtime error: free() expects a struct instance, got Rc<P> (an Rc frees its value when its last reference goes away).

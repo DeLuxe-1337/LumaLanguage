@@ -222,6 +222,8 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         buf_printf(out, "    mov [rip + .Lvar.%s], rax\n", m->globals[in->global].name);
         if (in->imm) buf_printf(out, "    call luma_release@PLT\n");
         break;
+    case IR_KEEP:
+        break; /* only extends its operand's lifetime */
     case IR_RETAIN:
     case IR_RELEASE: {
         /* only objects (low 3 bits 0) with a nonzero count at [obj + 4] are
@@ -326,6 +328,14 @@ static void emit_structs(const IrModule *m, Buf *out) {
         buf_printf(out, "    .quad %d    # methods\n", st->nmethods);
         if (st->nmethods) buf_printf(out, "    .quad .Lsmeth.%d\n", i);
         else buf_printf(out, "    .quad 0\n");
+        buf_printf(out, "    .quad %d    # kind: %s\n", (int)st->kind,
+                   st->kind == IR_STRUCT_RC ? "Rc" : st->kind == IR_STRUCT_ARENA ? "Arena" : "user");
+        /* a user struct's Rc<S> box, for Rc::new of a value known only at run time */
+        char rcname[300];
+        snprintf(rcname, sizeof rcname, "Rc.%s", st->name);
+        int rc = st->kind == IR_STRUCT_USER ? ir_find_struct(m, rcname) : -1;
+        if (rc >= 0) buf_printf(out, "    .quad .Lstruct.%d    # Rc<%s>\n", rc, st->name);
+        else buf_printf(out, "    .quad 0\n");
         if (st->nfields) {
             buf_printf(out, ".Lsfields.%d:\n", i);
             for (int k = 0; k < st->nfields; k++) buf_printf(out, "    .quad .Lsfname.%d.%d    # %s\n", i, k, st->fields[k]);
@@ -343,8 +353,10 @@ static void emit_structs(const IrModule *m, Buf *out) {
     buf_printf(out, "\n    .section .rodata\n");
     for (int i = 0; i < m->nstructs; i++) {
         const IrStruct *st = &m->structs[i];
+        char disp[300];
+        ir_struct_display(st->name, disp, sizeof disp); /* the name in messages: Rc<Point> */
         buf_printf(out, ".Lsname.%d:\n", i);
-        x86_emit_ascii(out, st->name, strlen(st->name));
+        x86_emit_ascii(out, disp, strlen(disp));
         buf_printf(out, "    .byte 0\n");
         for (int k = 0; k < st->nfields; k++) {
             buf_printf(out, ".Lsfname.%d.%d:\n", i, k);

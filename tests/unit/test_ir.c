@@ -358,12 +358,12 @@ static void expect_mem(const char *src, const char *fname, const char *want) {
 
 static void test_memory(void) {
     /* the memory line round-trips; none is the default and is not printed */
-    expect_roundtrip("module \"m\"\nmemory rc\n\nfn @luma_main() {\nentry:\n  %n = const nil\n  ret %n\n}\n");
     expect_roundtrip("module \"m\"\nmemory manual\n\nfn @luma_main() {\nentry:\n  %n = const nil\n  ret %n\n}\n");
     IrModule m;
     CHECK(!parse_str("module \"m\"\nmemory gc\n", &m));
+    CHECK(!parse_str("module \"m\"\nmemory rc\n", &m)); /* removed: Rc::new instead */
 
-    const char *HEAD = "module \"m\"\nmemory rc\n\nextern fn @luma_write(1)\nglobal @var.x\n\n";
+    const char *HEAD = "module \"m\"\nmemory manual\n\nextern fn @luma_write(1)\nglobal @var.x\n\n";
     char src[2048];
 
     /* parameters are borrowed: no operations for them */
@@ -378,9 +378,15 @@ static void test_memory(void) {
     snprintf(src, sizeof src, "%sfn @h(%%a) {\nentry:\n  %%t = add %%a, %%a\n  store @var.x, %%t\n  call @luma_write(%%t)\n  ret %%t\n}\n", HEAD);
     expect_mem(src, "h", "fn @h(%a) {\nentry:\n  %t = add %a, %a\n  retain %t\n  store @var.x, %t\n  call @luma_write(%t)\n  ret %t\n}\n");
 
-    /* returning a borrowed parameter retains it; load's result is retained */
+    /* returning a borrowed parameter retains it; a load used right away by
+     * something that cannot free anything is a borrowed read (no operations),
+     * but one that lives across a Luma call is retained */
     snprintf(src, sizeof src, "%sfn @i(%%a) {\nentry:\n  %%g = load @var.x\n  call @luma_write(%%g)\n  ret %%a\n}\n", HEAD);
-    expect_mem(src, "i", "fn @i(%a) {\nentry:\n  %g = load @var.x\n  retain %g\n  call @luma_write(%g)\n  release %g\n  retain %a\n  ret %a\n}\n");
+    expect_mem(src, "i", "fn @i(%a) {\nentry:\n  %g = load @var.x\n  call @luma_write(%g)\n  retain %a\n  ret %a\n}\n");
+    snprintf(src, sizeof src, "%sfn @j(%%a) {\nentry:\n  %%g = load @var.x\n  %%r = call @i(%%a)\n  call @luma_write(%%g)\n  ret %%r\n}\n%s",
+             HEAD, "fn @i(%a) {\nentry:\n  ret %a\n}\n");
+    expect_mem(src, "j", "fn @j(%a) {\nentry:\n  %g = load @var.x\n  retain %g\n  %r = call @i(%a)\n  call @luma_write(%g)\n"
+               "  release %g\n  ret %r\n}\n");
 
     /* dying on a critical edge: the edge gets its own block */
     snprintf(src, sizeof src, "%sfn @k(%%a, %%c) {\nentry:\n  %%t = add %%a, %%a\n  br %%c, use, join\nuse:\n"

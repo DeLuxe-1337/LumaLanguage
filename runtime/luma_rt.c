@@ -44,21 +44,30 @@ typedef struct {
     int64_t arity;         /* including self */
 } LumaMethod;
 
-typedef struct {
+typedef struct LumaStructDesc LumaStructDesc;
+struct LumaStructDesc {
     int64_t id;            /* struct index + 1, as in instance headers */
-    const char *name;
+    const char *name;      /* as shown in messages: "Point", "Rc<Point>", "Arena" */
     int64_t nfields;
     const char *const *fields;
     const int64_t *ftys;   /* declared type mask of each field */
     int64_t nmethods;
     const LumaMethod *methods;
-} LumaStructDesc;
+    int64_t kind;          /* LUMA_STRUCT_USER / _RC (field 0: the value) / _ARENA (field 0: its state) */
+    const LumaStructDesc *rc; /* user structs: the Rc<S> descriptor (NULL if the program uses no Rc) */
+};
 
 typedef struct {
     uint64_t header;
-    const LumaStructDesc *desc;
+    const LumaStructDesc *desc; /* bit 0 set: the instance lives in an arena */
     LumaValue fields[];
 } LumaStruct;
+
+static const LumaStructDesc *desc_of(const LumaStruct *o) {
+    return (const LumaStructDesc *)((uintptr_t)o->desc & ~(uintptr_t)7);
+}
+
+static bool in_arena(const LumaStruct *o) { return (uintptr_t)o->desc & 1; }
 
 extern const uintptr_t luma_structs[]; /* emitted into every program: [count, desc...] */
 extern const int64_t luma_mm;           /* emitted into every program: LUMA_MM_* */
@@ -222,6 +231,105 @@ static void drop(LumaValue v) {
     if (*c != 0 && --*c == 0) vec_push(&dying, (void *)(uintptr_t)v);
 }
 
+/* ---- arenas ----
+ * An Arena handle is a counted struct instance (kind LUMA_STRUCT_ARENA)
+ * whose field 0 holds its state as (pointer | 1), or the fixnum 0 before
+ * first use. While an arena is entered (`arena { ... }`), every struct
+ * instance the program would otherwise free by hand is allocated in it,
+ * marked by bit 0 of its descriptor word; free() on such an instance does
+ * nothing. When the handle's last reference goes away, the values in every
+ * instance's fields are released and the memory goes back in one piece. */
+
+typedef struct ArenaChunk {
+    struct ArenaChunk *next;
+    size_t used, cap;
+    uint64_t data[];
+} ArenaChunk;
+
+typedef struct {
+    ArenaChunk *chunks; /* every chunk, newest first */
+    ArenaChunk *cur;    /* the chunk small objects are bumped from */
+    PtrVec objs;        /* LUMA_MEMCHECK: the instances (allocated individually) */
+    uint64_t nobjects;
+} ArenaState;
+
+#define ARENA_CHUNK (64 * 1024)
+
+static ArenaState *arena_state(LumaStruct *h) {
+    LumaValue f = h->fields[0];
+    if (f != luma_fixnum(0)) return (ArenaState *)(uintptr_t)(f & ~(LumaValue)1);
+    ArenaState *a = calloc(1, sizeof *a);
+    if (!a) luma_panic("Out of memory.");
+    h->fields[0] = (LumaValue)(uintptr_t)a | 1;
+    return a;
+}
+
+static void *arena_alloc(ArenaState *a, size_t size) {
+    a->nobjects++;
+    if (memcheck) {
+        void *o = alloc_object(size);
+        vec_push(&a->objs, o);
+        return o;
+    }
+    n_allocated++;
+    if (!a->cur || a->cur->cap - a->cur->used < size) {
+        bool big = size > ARENA_CHUNK / 4;
+        size_t cap = big ? size : ARENA_CHUNK;
+        ArenaChunk *c = malloc(sizeof *c + cap);
+        if (!c) luma_panic("Out of memory.");
+        c->used = 0;
+        c->cap = cap;
+        c->next = a->chunks;
+        a->chunks = c;
+        if (!big) a->cur = c; /* a big object gets a chunk of its own */
+        if (big) {
+            c->used = size;
+            return c->data;
+        }
+    }
+    void *o = (char *)a->cur->data + a->cur->used;
+    a->cur->used += size;
+    return o;
+}
+
+static size_t instance_size(int64_t nfields) { return sizeof(LumaStruct) + (size_t)nfields * sizeof(LumaValue); }
+
+/* The handle's last reference is gone: release what the instances refer
+ * to, then free them all. */
+static void arena_destroy(LumaValue state) {
+    if (state == luma_fixnum(0)) return; /* never used */
+    ArenaState *a = (ArenaState *)(uintptr_t)(state & ~(LumaValue)1);
+    if (memcheck) {
+        for (size_t i = 0; i < a->objs.n; i++) {
+            LumaStruct *o = a->objs.items[i];
+            int64_t n = desc_of(o)->nfields;
+            for (int64_t k = 0; k < n; k++) drop(o->fields[k]);
+            free_object(o, false, n);
+        }
+        free(a->objs.items);
+    } else {
+        for (ArenaChunk *c = a->chunks; c;) {
+            for (size_t off = 0; off < c->used;) {
+                LumaStruct *o = (LumaStruct *)((char *)c->data + off);
+                int64_t n = desc_of(o)->nfields;
+                for (int64_t k = 0; k < n; k++) drop(o->fields[k]);
+                off += instance_size(n);
+            }
+            ArenaChunk *next = c->next;
+            free(c);
+            c = next;
+        }
+        n_freed += a->nobjects;
+    }
+    free(a);
+}
+
+/* The arenas entered, innermost last (each holds a reference to its handle). */
+static LumaValue *arena_stack;
+static size_t narena_stack, carena_stack;
+
+static void destroy_owned(LumaValue v);
+
 /* Destroys every object in `dying`, and those their fields release in turn. */
 static void drain(void) {
     if (draining) return;
@@ -230,14 +338,41 @@ static void drain(void) {
         void *o = dying.items[--dying.n];
         if ((*(uint64_t *)o & 0xff) == LUMA_TYPE_STRUCT) {
             LumaStruct *s = o;
-            int64_t n = s->desc->nfields;
-            for (int64_t k = 0; k < n; k++) drop(s->fields[k]);
+            const LumaStructDesc *d = desc_of(s);
+            int64_t n = d->nfields;
+            if (d->kind == LUMA_STRUCT_RC) destroy_owned(s->fields[0]); /* an Rc owns its value */
+            else if (d->kind == LUMA_STRUCT_ARENA) arena_destroy(s->fields[0]);
+            else
+                for (int64_t k = 0; k < n; k++) drop(s->fields[k]);
             free_object(o, false, n);
         } else {
             free_object(o, false, 0);
         }
     }
     draining = false;
+}
+
+/* Frees a struct instance the program manages by hand (count 0, not in an
+ * arena): releases its fields, then its memory goes back to the pool. */
+static void free_manual(LumaStruct *o) {
+    int64_t n = desc_of(o)->nfields;
+    for (int64_t k = 0; k < n; k++) drop(o->fields[k]);
+    free_object(o, true, n);
+}
+
+/* The value of an Rc whose last reference went away: an instance managed
+ * by hand is freed (the Rc owned it), anything counted is released, an
+ * instance in an arena stays (the arena owns it). */
+static void destroy_owned(LumaValue v) {
+    if (!is_object(v)) return;
+    uint64_t h = header_of(v);
+    if ((h & 0xff) == LUMA_TYPE_FREED) luma_panic("Double free: the value in an Rc was already freed.");
+    LumaStruct *o = (LumaStruct *)(uintptr_t)v;
+    if ((h & 0xff) == LUMA_TYPE_STRUCT && *rc_word(o) == 0) {
+        if (!in_arena(o) && luma_mm == LUMA_MM_MANUAL) free_manual(o);
+        return;
+    }
+    drop(v);
 }
 
 /* Compiled code: the inline retain/release handle counted objects with
@@ -305,7 +440,7 @@ static unsigned value_mask(LumaValue v) {
     if (v == LUMA_NIL) return MASK_NIL;
     if (v == LUMA_TRUE || v == LUMA_FALSE) return MASK_BOOL;
     if (is_string(v)) return MASK_STR;
-    if (is_struct(v)) return MASK_STRUCT | (unsigned)(as_struct(v)->desc->id << MASK_SID_SHIFT);
+    if (is_struct(v)) return MASK_STRUCT | (unsigned)(desc_of(as_struct(v))->id << MASK_SID_SHIFT);
     return 0;
 }
 
@@ -327,7 +462,7 @@ static const char *struct_name(unsigned id) {
 
 static const char *value_type_name(LumaValue v) {
     unsigned vm = value_mask(v);
-    if (vm & MASK_STRUCT) return as_struct(v)->desc->name;
+    if (vm & MASK_STRUCT) return desc_of(as_struct(v))->name;
     switch (vm) {
     case MASK_INT: return "int";
     case MASK_STR: return "str";
@@ -502,22 +637,28 @@ static void write_value(LumaValue v, bool quoted) {
             else putchar(c);
         }
         putchar('"');
+    } else if (is_struct(v) && desc_of(as_struct(v))->kind == LUMA_STRUCT_RC) {
+        fputs("Rc(", stdout);
+        write_value(as_struct(v)->fields[0], true);
+        putchar(')');
+    } else if (is_struct(v) && desc_of(as_struct(v))->kind == LUMA_STRUCT_ARENA) {
+        fputs("Arena", stdout);
     } else if (is_struct(v)) {
         const LumaStruct *o = as_struct(v);
         bool cycle = nprinting == MAX_PRINT_DEPTH;
         for (int i = 0; i < nprinting && !cycle; i++) cycle = printing[i] == o;
         if (cycle) {
-            printf("%s { ... }", o->desc->name);
+            printf("%s { ... }", desc_of(o)->name);
             return;
         }
-        if (o->desc->nfields == 0) {
-            printf("%s {}", o->desc->name);
+        if (desc_of(o)->nfields == 0) {
+            printf("%s {}", desc_of(o)->name);
             return;
         }
         printing[nprinting++] = o;
-        printf("%s { ", o->desc->name);
-        for (int64_t i = 0; i < o->desc->nfields; i++) {
-            printf("%s%s: ", i ? ", " : "", o->desc->fields[i]);
+        printf("%s { ", desc_of(o)->name);
+        for (int64_t i = 0; i < desc_of(o)->nfields; i++) {
+            printf("%s%s: ", i ? ", " : "", desc_of(o)->fields[i]);
             write_value(o->fields[i], true);
         }
         fputs(" }", stdout);
@@ -562,14 +703,20 @@ _Noreturn void luma_undefined_variable(const char *name) {
  * accesses whose struct is known statically are plain loads and stores. The
  * functions below serve values whose struct is not known at compile time. */
 
-/* `counted` is decided by the compiler: always in --mm=rc, never in
- * --mm=none, and in --mm=manual for instances its escape analysis proves are
- * never freed by the program (the rest come from the manual pool). */
+/* `counted` is decided by the compiler: never in --mm=none; in
+ * --mm=manual for Rc boxes, arena handles, and instances its escape analysis
+ * proves are never freed by the program. The others are the program's to
+ * free: they come from the current arena if one is entered, else from the
+ * manual pool. */
 LumaValue luma_new_struct(const LumaStructDesc *d, int64_t counted) {
-    size_t size = sizeof(LumaStruct) + (size_t)d->nfields * sizeof(LumaValue);
-    LumaStruct *o = !counted && luma_mm == LUMA_MM_MANUAL && !memcheck ? pool_get(d->nfields, size) : alloc_object(size);
+    size_t size = instance_size(d->nfields);
+    LumaStruct *o;
+    bool arena = !counted && luma_mm == LUMA_MM_MANUAL && narena_stack > 0;
+    if (arena) o = arena_alloc(arena_state(as_struct(arena_stack[narena_stack - 1])), size);
+    else if (!counted && luma_mm == LUMA_MM_MANUAL && !memcheck) o = pool_get(d->nfields, size);
+    else o = alloc_object(size);
     o->header = LUMA_TYPE_STRUCT | ((uint64_t)d->id << LUMA_STRUCT_ID_SHIFT) | ((uint64_t)(counted != 0) << 32);
-    o->desc = d;
+    o->desc = (const LumaStructDesc *)((uintptr_t)d | (arena ? 1 : 0));
     for (int64_t i = 0; i < d->nfields; i++) o->fields[i] = LUMA_NIL;
     return (LumaValue)(uintptr_t)o;
 }
@@ -580,26 +727,40 @@ static LumaStruct *need_instance(LumaValue o, const char *what) {
     return as_struct(o);
 }
 
+/* The instance a field access goes to: through any Rc to its value. */
+static LumaStruct *deref_instance(LumaValue o, const char *what) {
+    LumaStruct *s = need_instance(o, what);
+    for (;;) {
+        const LumaStructDesc *d = desc_of(s);
+        if (d->kind == LUMA_STRUCT_RC) {
+            s = need_instance(s->fields[0], what);
+            continue;
+        }
+        if (d->kind == LUMA_STRUCT_ARENA) panicf("An Arena has no %s.", what);
+        return s;
+    }
+}
+
 static int64_t field_index(const LumaStruct *s, const char *name) {
-    for (int64_t i = 0; i < s->desc->nfields; i++)
-        if (strcmp(s->desc->fields[i], name) == 0) return i;
-    panicf("Struct '%s' has no field '%s'.", s->desc->name, name);
+    for (int64_t i = 0; i < desc_of(s)->nfields; i++)
+        if (strcmp(desc_of(s)->fields[i], name) == 0) return i;
+    panicf("Struct '%s' has no field '%s'.", desc_of(s)->name, name);
 }
 
 LumaValue luma_getfield(LumaValue o, const char *name) {
-    LumaStruct *s = need_instance(o, "fields");
+    LumaStruct *s = deref_instance(o, "fields");
     return s->fields[field_index(s, name)];
 }
 
 LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
-    LumaStruct *s = need_instance(o, "fields");
+    LumaStruct *s = deref_instance(o, "fields");
     int64_t k = field_index(s, name);
     check_valid(v);
-    unsigned m = (unsigned)s->desc->ftys[k];
+    unsigned m = (unsigned)desc_of(s)->ftys[k];
     if (!mask_accepts(m, value_mask(v))) {
         char want[300];
         describe_mask(m, want, sizeof want);
-        panicf("field '%s' of '%s' expects %s, got %s.", name, s->desc->name, want, value_type_name(v));
+        panicf("field '%s' of '%s' expects %s, got %s.", name, desc_of(s)->name, want, value_type_name(v));
     }
     LumaValue old = s->fields[k];
     s->fields[k] = v; /* the field takes over the caller's reference to v */
@@ -608,22 +769,90 @@ LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
 }
 
 /* free(v): in --mm=manual, frees a struct instance and releases the values
- * in its fields; in the other modes it only checks its argument (the object
- * is reclaimed automatically, or never). free(nil) does nothing. */
+ * in its fields (an instance in an arena is left to the arena); in --mm=none
+ * it only checks its argument. free(nil) does nothing. Rc boxes and arenas
+ * free themselves when their last reference goes away. */
 LumaValue luma_free(LumaValue v) {
     if (is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FREED) luma_panic("Double free: this object was already freed.");
     check_valid(v);
     if (v == LUMA_NIL) return LUMA_NIL;
     if (is_string(v)) luma_panic("free() expects a struct instance, got str (strings are freed automatically).");
     if (!is_struct(v)) panicf("free() expects a struct instance, got %s.", value_type_name(v));
-    if (luma_mm != LUMA_MM_MANUAL) return LUMA_NIL;
     LumaStruct *o = as_struct(v);
+    const LumaStructDesc *d = desc_of(o);
+    if (d->kind == LUMA_STRUCT_RC)
+        panicf("free() expects a struct instance, got %s (an Rc frees its value when its last reference goes away).", d->name);
+    if (d->kind == LUMA_STRUCT_ARENA)
+        luma_panic("free() expects a struct instance, got Arena (an arena frees everything in it when its last reference goes away).");
+    if (luma_mm != LUMA_MM_MANUAL || in_arena(o)) return LUMA_NIL;
     if (*rc_word(o) != 0) /* the compiler only counts instances that never reach free() */
-        panicf("internal error: free() of an automatically managed %s.", o->desc->name);
-    int64_t n = o->desc->nfields;
-    for (int64_t k = 0; k < n; k++) drop(o->fields[k]);
-    free_object(o, true, n);
+        panicf("internal error: free() of an automatically managed %s.", d->name);
+    free_manual(o);
     drain();
+    return LUMA_NIL;
+}
+
+/* ---- Rc ------------------------------------------------------------------
+ * Rc::new(v) with a value whose struct is known at compile time is a plain
+ * `new Rc.S(v)`; these serve the dynamic cases. Like every runtime function,
+ * they borrow their arguments and return a reference the caller owns. */
+
+static const LumaStructDesc *rc_any_desc(void) {
+    static const LumaStructDesc *any;
+    if (!any)
+        for (uint64_t i = 1; i <= luma_structs[0] && !any; i++) {
+            const LumaStructDesc *d = (const LumaStructDesc *)luma_structs[i];
+            if (d->kind == LUMA_STRUCT_RC && strcmp(d->name, "Rc<any>") == 0) any = d;
+        }
+    if (!any) luma_panic("internal error: no Rc descriptor");
+    return any;
+}
+
+LumaValue luma_rc_new(LumaValue v) {
+    check_valid(v);
+    const LumaStructDesc *d = is_struct(v) ? desc_of(as_struct(v))->rc : NULL;
+    if (!d) d = rc_any_desc();
+    LumaValue box = luma_new_struct(d, luma_mm != LUMA_MM_NONE);
+    luma_retain(v); /* the box holds its own reference */
+    as_struct(box)->fields[0] = v;
+    return box;
+}
+
+static LumaStruct *need_rc(LumaValue r, const char *fn) {
+    check_valid(r);
+    if (!is_struct(r) || desc_of(as_struct(r))->kind != LUMA_STRUCT_RC) panicf("%s expects an Rc, got %s.", fn, value_type_name(r));
+    return as_struct(r);
+}
+
+LumaValue luma_rc_get(LumaValue r) {
+    LumaValue v = need_rc(r, "Rc::get")->fields[0];
+    luma_retain(v);
+    return v;
+}
+
+LumaValue luma_rc_count(LumaValue r) { return luma_fixnum(*rc_word(need_rc(r, "Rc::count"))); }
+
+/* ---- entering arenas ----------------------------------------------------- */
+
+LumaValue luma_arena_enter(LumaValue a) {
+    check_valid(a);
+    if (!is_struct(a) || desc_of(as_struct(a))->kind != LUMA_STRUCT_ARENA)
+        panicf("arena NAME { ... } expects an Arena, got %s.", value_type_name(a));
+    arena_state(as_struct(a));
+    if (narena_stack == carena_stack) {
+        carena_stack = carena_stack ? carena_stack * 2 : 8;
+        LumaValue *n = realloc(arena_stack, carena_stack * sizeof *n);
+        if (!n) luma_panic("Out of memory.");
+        arena_stack = n;
+    }
+    luma_retain(a); /* entered, it stays alive at least until left */
+    arena_stack[narena_stack++] = a;
+    return LUMA_NIL;
+}
+
+LumaValue luma_arena_leave(void) {
+    LumaValue a = arena_stack[--narena_stack];
+    luma_release(a);
     return LUMA_NIL;
 }
 
@@ -631,15 +860,19 @@ LumaValue luma_free(LumaValue v) {
  * after self. */
 LumaFn luma_method(LumaValue o, const char *name, int64_t nargs) {
     LumaStruct *s = need_instance(o, "methods");
-    for (int64_t i = 0; i < s->desc->nmethods; i++) {
-        const LumaMethod *mt = &s->desc->methods[i];
+    if (desc_of(s)->kind == LUMA_STRUCT_ARENA) luma_panic("An Arena has no methods.");
+    /* an Rc<S>'s table forwards S's methods; anything else in an Rc has none */
+    const LumaStruct *named = s;
+    if (desc_of(s)->kind == LUMA_STRUCT_RC) named = deref_instance(o, "methods");
+    for (int64_t i = 0; i < desc_of(s)->nmethods; i++) {
+        const LumaMethod *mt = &desc_of(s)->methods[i];
         if (strcmp(mt->name, name) != 0) continue;
         if (mt->arity - 1 != nargs)
-            panicf("'%s::%s' expects %" PRId64 " argument%s, got %" PRId64 ".", s->desc->name, name, mt->arity - 1,
+            panicf("'%s::%s' expects %" PRId64 " argument%s, got %" PRId64 ".", desc_of(named)->name, name, mt->arity - 1,
                    mt->arity == 2 ? "" : "s", nargs);
         return mt->fn;
     }
-    panicf("Struct '%s' has no method '%s'.", s->desc->name, name);
+    panicf("Struct '%s' has no method '%s'.", desc_of(named)->name, name);
 }
 
 /* ---- arithmetic -------------------------------------------------------- */
@@ -785,7 +1018,7 @@ static void install_stack_guard(void) {
 /* ---- LUMA_MEMCHECK report ----------------------------------------------- */
 
 static const char *mm_name(void) {
-    return luma_mm == LUMA_MM_RC ? "rc" : luma_mm == LUMA_MM_MANUAL ? "manual" : "none";
+    return luma_mm == LUMA_MM_MANUAL ? "manual" : "none";
 }
 
 /* Live objects reachable from the global variables get marked[index] = 1. */
@@ -803,7 +1036,14 @@ static void mark_from(LumaValue v, unsigned char *marked, PtrVec *stack) {
         marked[i] = 1;
         if ((h & 0xff) == LUMA_TYPE_STRUCT) {
             const LumaStruct *s = o;
-            for (int64_t k = 0; k < s->desc->nfields; k++)
+            if (desc_of(s)->kind == LUMA_STRUCT_ARENA) { /* an arena reaches everything in it */
+                if (s->fields[0] != luma_fixnum(0)) {
+                    const ArenaState *a = (const ArenaState *)(uintptr_t)(s->fields[0] & ~(LumaValue)1);
+                    for (size_t i = 0; i < a->objs.n; i++) vec_push(stack, a->objs.items[i]);
+                }
+                continue;
+            }
+            for (int64_t k = 0; k < desc_of(s)->nfields; k++)
                 if (is_object(s->fields[k])) vec_push(stack, (void *)(uintptr_t)s->fields[k]);
         }
     }
@@ -817,7 +1057,7 @@ static void describe_objects(const unsigned char *marked, unsigned char which, c
     for (size_t i = 0; i < live.n; i++) {
         if (marked[i] != which) continue;
         const uint64_t *h = live.items[i];
-        if ((*h & 0xff) == LUMA_TYPE_STRUCT) counts[((const LumaStruct *)h)->desc->id]++;
+        if ((*h & 0xff) == LUMA_TYPE_STRUCT) counts[desc_of((const LumaStruct *)h)->id]++;
         else counts[nstructs + 1]++;
     }
     buf[0] = '\0';

@@ -1,0 +1,2 @@
+luma: memcheck: --mm=none, 2000000 allocated, 0 freed, 2000000 leaked, 0 reachable from globals
+luma: memcheck: leaked: 1000000 Node, 1000000 Rc<Node>

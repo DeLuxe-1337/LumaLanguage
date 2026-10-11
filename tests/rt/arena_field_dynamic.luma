@@ -1,0 +1,3 @@
+fun dyn(x) { return x; }
+var a = dyn(arena {});
+a.size = 1;
