@@ -1,0 +1,14 @@
+pair 1 one
+pair one 1
+Pair<str, int> { first: "one", second: 1 }
+nil
+5
+42
+Box<str?> { value: nil } <true>
+41
+7 Box<Box<int>> { value: Box<int> { value: 7 } }
+6 3
+b a 2
+7 2
+41 one 3
+nil

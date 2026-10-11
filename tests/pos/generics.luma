@@ -1,0 +1,83 @@
+// Generic structs: one definition, a typed struct per list of type arguments.
+struct Point { x: int, y: int }
+
+struct Pair<A, B> { first: A, second: B }
+impl Pair<A, B> {
+  fun swap(self): Pair<B, A> { return Pair { first: self.second, second: self.first }; }
+  fun show(self) { print("pair", self.first, self.second); }
+}
+
+struct Box<T> { value: T }
+impl Box<T> {
+  fun new(v: T): Box<T> { return Box { value: v }; }
+  fun get(self): T { return self.value; }
+  fun set(self, v: T) { self.value = v; }
+}
+impl Box<U> {                       // a second impl block, its own parameter name
+  fun empty(): Box<U?> { return Box { value: nil }; }
+  fun map_str(self): Box<str> { return Box { value: "<" + str_of(self.value) + ">" }; }
+}
+
+fun str_of(v): str {
+  if (v == nil) return "nil";
+  if (v == true) return "true";
+  if (v == false) return "false";
+  return "?";
+}
+
+struct List<T> { head: T, tail: List<T>? }
+impl List<T> {
+  fun push(self, v: T): List<T> { return List { head: v, tail: self }; }
+  fun len(self): int {
+    var n = 0;
+    var l: List<T>? = self;
+    while (l != nil) { n = n + 1; l = l.tail; }
+    return n;
+  }
+}
+
+fun sum(l: List<int>?): int {
+  var t = 0;
+  while (l != nil) { t = t + l.head; l = l.tail; }
+  return t;
+}
+
+struct Holder { boxed: Box<Point>, names: List<str>? }   // generic types in a plain struct
+
+// literals infer their type arguments from the field values
+var p = Pair { first: 1, second: "one" };
+p.show();
+var q = p.swap();
+q.show();
+print(q);
+
+// an annotation decides when the values alone cannot
+var maybe: Box<int?> = Box { value: nil };
+print(maybe.value);
+maybe.set(5);
+print(maybe.get());
+
+// associated functions infer from their arguments, or from where the result goes
+var b = Box::new(41);
+print(b.get() + 1);
+var e: Box<str?> = Box::empty();
+print(e, Box::new(true).map_str().get());
+print(Box::get(b));                  // explicit self picks the instance
+
+// nested and recursive
+var bb = Box::new(Box::new(7));
+print(bb.get().get(), bb);
+var l: List<int> = List { head: 1, tail: nil };
+l = l.push(2).push(3);
+print(sum(l), l.len());
+var words = List { head: "a", tail: nil }.push("b");
+print(words.head, words.tail.head, words.len());
+
+var h = Holder { boxed: Box::new(Point { x: 3, y: 4 }), names: words };
+print(h.boxed.get().x + h.boxed.value.y, h.names.len());
+
+// dynamic code sees each instance as an ordinary struct
+fun dyn(x) { return x; }
+print(dyn(b).get(), dyn(q).first, dyn(h).boxed.value.x);
+dyn(maybe).set(nil);
+print(maybe.get());

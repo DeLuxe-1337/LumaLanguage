@@ -64,6 +64,31 @@ static bool name_char(int c, bool first) {
     return isalpha(c) || c == '_' || (!first && (isdigit(c) || c == '.'));
 }
 
+/* End of a name starting at i. A struct name may carry a balanced group of
+ * type arguments (a generic instance): Pair<int,Box<str?>>, also inside a
+ * field reference (Pair<int,str>.first). */
+static size_t name_end(const char *s, size_t len, size_t i, bool first) {
+    for (;;) {
+        while (i < len && name_char((unsigned char)s[i], first)) {
+            i++;
+            first = false;
+        }
+        if (first || i >= len || s[i] != '<') return i;
+        size_t j = i;
+        int depth = 0;
+        while (j < len) {
+            char c = s[j];
+            if (c == '<') depth++;
+            else if (c == '>') {
+                if (--depth == 0) { j++; break; }
+            } else if (!name_char((unsigned char)c, false) && c != ',' && c != '?') return i;
+            j++;
+        }
+        if (depth != 0) return i;
+        i = j;
+    }
+}
+
 /* Reads the next token into p->tok. */
 static void next(P *p) {
     Tok *t = &p->tok;
@@ -94,7 +119,9 @@ static void next(P *p) {
         size_t ns = p->pos;
         /* vreg names may start with a digit (%0) */
         bool first = c != '%';
-        while (p->pos < p->len && name_char((unsigned char)p->src[p->pos], first && p->pos == ns)) p->pos++;
+        if (!sigil) p->pos = name_end(p->src, p->len, p->pos, true);
+        else
+            while (p->pos < p->len && name_char((unsigned char)p->src[p->pos], first && p->pos == ns)) p->pos++;
         size_t n = p->pos - ns;
         if (n == 0) {
             perr(p, p->line, "expected a name after '%c'", c);
@@ -702,8 +729,7 @@ static bool prescan_structs(P *p) {
         if (p->len - j > 7 && memcmp(p->src + j, "struct", 6) == 0 && (p->src[j + 6] == ' ' || p->src[j + 6] == '\t')) {
             j += 6;
             while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
-            size_t k = j;
-            while (k < p->len && name_char((unsigned char)p->src[k], k == j)) k++;
+            size_t k = name_end(p->src, p->len, j, true);
             char name[256];
             if (k == j || k - j >= sizeof name) {
                 perr(p, line, "expected a struct name");
@@ -711,7 +737,14 @@ static bool prescan_structs(P *p) {
             }
             memcpy(name, p->src + j, k - j);
             name[k - j] = '\0';
-            if (strchr(name, '.') && (strncmp(name, "Rc.", 3) != 0 || strchr(name + 3, '.'))) {
+            /* dots only inside type arguments, or in the builtin Rc.S */
+            int depth = 0;
+            bool dot = false;
+            for (const char *c = strncmp(name, "Rc.", 3) == 0 ? name + 3 : name; *c; c++) {
+                depth += *c == '<' ? 1 : *c == '>' ? -1 : 0;
+                dot |= *c == '.' && depth == 0;
+            }
+            if (dot) {
                 perr(p, line, "struct names cannot contain '.' (except the builtin Rc.S)");
                 return false;
             }

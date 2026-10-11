@@ -1,0 +1,3 @@
+struct N<T> { next: N<Box<T>>? }
+struct Box<T> { value: T }
+var n: N<int>? = nil;

@@ -1,0 +1,2 @@
+struct Box<T> { value: T<int> }
+var b = Box { value: 1 };

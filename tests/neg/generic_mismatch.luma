@@ -1,0 +1,3 @@
+struct Box<T> { value: T }
+fun f(b: Box<int>) { return b.value; }
+f(Box { value: "s" });

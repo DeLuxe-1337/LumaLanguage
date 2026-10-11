@@ -42,6 +42,12 @@ typedef struct {
     Ty ty;     /* declared type (T_ANY if unannotated) */
 } Binding;
 
+/* A type parameter bound to a type (inside a generic struct's instance). */
+typedef struct {
+    const char *name;
+    Ty ty;
+} TArg;
+
 typedef struct {
     const char *name; /* "f", or "Point::len" for functions of an impl (then owned) */
     int global;   /* IR global index (@fn.NAME / @m.STRUCT.NAME) */
@@ -52,6 +58,9 @@ typedef struct {
     int sid;      /* impl functions: the struct; -1 for top-level functions */
     bool has_self;/* impl functions whose first parameter is `self` (methods) */
     char *owned_name;
+    const TArg *tenv; /* functions of a generic struct's instance: its type arguments */
+    int ntenv;
+    bool instance;    /* (its method table entry is added when the instance is created) */
 } FnInfo;
 
 typedef struct {
@@ -60,7 +69,18 @@ typedef struct {
     const Stmt *decl;   /* NULL for builtins */
     int *fns;           /* indices into L.fns of the impl's functions */
     int nfns;
+    int generic;        /* instances of a generic struct: index into L.generics, else -1 */
+    Ty *targs;          /* ... and its type arguments (owned) */
 } StructInfo;
+
+/* A generic struct (`struct Box<T> { ... }`) and its impl blocks. Each
+ * distinct list of type arguments becomes one struct (an instance) when a
+ * type, literal or call first needs it. */
+typedef struct {
+    const Stmt *decl;
+    const Stmt **impls;
+    int nimpls;
+} Generic;
 
 typedef struct {
     const char *name;
@@ -81,7 +101,6 @@ typedef struct {
 typedef struct {
     int fi;
     bool is_main;
-    const FnInfo *info; /* NULL for luma_main */
     int cur;
     int *order;
     int norder, cap_order;
@@ -92,6 +111,7 @@ typedef struct {
     int depth;
     int ntemps, nlabels;
     int narenas;  /* arena blocks entered at this point (left before a return) */
+    int info;     /* index into L.fns; -1 for luma_main */
 } Fn;
 
 typedef struct {
@@ -105,6 +125,13 @@ typedef struct {
     int ngvars;
     StructInfo *structs;
     int nstructs;
+    Generic *generics;
+    int ngenerics;
+    const TArg *tenv; /* the type parameters in scope (in a generic instance) */
+    int ntenv;
+    TArg **tenvs;     /* every environment allocated (freed at the end) */
+    int ntenvs;
+    Ty expect;        /* the type the expression being lowered flows into, or 0 */
     int nstrings;
     int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
     int rc_new_fn, rc_get_fn, rc_count_fn, arena_enter_fn, arena_leave_fn;
@@ -129,6 +156,14 @@ static int find_struct(L *l, const char *name) {
         if (strcmp(l->structs[i].name, name) == 0) return i;
     return -1;
 }
+
+static int find_generic(L *l, const char *name) {
+    for (int i = 0; i < l->ngenerics; i++)
+        if (strcmp(l->generics[i].decl->name, name) == 0) return i;
+    return -1;
+}
+
+static const FnInfo *cur_info(L *l) { return l->f->info >= 0 ? &l->fns[l->f->info] : NULL; }
 
 /* The function `name` of struct si's impl, as an index into l->fns, or -1. */
 static int find_impl_fn(L *l, int si, const char *name) {
@@ -291,44 +326,121 @@ static bool is_base_type(const char *n) {
            strcmp(n, "any") == 0;
 }
 
+static int instantiate(L *l, int gi, const Ty *targs, int line, int col);
+
+/* The struct (index into l->structs) a type is exactly, or -1. */
+static int static_struct_of(L *l, Ty t) {
+    int sid = ty_sid(t);
+    if (sid < 0 || !ir_ty_sub(t, ty_struct_of(sid))) return -1;
+    for (int i = 0; i < l->nstructs; i++)
+        if (l->structs[i].sid == sid) return i;
+    return -1;
+}
+
+/* A type argument as the instance's name spells it: only types that can be
+ * written (int, Point?, nil, any, ...); anything else (int|str, any struct)
+ * becomes any. */
+static Ty targ_norm(Ty t) {
+    if (t == 0 || t == T_ANY) return T_ANY;
+    int sid = ty_sid(t);
+    if ((t & TY_STRUCT) && sid < 0) return T_ANY;
+    int members = __builtin_popcount(t & (T_INT | T_STR | T_BOOL)) + ((t & TY_STRUCT) ? 1 : 0);
+    if (members == 1 || (members == 0 && (t & T_NIL))) return t;
+    return T_ANY;
+}
+
+static const TArg *tenv_find(L *l, const char *name) {
+    for (int i = 0; i < l->ntenv; i++)
+        if (strcmp(l->tenv[i].name, name) == 0) return &l->tenv[i];
+    return NULL;
+}
+
 /* Resolves a Luma type annotation; T_ANY if absent. */
 static Ty resolve_type(L *l, const TypeRef *t) {
     if (!t->name) return T_ANY;
+    Ty nil = t->nullable ? T_NIL : 0;
+    const TArg *ta = tenv_find(l, t->name);
+    if (ta) {
+        if (t->nargs) {
+            lerr(l, t->line, t->col, "type parameter '%s' takes no type arguments", t->name);
+            return T_ANY;
+        }
+        return ta->ty == T_ANY ? T_ANY : ir_ty_union(ta->ty, nil);
+    }
     if (strcmp(t->name, "Rc") == 0) {
-        if (!t->arg) {
+        if (t->nargs != 1) {
             lerr(l, t->line, t->col, "Rc needs a type argument: Rc<Point>, or Rc<any> for a value that is not a struct");
             return T_ANY;
         }
+        const TypeRef *a = &t->args[0];
         char n[300];
-        if (is_base_type(t->arg)) snprintf(n, sizeof n, "Rc");
-        else if (find_struct(l, t->arg) >= 0 && l->structs[find_struct(l, t->arg)].decl) snprintf(n, sizeof n, "Rc.%s", t->arg);
-        else {
-            lerr(l, t->line, t->col, "unknown type '%s' in Rc<%s>", t->arg, t->arg);
+        if (!a->nargs && !tenv_find(l, a->name) && !is_base_type(a->name) && find_struct(l, a->name) < 0 &&
+            find_generic(l, a->name) < 0) {
+            lerr(l, t->line, t->col, "unknown type '%s' in Rc<%s>", a->name, a->name);
             return T_ANY;
         }
+        Ty at = resolve_type(l, a);
+        int si = static_struct_of(l, at);
+        if (si >= 0 && l->structs[si].decl && l->structs[si].generic < 0 && !(at & T_NIL)) snprintf(n, sizeof n, "Rc.%s", l->structs[si].name);
+        else snprintf(n, sizeof n, "Rc");
         int sid = builtin_sid(l, n);
-        return sid >= 0 ? ty_struct_of(sid) | (t->nullable ? T_NIL : 0) : T_ANY;
+        return sid >= 0 ? ty_struct_of(sid) | nil : T_ANY;
     }
-    if (t->arg) {
-        lerr(l, t->line, t->col, "'%s' takes no type argument (only Rc<T> does)", t->name);
+    int gi = find_generic(l, t->name);
+    if (gi >= 0) {
+        const Stmt *d = l->generics[gi].decl;
+        if (t->nargs != d->ntparams) {
+            lerr(l, t->line, t->col, "'%s' takes %zu type argument%s, got %zu", t->name, d->ntparams,
+                 d->ntparams == 1 ? "" : "s", t->nargs);
+            return T_ANY;
+        }
+        Ty *args = xmalloc(t->nargs * sizeof *args);
+        for (size_t i = 0; i < t->nargs; i++) args[i] = resolve_type(l, &t->args[i]);
+        int si = l->failed ? -1 : instantiate(l, gi, args, t->line, t->col);
+        free(args);
+        return si >= 0 ? ty_struct_of(l->structs[si].sid) | nil : T_ANY;
+    }
+    if (t->nargs) {
+        lerr(l, t->line, t->col, "'%s' takes no type arguments (it is not a generic struct)", t->name);
         return T_ANY;
     }
     if (strcmp(t->name, "Arena") == 0) {
         int sid = builtin_sid(l, "Arena");
-        return sid >= 0 ? ty_struct_of(sid) | (t->nullable ? T_NIL : 0) : T_ANY;
+        return sid >= 0 ? ty_struct_of(sid) | nil : T_ANY;
     }
     static const struct { const char *name; Ty ty; } N[] = {
         {"int", T_INT}, {"str", T_STR}, {"bool", T_BOOL}, {"nil", T_NIL}, {"any", T_ANY}};
     for (size_t i = 0; i < sizeof N / sizeof *N; i++)
-        if (strcmp(t->name, N[i].name) == 0) return N[i].ty | (t->nullable ? T_NIL : 0);
+        if (strcmp(t->name, N[i].name) == 0) return N[i].ty | nil;
     int si = find_struct(l, t->name);
-    if (si >= 0) return ty_struct_of(l->structs[si].sid) | (t->nullable ? T_NIL : 0);
+    if (si >= 0) return ty_struct_of(l->structs[si].sid) | nil;
     CType c;
     if (ctype_from_name(t->name, false, &c) || strcmp(t->name, "f32") == 0 || strcmp(t->name, "f64") == 0)
         lerr(l, t->line, t->col, "'%s' is a C type; it can only be used in extern declarations (Luma types: int, str, bool, nil, any, or a struct)", t->name);
     else
         lerr(l, t->line, t->col, "unknown type '%s' (Luma types: int, str, bool, nil, any, or a struct)", t->name);
     return T_ANY;
+}
+
+/* Type inference for a generic struct's type parameters (names[0..n)):
+ * matches the annotation `pat` (as written in the generic's declaration)
+ * against a value's static type, binding parameters it names. */
+static void unify(L *l, const TypeRef *pat, Ty actual, const char *const *names, size_t n, Ty *binds, bool *bound) {
+    if (!pat->name || actual == 0) return;
+    if (!pat->nargs)
+        for (size_t i = 0; i < n; i++)
+            if (strcmp(pat->name, names[i]) == 0) {
+                Ty a = pat->nullable && actual != T_ANY ? ir_ty_inter(actual, T_ANY & ~T_NIL) : actual;
+                if (!a) return; /* only nil: says nothing about the parameter */
+                binds[i] = bound[i] ? ir_ty_union(binds[i], a) : a;
+                bound[i] = true;
+                return;
+            }
+    int gi = find_generic(l, pat->name);
+    if (gi < 0 || pat->nargs != l->generics[gi].decl->ntparams) return;
+    int si = static_struct_of(l, ir_ty_inter(actual, T_ANY & ~T_NIL));
+    if (si < 0 || l->structs[si].generic != gi) return;
+    for (size_t k = 0; k < pat->nargs; k++) unify(l, &pat->args[k], l->structs[si].targs[k], names, n, binds, bound);
 }
 
 /* Resolves a C type in an extern declaration. */
@@ -857,26 +969,71 @@ static Val lower_arena(L *l, const Expr *e, int hint) {
     return (Val){a, ty};
 }
 
+/* The instance of generic gi whose type arguments are inferred from (in this
+ * order) the type the value flows into, when that is an instance of gi, and
+ * the static types of the values given for annotated parts (pats[i] against
+ * tys[i]); parameters nothing determines are any. names: the parameter names
+ * the patterns use. */
+static int infer_instance(L *l, int gi, Ty expect, const char *const *names, const TypeRef *const *pats,
+                          const Ty *tys, size_t n, const TypeRef *ret, int line, int col) {
+    const Stmt *d = l->generics[gi].decl;
+    size_t np = d->ntparams;
+    Ty *binds = xcalloc(np, sizeof *binds);
+    bool *bound = xcalloc(np, sizeof *bound);
+    int esi = expect ? static_struct_of(l, ir_ty_inter(expect, T_ANY & ~T_NIL)) : -1;
+    if (esi >= 0 && l->structs[esi].generic == gi && !ret) {
+        for (size_t i = 0; i < np; i++) binds[i] = l->structs[esi].targs[i];
+    } else {
+        for (size_t i = 0; i < n; i++)
+            if (pats[i]) unify(l, pats[i], tys[i], names, np, binds, bound);
+        if (ret && expect) { /* Box::empty(): only the result names T */
+            Ty *rb = xcalloc(np, sizeof *rb);
+            bool *rbd = xcalloc(np, sizeof *rbd);
+            unify(l, ret, expect, names, np, rb, rbd);
+            for (size_t i = 0; i < np; i++)
+                if (!bound[i] && rbd[i]) {
+                    binds[i] = rb[i];
+                    bound[i] = true;
+                }
+            free(rb);
+            free(rbd);
+        }
+        for (size_t i = 0; i < np; i++)
+            if (!bound[i]) binds[i] = T_ANY;
+    }
+    int si = instantiate(l, gi, binds, line, col);
+    free(binds);
+    free(bound);
+    return si;
+}
+
 /* Name { field: value, ... } */
-static Val lower_struct_literal(L *l, const Expr *e, int hint) {
+static Val lower_struct_literal(L *l, const Expr *e, int hint, Ty expect) {
     int si = find_struct(l, e->name);
+    int gi = si < 0 ? find_generic(l, e->name) : -1;
     if ((si >= 0 && !l->structs[si].decl) || strcmp(e->name, "Rc") == 0 || strcmp(e->name, "Arena") == 0) {
         lerr(l, e->line, e->col, "'%s' is a builtin type; create one with %s", e->name,
              strcmp(e->name, "Arena") == 0 ? "arena { ... }" : "Rc::new(...)");
         return NO_VAL;
     }
-    if (si < 0) {
+    if (si < 0 && gi < 0) {
         lerr(l, e->line, e->col, "unknown struct '%s'", e->name);
         return NO_VAL;
     }
-    const StructInfo *st = &l->structs[si];
-    const IrStruct *ir = &l->m->structs[st->sid];
-    int nf = ir->nfields;
+    /* the fields as declared (for a generic struct, all instances share them) */
+    const Stmt *decl = gi >= 0 ? l->generics[gi].decl : NULL;
+    int nf = gi >= 0 ? (int)decl->nparams : l->m->structs[l->structs[si].sid].nfields;
     int *where = xmalloc((size_t)(nf ? nf : 1) * sizeof *where); /* field -> argument index */
     for (int k = 0; k < nf; k++) where[k] = -1;
     Val r = NO_VAL;
     for (size_t i = 0; i < e->nargs; i++) {
-        int k = ir_struct_field(ir, e->fields[i]);
+        int k = -1;
+        if (gi >= 0) {
+            for (int j = 0; j < nf && k < 0; j++)
+                if (strcmp(decl->params[j], e->fields[i]) == 0) k = j;
+        } else {
+            k = ir_struct_field(&l->m->structs[l->structs[si].sid], e->fields[i]);
+        }
         if (k < 0) {
             lerr(l, e->field_line[i], e->field_col[i], "struct '%s' has no field '%s'", e->name, e->fields[i]);
             goto done;
@@ -889,32 +1046,50 @@ static Val lower_struct_literal(L *l, const Expr *e, int hint) {
     }
     for (int k = 0; k < nf; k++)
         if (where[k] < 0) {
-            lerr(l, e->line, e->col, "missing field '%s' in %s literal", ir->fields[k], e->name);
+            lerr(l, e->line, e->col, "missing field '%s' in %s literal", gi >= 0 ? decl->params[k] : l->m->structs[l->structs[si].sid].fields[k], e->name);
             goto done;
         }
     Val *vals = xmalloc((e->nargs ? e->nargs : 1) * sizeof *vals);
     if (lower_operands(l, e->args, e->nargs, vals)) {
-        int *args = xmalloc((size_t)(nf ? nf : 1) * sizeof *args);
-        for (int k = 0; k < nf; k++) {
-            char what[300];
-            snprintf(what, sizeof what, "field '%s' of '%s'", ir->fields[k], e->name);
-            const Expr *a = e->args[where[k]];
-            flow(l, vals[where[k]], ir->ftys[k], what, a->line, a->col);
-            args[k] = vals[where[k]].v;
-        }
-        if (!l->failed) {
-            int d = hint >= 0 ? hint : temp(l);
-            IrInstr *in = emit(l, IR_NEW, e->line);
-            in->dst = d;
-            in->sid = st->sid;
-            in->nargs = nf;
-            if (nf) {
-                in->args = xmalloc((size_t)nf * sizeof(int));
-                memcpy(in->args, args, (size_t)nf * sizeof(int));
+        if (gi >= 0) { /* infer the type arguments from the field values */
+            const TypeRef **pats = xmalloc((size_t)(nf ? nf : 1) * sizeof *pats);
+            Ty *tys = xmalloc((size_t)(nf ? nf : 1) * sizeof *tys);
+            for (int k = 0; k < nf; k++) {
+                pats[k] = &decl->param_types[k];
+                tys[k] = vals[where[k]].ty;
             }
-            r = (Val){d, ty_struct_of(st->sid)};
+            si = infer_instance(l, gi, expect, (const char *const *)decl->tparams, pats, tys, (size_t)nf, NULL, e->line, e->col);
+            free(pats);
+            free(tys);
         }
-        free(args);
+        if (si >= 0 && !l->failed) {
+            const StructInfo *st = &l->structs[si];
+            const IrStruct *ir = &l->m->structs[st->sid];
+            char disp[600];
+            ir_struct_display(ir->name, disp, sizeof disp);
+            int *args = xmalloc((size_t)(nf ? nf : 1) * sizeof *args);
+            for (int k = 0; k < nf; k++) {
+                char what[700];
+                snprintf(what, sizeof what, "field '%s' of '%s'", ir->fields[k], disp);
+                const Expr *a = e->args[where[k]];
+                flow(l, vals[where[k]], l->m->structs[st->sid].ftys[k], what, a->line, a->col);
+                args[k] = vals[where[k]].v;
+            }
+            if (!l->failed) {
+                int sid = l->structs[si].sid;
+                int d = hint >= 0 ? hint : temp(l);
+                IrInstr *in = emit(l, IR_NEW, e->line);
+                in->dst = d;
+                in->sid = sid;
+                in->nargs = nf;
+                if (nf) {
+                    in->args = xmalloc((size_t)nf * sizeof(int));
+                    memcpy(in->args, args, (size_t)nf * sizeof(int));
+                }
+                r = (Val){d, ty_struct_of(sid)};
+            }
+            free(args);
+        }
     }
     free(vals);
 done:
@@ -1044,30 +1219,97 @@ done:
 }
 
 /* Struct::name(args) */
-static Val lower_assoc_call(L *l, const Expr *e, int hint) {
+static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
     if (strcmp(e->name, "Rc") == 0) return lower_rc_call(l, e, hint);
     if (strcmp(e->name, "Arena") == 0) {
         lerr(l, e->line, e->col, "Arena has no functions; create an arena with arena { ... }");
         return NO_VAL;
     }
     int si = find_struct(l, e->name);
-    if (si < 0) {
+    int gi = si < 0 ? find_generic(l, e->name) : -1;
+    if (si < 0 && gi < 0) {
         lerr(l, e->line, e->col, "unknown struct '%s'", e->name);
         return NO_VAL;
+    }
+    if (gi >= 0) {
+        /* Box::new(args): the instance comes from the argument types (and the
+         * type the result flows into), so arguments are lowered first */
+        const Stmt *fd = NULL, *im = NULL;
+        const Generic *g = &l->generics[gi];
+        for (int k = 0; k < g->nimpls && !fd; k++)
+            for (size_t j = 0; j < g->impls[k]->n && !fd; j++)
+                if (strcmp(g->impls[k]->stmts[j]->name, e->str) == 0) {
+                    fd = g->impls[k]->stmts[j];
+                    im = g->impls[k];
+                }
+        if (!fd) {
+            lerr(l, e->line, e->col, "struct '%s' has no function '%s'", e->name, e->str);
+            return NO_VAL;
+        }
+        if (e->nargs != fd->nparams) {
+            lerr(l, e->line, e->col, "'%s::%s' expects %zu argument%s, got %zu", e->name, e->str, fd->nparams,
+                 fd->nparams == 1 ? "" : "s", e->nargs);
+            return NO_VAL;
+        }
+        Val *vals = xmalloc((e->nargs ? e->nargs : 1) * sizeof *vals);
+        Val r = NO_VAL;
+        if (lower_operands(l, e->args, e->nargs, vals)) {
+            const TypeRef **pats = xmalloc((e->nargs ? e->nargs : 1) * sizeof *pats);
+            Ty *tys = xmalloc((e->nargs ? e->nargs : 1) * sizeof *tys);
+            for (size_t k = 0; k < e->nargs; k++) {
+                pats[k] = strcmp(fd->params[k], "self") == 0 ? NULL : &fd->param_types[k];
+                tys[k] = vals[k].ty;
+            }
+            /* `self` passed explicitly (Box::get(b)) names the instance directly */
+            int bsi = -1;
+            if (e->nargs && !pats[0]) {
+                bsi = static_struct_of(l, vals[0].ty);
+                if (bsi >= 0 && l->structs[bsi].generic != gi) bsi = -1;
+            }
+            if (e->nargs && !pats[0] && bsi < 0 && !l->failed) {
+                /* the receiver's instance is only known at run time: a method call */
+                free(pats);
+                free(tys);
+                int d = hint >= 0 ? hint : -1;
+                r = result(l, hint, &d);
+                IrInstr *in = emit(l, IR_CALLM, e->line);
+                in->dst = hint == DISCARD ? IR_NONE : d;
+                in->a = vals[0].v;
+                in->name = xstrdup(e->str);
+                in->nargs = (int)e->nargs - 1;
+                if (in->nargs) {
+                    in->args = xmalloc((size_t)in->nargs * sizeof(int));
+                    for (int k = 0; k < in->nargs; k++) in->args[k] = vals[k + 1].v;
+                }
+                r.ty = T_ANY;
+                free(vals);
+                return r;
+            }
+            int isi = bsi >= 0 ? bsi
+                    : infer_instance(l, gi, expect, (const char *const *)im->tparams, pats, tys, e->nargs,
+                                     fd->type.name ? &fd->type : NULL, e->line, e->col);
+            free(pats);
+            free(tys);
+            int fi = isi >= 0 ? find_impl_fn(l, isi, e->str) : -1;
+            if (fi >= 0 && !l->failed) r = call_fn(l, &l->fns[fi], vals, e->args, hint, e->line, e->col);
+        }
+        free(vals);
+        return r;
     }
     int fi = find_impl_fn(l, si, e->str);
     if (fi < 0) {
         lerr(l, e->line, e->col, "struct '%s' has no function '%s'", e->name, e->str);
         return NO_VAL;
     }
-    const FnInfo *f = &l->fns[fi];
-    if ((int)e->nargs != f->arity) {
+    if ((int)e->nargs != l->fns[fi].arity) {
+        const FnInfo *f = &l->fns[fi];
         lerr(l, e->line, e->col, "'%s' expects %d argument%s, got %zu", f->name, f->arity, f->arity == 1 ? "" : "s", e->nargs);
         return NO_VAL;
     }
     Val *vals = xmalloc((e->nargs ? e->nargs : 1) * sizeof *vals);
     Val r = NO_VAL;
-    if (lower_operands(l, e->args, e->nargs, vals)) r = call_fn(l, f, vals, e->args, hint, e->line, e->col);
+    /* (lowering the arguments may create instances, which moves l->fns) */
+    if (lower_operands(l, e->args, e->nargs, vals)) r = call_fn(l, &l->fns[fi], vals, e->args, hint, e->line, e->col);
     free(vals);
     return r;
 }
@@ -1077,6 +1319,7 @@ static Val assign_to(L *l, const Expr *e, Name n, int hint) {
     char what[300];
     snprintf(what, sizeof what, "variable '%s'", e->name);
     if (n.kind == NAME_LOCAL) {
+        l->expect = n.ty;
         Val v = lower_into(l, e->right, n.index);
         if (v.v < 0) return NO_VAL;
         v.ty = flow(l, v, n.ty, what, e->right->line, e->right->col);
@@ -1086,6 +1329,7 @@ static Val assign_to(L *l, const Expr *e, Name n, int hint) {
         }
         return v;
     }
+    l->expect = n.ty;
     Val v = lower_expr(l, e->right, hint >= 0 ? hint : -1);
     if (v.v < 0) return NO_VAL;
     v.ty = flow(l, v, n.ty, what, e->right->line, e->right->col);
@@ -1099,18 +1343,22 @@ static Val assign_to(L *l, const Expr *e, Name n, int hint) {
  * that is free (no extra mov). The hint is only ever written by the final
  * instruction of the expression, after all operands are read, so `x = x + 1`
  * can safely lower to `%x = add %x, %1`. DISCARD means the value is unused. */
-static Val lower_expr_at(L *l, const Expr *e, int hint);
+static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect);
 
-/* Instructions emitted for e (after its operands) carry e's column. */
+/* Instructions emitted for e (after its operands) carry e's column. The type
+ * the caller set in l->expect (what e's value flows into) applies to e alone,
+ * not to its operands. */
 static Val lower_expr(L *l, const Expr *e, int hint) {
     int saved = l->col;
+    Ty expect = l->expect;
+    l->expect = 0;
     l->col = e->col;
-    Val v = lower_expr_at(l, e, hint);
+    Val v = lower_expr_at(l, e, hint, expect);
     l->col = saved;
     return v;
 }
 
-static Val lower_expr_at(L *l, const Expr *e, int hint) {
+static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
     if (l->failed) return NO_VAL;
     int d = hint >= 0 ? hint : -1;
     IrInstr *in;
@@ -1227,9 +1475,9 @@ static Val lower_expr_at(L *l, const Expr *e, int hint) {
     case EXPR_METHOD:
         return lower_method_call(l, e, hint);
     case EXPR_ASSOC:
-        return lower_assoc_call(l, e, hint);
+        return lower_assoc_call(l, e, hint, expect);
     case EXPR_STRUCT:
-        return lower_struct_literal(l, e, hint);
+        return lower_struct_literal(l, e, hint, expect);
     case EXPR_ARENA:
         return lower_arena(l, e, hint);
     }
@@ -1257,7 +1505,9 @@ static void lower_var(L *l, const Stmt *s) {
     }
     if (f->depth == 0) { /* top-level variable: a module global */
         int g = find_gvar(l, s->name);
+        l->expect = l->gvars[g].ty;
         Val v = s->expr ? lower_expr(l, s->expr, -1) : NO_VAL;
+        l->expect = 0;
         if (l->failed) return;
         if (v.v < 0) {
             v = (Val){temp(l), T_NIL};
@@ -1280,6 +1530,7 @@ static void lower_var(L *l, const Stmt *s) {
     int idx = f->nscope - 1;
     int v = new_var_vreg(l, s->name);
     if (s->expr) {
+        l->expect = ty;
         Val iv = lower_into(l, s->expr, v);
         if (iv.v >= 0) flow(l, iv, ty, what, s->expr->line, s->expr->col);
     } else {
@@ -1305,13 +1556,14 @@ static void lower_stmt(L *l, const Stmt *s) {
     case STMT_RETURN: {
         Val v;
         if (s->expr) {
+            l->expect = cur_info(l) ? cur_info(l)->ret : 0;
             v = lower_expr(l, s->expr, -1);
             if (v.v < 0) return;
         } else {
             v = (Val){temp(l), T_NIL};
             emit(l, IR_CONST_NIL, s->line)->dst = v.v;
         }
-        const FnInfo *fi = l->f->info;
+        const FnInfo *fi = cur_info(l);
         if (fi) {
             char what[300];
             snprintf(what, sizeof what, "return value of '%s'", fi->name);
@@ -1454,7 +1706,7 @@ static void end_function(L *l, int line, int col) {
             emit(l, IR_RET, line)->a = r;
         }
         bool reachable_end = finish_blocks(l, implicit);
-        const FnInfo *fi = l->f->info;
+        const FnInfo *fi = cur_info(l);
         if (reachable_end && fi && !(fi->ret & T_NIL)) {
             char tn[300];
             ty_name(l, fi->ret, tn, sizeof tn);
@@ -1471,19 +1723,22 @@ static void end_function(L *l, int line, int col) {
     memset(f, 0, sizeof *f);
 }
 
-static void begin_function(L *l, Fn *f, int fi, const FnInfo *info) {
+static void begin_function(L *l, Fn *f, int fi, int info) {
     memset(f, 0, sizeof *f);
     f->fi = fi;
-    f->is_main = info == NULL;
+    f->is_main = info < 0;
     f->info = info;
     l->f = f;
     set_block(l, ir_func_block(fn(l), "entry"));
 }
 
-static void lower_function(L *l, const FnInfo *info) {
+static void lower_function(L *l, int idx) {
+    const FnInfo *info = &l->fns[idx];
     const Stmt *s = info->decl;
     Fn f;
-    begin_function(l, &f, l->m->globals[info->global].func, info);
+    l->tenv = info->tenv; /* a generic instance's function sees its type arguments */
+    l->ntenv = info->ntenv;
+    begin_function(l, &f, l->m->globals[info->global].func, idx);
     /* parameters and the body's top-level declarations share one scope */
     f.depth = 1;
     for (size_t i = 0; i < s->nparams && !l->failed; i++) {
@@ -1492,11 +1747,13 @@ static void lower_function(L *l, const FnInfo *info) {
                 lerr(l, s->param_line[i], s->param_col[i], "duplicate parameter '%s'", s->params[i]);
         int v = ir_func_new_vreg(fn(l), s->params[i]); /* params are vregs 0..n-1 */
         mark_var(l, v, true);
-        bind(l, s->params[i], v, info->ptypes[i]);
+        bind(l, s->params[i], v, l->fns[idx].ptypes[i]);
     }
     for (size_t i = 0; i < s->n && !l->failed; i++) lower_stmt(l, s->stmts[i]);
     /* "can reach the end" errors point at the function name */
     end_function(l, s->line, s->col);
+    l->tenv = NULL;
+    l->ntenv = 0;
 }
 
 static bool name_taken(L *l, const Stmt *s) {
@@ -1528,12 +1785,46 @@ static void collect_structs(L *l, const Program *prog) {
             lerr(l, s->line, s->col, "'%s' is a builtin type name and cannot name a struct", s->name);
             return;
         }
-        if (find_struct(l, s->name) >= 0) {
+        if (find_struct(l, s->name) >= 0 || find_generic(l, s->name) >= 0) {
             lerr(l, s->line, s->col, "struct '%s' is already defined", s->name);
             return;
         }
+        if (s->ntparams) { /* generic: instantiated on demand */
+            for (size_t k = 0; k < s->ntparams; k++)
+                if (is_type_name(s->tparams[k])) {
+                    lerr(l, s->line, s->col, "'%s' is a builtin type name and cannot name a type parameter", s->tparams[k]);
+                    return;
+                }
+            l->generics = xrealloc(l->generics, (size_t)(l->ngenerics + 1) * sizeof *l->generics);
+            l->generics[l->ngenerics++] = (Generic){s, NULL, 0};
+            continue;
+        }
         l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
-        l->structs[l->nstructs++] = (StructInfo){s->name, ir_add_struct(l->m, s->name), s, NULL, 0};
+        l->structs[l->nstructs++] = (StructInfo){s->name, ir_add_struct(l->m, s->name), s, NULL, 0, -1, NULL};
+    }
+    /* impl blocks of generic structs: their functions are added per instance */
+    for (size_t i = 0; i < prog->len && !l->failed; i++) {
+        const Stmt *s = prog->stmts[i];
+        if (s->kind != STMT_IMPL) continue;
+        int gi = find_generic(l, s->name);
+        if (gi < 0) continue;
+        Generic *g = &l->generics[gi];
+        if (s->ntparams != g->decl->ntparams) {
+            if (!s->ntparams)
+                lerr(l, s->line, s->col, "impl for generic struct '%s' needs its type parameters: impl %s<%s%s> { ... }", s->name,
+                     s->name, g->decl->tparams[0], g->decl->ntparams > 1 ? ", ..." : "");
+            else
+                lerr(l, s->line, s->col, "'%s' has %zu type parameter%s, but this impl declares %zu", s->name, g->decl->ntparams,
+                     g->decl->ntparams == 1 ? "" : "s", s->ntparams);
+            return;
+        }
+        for (size_t k = 0; k < s->ntparams; k++)
+            if (is_type_name(s->tparams[k])) {
+                lerr(l, s->line, s->col, "'%s' is a builtin type name and cannot name a type parameter", s->tparams[k]);
+                return;
+            }
+        g->impls = xrealloc(g->impls, (size_t)(g->nimpls + 1) * sizeof *g->impls);
+        g->impls[g->nimpls++] = s;
     }
     /* builtin structs (docs/DESIGN.md "Memory"): an Rc box per user struct
      * (Rc.S, written Rc<S>) plus Rc for other values, and Arena handles */
@@ -1544,14 +1835,15 @@ static void collect_structs(L *l, const Program *prog) {
         else snprintf(name, sizeof name, "Rc.%s", l->structs[k].name);
         int sid = ir_add_struct(l->m, name);
         l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
-        l->structs[l->nstructs++] = (StructInfo){l->m->structs[sid].name, sid, NULL, NULL, 0};
+        l->structs[l->nstructs++] = (StructInfo){l->m->structs[sid].name, sid, NULL, NULL, 0, -1, NULL};
     }
     if (l->uses_arena) {
         int sid = ir_add_struct(l->m, "Arena");
         l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
-        l->structs[l->nstructs++] = (StructInfo){l->m->structs[sid].name, sid, NULL, NULL, 0};
+        l->structs[l->nstructs++] = (StructInfo){l->m->structs[sid].name, sid, NULL, NULL, 0, -1, NULL};
     }
-    for (int si = 0; si < l->nstructs && !l->failed; si++) {
+    int nfixed = l->nstructs; /* (instances created while resolving fields set their own) */
+    for (int si = 0; si < nfixed && !l->failed; si++) {
         const Stmt *s = l->structs[si].decl;
         if (!s) { /* builtin: Rc.S {value: S}, Rc {value}, Arena {state: int} */
             const IrStruct *ir = &l->m->structs[l->structs[si].sid];
@@ -1573,50 +1865,68 @@ static void collect_structs(L *l, const Program *prog) {
     }
 }
 
-/* Adds the functions of one impl block. */
-static void collect_impl(L *l, const Stmt *s) {
-    int si = find_struct(l, s->name);
-    if ((si >= 0 && !l->structs[si].decl) || strcmp(s->name, "Rc") == 0 || strcmp(s->name, "Arena") == 0) {
-        lerr(l, s->line, s->col, "'%s' is a builtin type; it cannot have an impl block", s->name);
-        return;
+/* Symbol-safe form of a struct name for function symbols: Pair<int,Box<str?>>
+ * -> Pair..int.Box..str_opt (the assembler's names have no <, > or ?). */
+static void mangle(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (const char *c = in; *c && o + 5 < n; c++) {
+        if (*c == '<') { out[o++] = '.'; out[o++] = '.'; }
+        else if (*c == ',') out[o++] = '.';
+        else if (*c == '>') continue;
+        else if (*c == '?') { memcpy(out + o, "_opt", 4); o += 4; }
+        else out[o++] = *c;
     }
-    if (si < 0) {
-        lerr(l, s->line, s->col, "impl for unknown struct '%s'", s->name);
-        return;
-    }
+    out[o] = '\0';
+}
+
+/* Adds the functions of impl block s to struct si; tenv binds the impl's
+ * type parameters (an instance of a generic struct), else NULL. */
+static void collect_impl_fns(L *l, const Stmt *s, int si, const TArg *tenv, int ntenv) {
+    const TArg *saved = l->tenv;
+    int nsaved = l->ntenv;
+    l->tenv = tenv;
+    l->ntenv = ntenv;
+    const char *sname = l->structs[si].name;
+    char msym[600];
+    mangle(sname, msym, sizeof msym);
     for (size_t i = 0; i < s->n && !l->failed; i++) {
         const Stmt *f = s->stmts[i];
         if (find_impl_fn(l, si, f->name) >= 0) {
             lerr(l, f->line, f->col, "'%s::%s' is already defined", s->name, f->name);
-            return;
+            break;
         }
         bool has_self = f->nparams > 0 && strcmp(f->params[0], "self") == 0;
-        for (size_t k = 0; k < f->nparams; k++) {
+        bool bad = false;
+        for (size_t k = 0; k < f->nparams && !bad; k++) {
             if (strcmp(f->params[k], "self") != 0) continue;
             if (k > 0) {
                 lerr(l, f->param_line[k], f->param_col[k], "'self' must be the first parameter");
-                return;
-            }
-            if (f->param_types[k].name) {
+                bad = true;
+            } else if (f->param_types[k].name) {
                 lerr(l, f->param_types[k].line, f->param_types[k].col, "'self' cannot have a type annotation (it is always %s)", s->name);
-                return;
+                bad = true;
             }
         }
+        if (bad) break;
         if (f->nparams > MAX_PARAMS) {
             lerr(l, f->line, f->col, "functions with more than %d parameters are not supported yet", MAX_PARAMS);
-            return;
+            break;
         }
-        char sym[600];
-        snprintf(sym, sizeof sym, "m.%s.%s", s->name, f->name);
+        char sym[700];
+        snprintf(sym, sizeof sym, "m.%s.%s", msym, f->name);
+        for (int k = 2; ir_find_global(l->m, sym) >= 0; k++) snprintf(sym, sizeof sym, "m.%s.%d.%s", msym, k, f->name);
         int irf = ir_add_func(l->m, sym, (int)f->nparams);
-        FnInfo info = {NULL, l->m->funcs[irf].global, (int)f->nparams, f, NULL, T_ANY, l->structs[si].sid, has_self, NULL};
+        FnInfo info = {NULL, l->m->funcs[irf].global, (int)f->nparams, f, NULL, T_ANY, l->structs[si].sid, has_self, NULL, tenv, ntenv, tenv != NULL};
         char dn[600];
-        snprintf(dn, sizeof dn, "%s::%s", s->name, f->name);
+        ir_struct_display(sname, dn, sizeof dn);
+        size_t dl = strlen(dn);
+        snprintf(dn + dl, sizeof dn - dl, "::%s", f->name);
         info.owned_name = xstrdup(dn);
         info.name = info.owned_name;
+        int sid = l->structs[si].sid;
         info.ptypes = xmalloc((f->nparams ? f->nparams : 1) * sizeof *info.ptypes);
         for (size_t k = 0; k < f->nparams; k++)
-            info.ptypes[k] = (has_self && k == 0) ? ty_struct_of(l->structs[si].sid) : resolve_type(l, &f->param_types[k]);
+            info.ptypes[k] = (has_self && k == 0) ? ty_struct_of(sid) : resolve_type(l, &f->param_types[k]);
         info.ret = resolve_type(l, &f->type);
         IrGlobal *g = &l->m->globals[info.global];
         g->ty = info.ret;
@@ -1632,6 +1942,104 @@ static void collect_impl(L *l, const Stmt *s) {
         st->fns = xrealloc(st->fns, (size_t)(st->nfns + 1) * sizeof *st->fns);
         st->fns[st->nfns++] = l->nfns - 1;
     }
+    l->tenv = saved;
+    l->ntenv = nsaved;
+}
+
+/* Adds the functions of one impl block of a non-generic struct. */
+static void collect_impl(L *l, const Stmt *s) {
+    if (find_generic(l, s->name) >= 0) return; /* registered with its generic struct */
+    int si = find_struct(l, s->name);
+    if ((si >= 0 && !l->structs[si].decl) || strcmp(s->name, "Rc") == 0 || strcmp(s->name, "Arena") == 0) {
+        lerr(l, s->line, s->col, "'%s' is a builtin type; it cannot have an impl block", s->name);
+        return;
+    }
+    if (si < 0) {
+        lerr(l, s->line, s->col, "impl for unknown struct '%s'", s->name);
+        return;
+    }
+    if (s->ntparams) {
+        lerr(l, s->line, s->col, "struct '%s' is not generic; write impl %s { ... }", s->name, s->name);
+        return;
+    }
+    collect_impl_fns(l, s, si, NULL, 0);
+}
+
+static int dynamic_entry(L *l, const FnInfo *fi);
+
+/* The struct for generic gi with these type arguments (created on first
+ * use): fields resolved with the arguments bound, plus the functions of every
+ * impl block and their method table entries. */
+static int instantiate(L *l, int gi, const Ty *targs_in, int line, int col) {
+    const Generic *g = &l->generics[gi];
+    const Stmt *d = g->decl;
+    size_t n = d->ntparams;
+    Ty *targs = xmalloc(n * sizeof *targs);
+    char name[1024];
+    size_t o = (size_t)snprintf(name, sizeof name, "%s<", d->name);
+    for (size_t i = 0; i < n; i++) {
+        targs[i] = targ_norm(targs_in[i]);
+        char tn[512];
+        ir_ty_name(l->m, targs[i], tn, sizeof tn);
+        o += (size_t)snprintf(name + o, o < sizeof name ? sizeof name - o : 0, "%s%s", i ? "," : "", tn);
+    }
+    if (o + 2 >= sizeof name) {
+        lerr(l, line, col, "type '%s<...>' is too long", d->name);
+        free(targs);
+        return -1;
+    }
+    strcat(name, ">");
+    int si = find_struct(l, name);
+    if (si >= 0) {
+        free(targs);
+        return si;
+    }
+    int depth = 0, maxd = 0;
+    for (const char *c = name; *c; c++) {
+        depth += *c == '<' ? 1 : *c == '>' ? -1 : 0;
+        if (depth > maxd) maxd = depth;
+    }
+    if (maxd > 32) {
+        lerr(l, line, col, "type arguments nested more than 32 levels deep while instantiating '%s'", d->name);
+        free(targs);
+        return -1;
+    }
+    int sid = ir_add_struct(l->m, name);
+    l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
+    si = l->nstructs++;
+    l->structs[si] = (StructInfo){l->m->structs[sid].name, sid, d, NULL, 0, gi, targs};
+    /* fields, with the struct's own parameter names bound */
+    TArg *env = xmalloc(n * sizeof *env);
+    for (size_t i = 0; i < n; i++) env[i] = (TArg){d->tparams[i], targs[i]};
+    l->tenvs = xrealloc(l->tenvs, (size_t)(l->ntenvs + 1) * sizeof *l->tenvs);
+    l->tenvs[l->ntenvs++] = env;
+    const TArg *saved = l->tenv;
+    int nsaved = l->ntenv;
+    l->tenv = env;
+    l->ntenv = (int)n;
+    Ty *tys = xmalloc((d->nparams ? d->nparams : 1) * sizeof *tys);
+    for (size_t k = 0; k < d->nparams; k++) tys[k] = resolve_type(l, &d->param_types[k]);
+    ir_struct_set_fields(l->m, sid, (int)d->nparams, (const char *const *)d->params, tys);
+    free(tys);
+    l->tenv = saved;
+    l->ntenv = nsaved;
+    /* functions: each impl block binds its own parameter names */
+    for (int k = 0; k < g->nimpls && !l->failed; k++) {
+        const Stmt *im = g->impls[k];
+        TArg *ienv = xmalloc(n * sizeof *ienv);
+        for (size_t i = 0; i < n; i++) ienv[i] = (TArg){im->tparams[i], targs[i]};
+        l->tenvs = xrealloc(l->tenvs, (size_t)(l->ntenvs + 1) * sizeof *l->tenvs);
+        l->tenvs[l->ntenvs++] = ienv;
+        collect_impl_fns(l, im, si, ienv, (int)n);
+    }
+    for (int k = 0; k < l->structs[si].nfns && !l->failed; k++) {
+        int fi = l->structs[si].fns[k];
+        if (l->fns[fi].has_self) {
+            int mg = dynamic_entry(l, &l->fns[fi]);
+            ir_struct_add_method(l->m, sid, l->fns[fi].decl->name, mg);
+        }
+    }
+    return l->failed ? -1 : si;
 }
 
 /* A method's entry for dynamic calls (callm), which pass their arguments
@@ -1685,6 +2093,7 @@ static void scan_type(L *l, const TypeRef *t) {
     if (!t->name) return;
     if (strcmp(t->name, "Rc") == 0) l->uses_rc = true;
     if (strcmp(t->name, "Arena") == 0) l->uses_arena = true;
+    for (size_t i = 0; i < t->nargs; i++) scan_type(l, &t->args[i]);
 }
 
 static void scan_stmt(L *l, const Stmt *s);
@@ -1782,7 +2191,7 @@ static void collect_declarations(L *l, const Program *prog) {
                     lerr(l, s->param_line[k], s->param_col[k], "'self' is only allowed as the first parameter of a function in an impl block");
                     return;
                 }
-            FnInfo info = {s->name, l->m->funcs[fi].global, (int)s->nparams, s, NULL, T_ANY, -1, false, NULL};
+            FnInfo info = {s->name, l->m->funcs[fi].global, (int)s->nparams, s, NULL, T_ANY, -1, false, NULL, NULL, 0, false};
             info.ptypes = xmalloc((s->nparams ? s->nparams : 1) * sizeof *info.ptypes);
             for (size_t k = 0; k < s->nparams; k++) info.ptypes[k] = resolve_type(l, &s->param_types[k]);
             info.ret = resolve_type(l, &s->type);
@@ -1845,14 +2254,19 @@ static void collect_declarations(L *l, const Program *prog) {
     }
     for (int i = 0; i < l->nstructs && !l->failed; i++) {
         const Stmt *d = l->structs[i].decl;
-        if (!d) continue; /* builtin */
+        if (!d || l->structs[i].generic >= 0) continue; /* builtin, or an instance (checked below) */
+        if (find_fn(l, d->name) >= 0 || find_ext(l, d->name) >= 0 || find_gvar(l, d->name) >= 0 || is_builtin(d->name))
+            lerr(l, d->line, d->col, "'%s' is declared as a struct and as a function or variable", d->name);
+    }
+    for (int i = 0; i < l->ngenerics && !l->failed; i++) {
+        const Stmt *d = l->generics[i].decl;
         if (find_fn(l, d->name) >= 0 || find_ext(l, d->name) >= 0 || find_gvar(l, d->name) >= 0 || is_builtin(d->name))
             lerr(l, d->line, d->col, "'%s' is declared as a struct and as a function or variable", d->name);
     }
     /* method tables for calls on values whose struct is not known statically */
     for (int i = 0; i < l->nfns && !l->failed; i++) {
         const FnInfo *fi = &l->fns[i];
-        if (fi->sid >= 0 && fi->has_self) {
+        if (fi->sid >= 0 && fi->has_self && !fi->instance) {
             int g = dynamic_entry(l, &l->fns[i]);
             ir_struct_add_method(l->m, l->fns[i].sid, l->fns[i].decl->name, g);
         }
@@ -1879,18 +2293,25 @@ bool lower_program(const Program *prog, IrModule *out) {
     collect_declarations(&l, prog);
 
     if (!l.failed) {
-        begin_function(&l, &main_fn, main_fi, NULL);
+        begin_function(&l, &main_fn, main_fi, -1);
         for (size_t i = 0; i < prog->len && !l.failed; i++) lower_stmt(&l, prog->stmts[i]);
         end_function(&l, 0, 0);
     }
-    for (int i = 0; i < l.nfns && !l.failed; i++) lower_function(&l, &l.fns[i]);
+    for (int i = 0; i < l.nfns && !l.failed; i++) lower_function(&l, i); /* (instances may add more) */
 
     for (int i = 0; i < l.nfns; i++) {
         free(l.fns[i].ptypes);
         free(l.fns[i].owned_name);
     }
-    for (int i = 0; i < l.nstructs; i++) free(l.structs[i].fns);
+    for (int i = 0; i < l.nstructs; i++) {
+        free(l.structs[i].fns);
+        free(l.structs[i].targs);
+    }
     free(l.structs);
+    for (int i = 0; i < l.ngenerics; i++) free(l.generics[i].impls);
+    free(l.generics);
+    for (int i = 0; i < l.ntenvs; i++) free(l.tenvs[i]);
+    free(l.tenvs);
     for (int i = 0; i < l.nexts; i++) free(l.exts[i].ctypes);
     free(l.fns);
     free(l.exts);

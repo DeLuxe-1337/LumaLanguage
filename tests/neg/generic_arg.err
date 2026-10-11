@@ -1,1 +1,1 @@
-'int' takes no type argument (only Rc<T> does)
+'int' takes no type arguments (it is not a generic struct)

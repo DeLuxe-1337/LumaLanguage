@@ -1,0 +1,1 @@
+struct 'P' is not generic; write impl P { ... }

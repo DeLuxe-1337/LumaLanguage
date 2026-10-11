@@ -3,15 +3,16 @@
  *   program     → declaration* EOF
  *   declaration → funDecl | externDecl | structDecl | implDecl | varDecl | statement
  *   funDecl     → "fun" IDENTIFIER "(" parameters? ")" ( ":" type )? block   (top level only, for now)
- *   structDecl  → "struct" IDENTIFIER "{" ( field ( "," field )* ","? )? "}"   (top level)
+ *   structDecl  → "struct" IDENTIFIER tparams? "{" ( field ( "," field )* ","? )? "}"   (top level)
+ *   tparams     → "<" IDENTIFIER ( "," IDENTIFIER )* ">"                   (a generic struct)
  *   field       → IDENTIFIER ( ":" type )?
- *   implDecl    → "impl" IDENTIFIER "{" funDecl* "}"                      (top level; a function
+ *   implDecl    → "impl" IDENTIFIER tparams? "{" funDecl* "}"              (top level; a function
  *                 whose first parameter is `self` is a method, any other is an associated function)
  *   parameters  → param ( "," param )*
  *   param       → IDENTIFIER ( ":" type )?
  *   externDecl  → "extern" "fun" IDENTIFIER "(" cparams? ")" ":" type ";"     (top level; C function)
  *   cparams     → IDENTIFIER ":" type ( "," IDENTIFIER ":" type )*
- *   type        → ( IDENTIFIER | "nil" ) "?"?
+ *   type        → ( IDENTIFIER ( "<" type ( "," type )* ">" )? | "nil" ) "?"?
  *   varDecl     → "var" IDENTIFIER ( ":" type )? ( "=" expression )? ";"
  *   statement   → exprStmt | forStmt | ifStmt | returnStmt | whileStmt | block
  *   returnStmt  → "return" expression? ";"                          (inside functions only)
@@ -97,12 +98,14 @@ struct Expr {
 };
 
 /* A type annotation as written. name == NULL means "no annotation". */
-typedef struct {
+typedef struct TypeRef TypeRef;
+struct TypeRef {
     char *name;
-    char *arg;     /* the type argument of a generic type: Rc<Point> -> "Point" (owned), else NULL */
+    TypeRef *args; /* type arguments of a generic type: Pair<int, Point> (owned), else NULL */
+    size_t nargs;
     bool nullable; /* written with a trailing '?' */
     int line, col;
-} TypeRef;
+};
 
 typedef enum {
     STMT_EXPR,  /* expr */
@@ -130,6 +133,8 @@ struct Stmt {
     TypeRef *param_types; /* STMT_FUN / STMT_EXTERN: one per param */
     size_t nparams;
     TypeRef type;   /* STMT_VAR: declared type; STMT_FUN / STMT_EXTERN: return type */
+    char **tparams; /* STMT_STRUCT / STMT_IMPL: type parameters of a generic struct (owned) */
+    size_t ntparams;
 };
 
 typedef struct {
@@ -142,6 +147,7 @@ typedef struct {
 void program_free(Program *p);
 void expr_free(Expr *e);
 void stmt_free(Stmt *s);
+void typeref_free(TypeRef *t);
 /* Prints an S-expression view, for `luma --dump-ast`. */
 void program_dump(const Program *p);
 

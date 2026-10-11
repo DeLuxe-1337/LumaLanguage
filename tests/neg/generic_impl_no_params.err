@@ -1,0 +1,1 @@
+impl for generic struct 'Box' needs its type parameters: impl Box<T> { ... }

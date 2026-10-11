@@ -1,0 +1,2 @@
+struct Box<T> { value: T }
+impl Box<A, B> { fun get(self) { return self.value; } }

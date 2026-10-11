@@ -125,6 +125,21 @@ static void test_parse(void) {
     CHECK(e->right->kind == EXPR_GET && e->right->left->kind == EXPR_METHOD && e->right->left->left->kind == EXPR_ASSOC &&
           strcmp(e->right->left->left->str, "new") == 0);
     program_free(&p);
+    /* generic structs: type parameters and nested type arguments */
+    CHECK(parse_str("struct Pair<A, B> { first: A, second: Box<Pair<int, str?>>? } impl Pair<X, Y> { fun f(self) {} }", &p));
+    CHECK(p.stmts[0]->ntparams == 2 && strcmp(p.stmts[0]->tparams[1], "B") == 0);
+    {
+        const TypeRef *t = &p.stmts[0]->param_types[1]; /* Box<Pair<int, str?>>? */
+        CHECK(strcmp(t->name, "Box") == 0 && t->nullable && t->nargs == 1);
+        CHECK(strcmp(t->args[0].name, "Pair") == 0 && t->args[0].nargs == 2 && !t->args[0].nullable);
+        CHECK(strcmp(t->args[0].args[1].name, "str") == 0 && t->args[0].args[1].nullable);
+    }
+    CHECK(p.stmts[1]->kind == STMT_IMPL && p.stmts[1]->ntparams == 2 && strcmp(p.stmts[1]->tparams[0], "X") == 0);
+    program_free(&p);
+    CHECK(!parse_str("struct P<A, A> { x: A }", &p));      /* duplicate type parameter */
+    CHECK(!parse_str("var b: Box<int>= 1;", &p));          /* '>=' is one token: needs a space */
+    CHECK(!parse_str("struct P<> { x }", &p));
+    CHECK(!parse_str("var b: Box<int = 1;", &p));
     CHECK(parse_str("if (a) { b; }", &p)); /* NAME '{' is a block here, not a struct literal */
     CHECK(p.stmts[0]->kind == STMT_IF && p.stmts[0]->then_branch->kind == STMT_BLOCK);
     program_free(&p);

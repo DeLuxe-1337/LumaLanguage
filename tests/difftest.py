@@ -197,10 +197,11 @@ def render_e(e):
         return "(%s%s)" % (e[1], render_e(e[2]))
     if k == "call":
         return "%s(%s)" % (e[1], ", ".join(render_e(a) for a in e[2]))
-    if k == "new":
+    if k == "new":   # (an instance G<int> of a generic struct is written G { ... })
+        name = e[1].split("<")[0]
         if not e[2]:
-            return "%s {}" % e[1]
-        return "%s { %s }" % (e[1], ", ".join("%s: %s" % (f, render_e(x)) for f, x in e[2]))
+            return "%s {}" % name
+        return "%s { %s }" % (name, ", ".join("%s: %s" % (f, render_e(x)) for f, x in e[2]))
     if k == "get":
         return "(%s).%s" % (render_e(e[1]), e[2])
     if k == "set":
@@ -219,6 +220,12 @@ def render_s(s, ind=0):
         return p + "print(%s);\n" % ", ".join(render_e(a) for a in s[1])
     if k == "return":
         return p + "return %s;\n" % render_e(s[1])
+    if k in ("struct", "impl") and "<" in s[1]:
+        return ""   # an instance: the interpreter's view of a generic struct (rendered by gstruct/gimpl)
+    if k == "gstruct":
+        return p + "struct %s<%s> {\n" % (s[1], ", ".join(s[2])) + "".join(p + "  %s%s,\n" % (f, ann(a)) for f, a in s[3]) + p + "}\n"
+    if k == "gimpl":
+        return p + "impl %s<%s> {\n" % (s[1], ", ".join(s[2])) + "".join(render_s(x, ind + 1) for x in s[3]) + p + "}\n"
     if k == "struct":
         return p + "struct %s {\n" % s[1] + "".join(p + "  %s%s,\n" % (f, ann(a)) for f, _, a in s[2]) + p + "}\n"
     if k == "impl":
@@ -496,6 +503,7 @@ class Gen:
         self.structs = {}    # S -> {"fields": [(field, type, ann)], "methods": [(m, [ptypes], [panns], ret)]}
         self.methods_ok = False  # may expressions call methods? (only from main code: no recursion)
         self.self_struct = None  # inside a method of S: `self` may be the receiver of field accesses
+        self.generic = {}        # instance "G<int>" -> its constructor function (see generic())
 
     def fresh(self, prefix):
         self.n += 1
@@ -507,14 +515,24 @@ class Gen:
             seen.update(sc)   # inner declarations shadow outer ones
         return {k: v[0] for k, v in seen.items()}
 
+    def construct(self, S, value):
+        """A new instance of S whose fields come from value(field, type,
+        annotation). An instance of a generic struct is built by its
+        constructor function: a literal's type arguments are inferred from
+        static types, which only the compiler knows, except when the literal
+        initializes a variable annotated with the instance (as there)."""
+        fields = list(self.structs[S]["fields"])
+        if S in self.generic:
+            return ("call", self.generic[S], [value(f, ft, fa) for f, ft, fa in fields])
+        self.r.shuffle(fields)   # any order in the literal
+        return ("new", S, [(f, value(f, ft, fa)) for f, ft, fa in fields])
+
     def literal(self, t):
         r = self.r
         if t.startswith("Rc<"):
             return ("rcnew", self.literal(t[3:-1]))
         if t in self.structs:
-            fields = list(self.structs[t]["fields"])
-            r.shuffle(fields)   # any order in the literal
-            return ("new", t, [(f, self.literal(ft)) for f, ft, _ in fields])
+            return self.construct(t, lambda f, ft, fa: self.literal(ft))
         if t == "int":
             if r.random() < 0.04:   # rare: values near the fixnum limits (overflow paths)
                 return ("int", r.choice([FIXMAX, FIXMIN + 1, 2**31, 3037000499, 2**40]))
@@ -559,9 +577,7 @@ class Gen:
         if c < 0.2:   # same-typed short-circuit: result has the operands' type
             return ("log", r.choice(["and", "or"]), self.expr(t, depth - 1, exclude), self.expr(t, depth - 1, exclude))
         if t in self.structs:
-            fields = list(self.structs[t]["fields"])
-            r.shuffle(fields)
-            return ("new", t, [(f, self.slot_expr(ft, fa, depth - 1, exclude)) for f, ft, fa in fields])
+            return self.construct(t, lambda f, ft, fa: self.slot_expr(ft, fa, depth - 1, exclude))
         if t.startswith("Rc<"):   # always a fresh instance: Rc::new moves its argument
             S = t[3:-1]
             fields = list(self.structs[S]["fields"])
@@ -605,7 +621,7 @@ class Gen:
         c = self.r.random()
         if self.self_struct == S and c < 0.3:
             return ("var", "self"), False
-        if c < 0.55:
+        if c < 0.55 and S not in self.generic:   # (Rc of a generic instance: later milestone)
             return self.expr("Rc<%s>" % S, depth, exclude), True
         return self.expr(S, depth, exclude), False
 
@@ -617,7 +633,7 @@ class Gen:
         including cycles of boxes, for the memory oracle."""
         if t == "nil" and annotation is None and self.structs and self.r.random() < 0.5:
             S2 = self.r.choice(sorted(self.structs))
-            return self.expr("Rc<%s>" % S2 if self.r.random() < 0.5 else S2, depth, exclude)
+            return self.expr("Rc<%s>" % S2 if self.r.random() < 0.5 and S2 not in self.generic else S2, depth, exclude)
         return self.slot_expr(t, annotation, depth, exclude)
 
     def ann_of(self, name):
@@ -629,7 +645,7 @@ class Gen:
     def any_type(self):
         if self.structs and self.r.random() < 0.15:
             S = self.r.choice(sorted(self.structs))
-            return "Rc<%s>" % S if self.r.random() < 0.4 else S
+            return "Rc<%s>" % S if self.r.random() < 0.4 and S not in self.generic else S
         return self.r.choice(("int", "int", "int", "str", "str", "bool", "nil"))
 
     def annotation(self, t):
@@ -679,9 +695,7 @@ class Gen:
         if c < 0.655 and self.structs:   # a fresh local instance, read, then freed
             S = r.choice(sorted(self.structs))
             t = self.fresh("t")
-            fields = list(self.structs[S]["fields"])
-            r.shuffle(fields)
-            new = ("new", S, [(f, self.slot_expr(ft, fa, 2)) for f, ft, fa in fields])
+            new = self.construct(S, lambda f, ft, fa: self.slot_expr(ft, fa, 2))
             body = [("var", t, new, S if r.random() < 0.5 else None)]
             if self.structs[S]["fields"]:
                 body.append(("print", [("get", ("var", t), f) for f, _, _ in self.structs[S]["fields"]]))
@@ -690,9 +704,7 @@ class Gen:
         if c < 0.657 and self.structs:   # an arena block: its instances are freed at its end
             S = r.choice(sorted(self.structs))
             t = self.fresh("t")
-            fields = list(self.structs[S]["fields"])
-            r.shuffle(fields)
-            body = [("var", t, ("new", S, [(f, self.literal(ft)) for f, ft, _ in fields]), None)]
+            body = [("var", t, self.construct(S, lambda f, ft, fa: self.literal(ft)), None)]
             if self.structs[S]["fields"]:
                 body.append(("print", [("get", ("var", t), f) for f, _, _ in self.structs[S]["fields"]]))
             return ("arena", body)
@@ -747,6 +759,31 @@ class Gen:
         self.structs[name] = {"fields": fields, "methods": []}
         return ("struct", name, fields)
 
+    def generic_struct(self):
+        """A generic struct G<T> { val: T, link } with methods get and put, and
+        1-3 instances (G<int>, ...). The interpreter sees each instance as a
+        plain struct with T substituted; each has a constructor function
+        mkG_x(val: x, link): G<x> that builds it from an annotated variable."""
+        G = self.fresh("G")
+        decls = [("gstruct", G, ["T"], [("val", "T"), ("link", None)]),
+                 ("gimpl", G, ["T"], [("fun", "get", ["self"], [("return", ("get", ("var", "self"), "val"))], [None], "T"),
+                                      ("fun", "put", ["self", "v"], [("expr", ("set", ("var", "self"), "val", ("var", "v")))],
+                                       [None, "T"], None)])]
+        for X in self.r.sample(("int", "str", "bool", "nil"), self.r.randint(1, 3)):
+            S = "%s<%s>" % (G, X)
+            fields = [("val", X, X), ("link", "nil", None)]
+            self.structs[S] = {"fields": fields, "methods": [("get", [], [], X), ("put", [X], [X], "nil")]}
+            mk = "mk%s_%s" % (G, X)
+            self.generic[S] = mk
+            decls += [("struct", S, fields),
+                      ("impl", S, [("fun", "get", ["self"], [("return", ("get", ("var", "self"), "val"))], [None], X),
+                                   ("fun", "put", ["self", "v"], [("expr", ("set", ("var", "self"), "val", ("var", "v")))],
+                                    [None, X], None)]),
+                      ("fun", mk, ["val", "link"],
+                       [("var", "r", ("new", S, [("val", ("var", "val")), ("link", ("var", "link"))]), S),
+                        ("return", ("var", "r"))], [X, None], S)]
+        return decls
+
     def method(self, S):
         """A method of struct S: like a function, with `self` in scope. Methods
         call functions but no methods (so calls always terminate)."""
@@ -776,6 +813,7 @@ def generate(seed):
     rng = random.Random(seed)
     g = Gen(rng)
     structs = [g.struct() for _ in range(rng.choice((0, 0, 1, 1, 2)))]
+    generics = g.generic_struct() if rng.random() < 0.35 else []
     globals_ = [g.stmt(0) for _ in range(rng.randint(0, 3))]
     globals_ = [s for s in globals_ if s[0] == "var"]
     funs = [g.function() for _ in range(rng.randint(0, 4))]
@@ -783,7 +821,7 @@ def generate(seed):
     impls = [("impl", s[1], [g.method(s[1]) for _ in range(rng.randint(1, 2))]) for s in structs]
     g.methods_ok = True
     prog = globals_ + g.stmts(rng.randint(3, 14), 3)
-    return structs + impls + [DYN] + funs, prog
+    return structs + generics + impls + [DYN] + funs, prog
 
 
 def live_at_exit(it, mm):

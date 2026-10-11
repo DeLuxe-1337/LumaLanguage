@@ -478,8 +478,8 @@ static Expr *expression(Parser *p) { return assignment(p); }
 static Stmt *declaration(Parser *p);
 static Stmt *statement(Parser *p);
 
-/* type → ( IDENTIFIER ( "<" IDENTIFIER ">" )? | "nil" ) "?"?
- * Names are validated by lowering; Rc<T> is the only generic type. */
+/* type → ( IDENTIFIER ( "<" type ( "," type )* ">" )? | "nil" ) "?"?
+ * Names are validated by lowering. */
 static bool parse_type(Parser *p, TypeRef *out) {
     Token *t = cur(p);
     if (t->kind != TOK_IDENTIFIER && t->kind != TOK_NIL) {
@@ -491,17 +491,47 @@ static bool parse_type(Parser *p, TypeRef *out) {
     out->line = t->line;
     out->col = t->col;
     if (t->kind == TOK_IDENTIFIER && match(p, TOK_LESS)) {
-        Token *a = cur(p);
-        if (!consume(p, TOK_IDENTIFIER, "a type name after '<'")) return false;
-        out->arg = xstrndup(a->lexeme, a->lexeme_len);
+        size_t cap = 0;
+        do {
+            if (out->nargs == cap) {
+                cap = cap ? cap * 2 : 2;
+                out->args = xrealloc(out->args, cap * sizeof *out->args);
+            }
+            TypeRef *a = &out->args[out->nargs++];
+            memset(a, 0, sizeof *a);
+            if (!parse_type(p, a)) return false;
+        } while (match(p, TOK_COMMA));
         if (check(p, TOK_GREATER_EQUAL)) {
-            error_at(p, cur(p), "write a space between '>' and '=' (e.g. Rc<Point> = ...)");
+            error_at(p, cur(p), "write a space between '>' and '=' (e.g. Box<int> = ...)");
             return false;
         }
-        if (!consume(p, TOK_GREATER, "'>' after the type argument")) return false;
+        if (!consume(p, TOK_GREATER, "'>' after the type arguments")) return false;
     }
     out->nullable = match(p, TOK_QUESTION);
     return true;
+}
+
+/* tparams → "<" IDENTIFIER ( "," IDENTIFIER )* ">" (after a struct or impl name) */
+static bool parse_tparams(Parser *p, Stmt *s) {
+    if (!match(p, TOK_LESS)) return true;
+    size_t cap = 0;
+    do {
+        Token *t = cur(p);
+        if (!consume(p, TOK_IDENTIFIER, "a type parameter name")) return false;
+        if (s->ntparams == cap) {
+            cap = cap ? cap * 2 : 2;
+            s->tparams = xrealloc(s->tparams, cap * sizeof *s->tparams);
+        }
+        char *n = xstrndup(t->lexeme, t->lexeme_len);
+        for (size_t i = 0; i < s->ntparams; i++)
+            if (strcmp(s->tparams[i], n) == 0) {
+                error_at(p, t, "duplicate type parameter");
+                free(n);
+                return false;
+            }
+        s->tparams[s->ntparams++] = n;
+    } while (match(p, TOK_COMMA));
+    return consume(p, TOK_GREATER, "'>' after the type parameters");
 }
 
 /* Parses "(" params ")" into s. With require_types (extern), every parameter
@@ -778,6 +808,7 @@ static Stmt *struct_declaration(Parser *p, const Token *kw) {
     s->name = xstrndup(name->lexeme, name->lexeme_len);
     s->line = name->line;
     s->col = name->col;
+    if (!parse_tparams(p, s)) { stmt_free(s); return NULL; }
     if (!consume(p, TOK_LEFT_BRACE, "'{' after the struct name")) { stmt_free(s); return NULL; }
     size_t cap = 0;
     while (!check(p, TOK_RIGHT_BRACE)) {
@@ -820,6 +851,7 @@ static Stmt *impl_declaration(Parser *p, const Token *kw) {
     s->name = xstrndup(name->lexeme, name->lexeme_len);
     s->line = name->line;
     s->col = name->col;
+    if (!parse_tparams(p, s)) { stmt_free(s); return NULL; }
     if (!consume(p, TOK_LEFT_BRACE, "'{' after the impl's struct name")) { stmt_free(s); return NULL; }
     while (!check(p, TOK_RIGHT_BRACE) && !check(p, TOK_EOF)) {
         Token *fk = cur(p);
@@ -911,18 +943,25 @@ void stmt_free(Stmt *s) {
     stmt_free(s->body);
     for (size_t i = 0; i < s->nparams; i++) {
         free(s->params[i]);
-        if (s->param_types) {
-            free(s->param_types[i].name);
-            free(s->param_types[i].arg);
-        }
+        if (s->param_types) typeref_free(&s->param_types[i]);
     }
+    for (size_t i = 0; i < s->ntparams; i++) free(s->tparams[i]);
+    free(s->tparams);
     free(s->params);
     free(s->param_types);
-    free(s->type.name);
-    free(s->type.arg);
+    typeref_free(&s->type);
     free(s->param_line);
     free(s->param_col);
     free(s);
+}
+
+void typeref_free(TypeRef *t) {
+    for (size_t i = 0; i < t->nargs; i++) typeref_free(&t->args[i]);
+    free(t->args);
+    free(t->name);
+    t->args = NULL;
+    t->name = NULL;
+    t->nargs = 0;
 }
 
 void program_free(Program *p) {
@@ -1021,11 +1060,28 @@ static void dump_expr(const Expr *e) {
     }
 }
 
+static void dump_type_name(const TypeRef *t) {
+    printf("%s", t->name);
+    if (t->nargs) {
+        printf("<");
+        for (size_t i = 0; i < t->nargs; i++) {
+            if (i) printf(",");
+            dump_type_name(&t->args[i]);
+        }
+        printf(">");
+    }
+    printf("%s", t->nullable ? "?" : "");
+}
+
 static void dump_type(const TypeRef *t) {
     if (!t->name) return;
-    printf(":%s", t->name);
-    if (t->arg) printf("<%s>", t->arg);
-    printf("%s", t->nullable ? "?" : "");
+    printf(":");
+    dump_type_name(t);
+}
+
+static void dump_tparams(const Stmt *s) {
+    for (size_t i = 0; i < s->ntparams; i++) printf("%s%s", i ? "," : "<", s->tparams[i]);
+    if (s->ntparams) printf(">");
 }
 
 static void dump_params(const Stmt *s) {
@@ -1082,12 +1138,16 @@ static void dump_stmt(const Stmt *s, int indent) {
         printf(")\n");
         break;
     case STMT_STRUCT:
-        printf("(struct %s ", s->name);
+        printf("(struct %s", s->name);
+        dump_tparams(s);
+        printf(" ");
         dump_params(s);
         printf(")\n");
         break;
     case STMT_IMPL:
-        printf("(impl %s\n", s->name);
+        printf("(impl %s", s->name);
+        dump_tparams(s);
+        printf("\n");
         for (size_t i = 0; i < s->n; i++) dump_stmt(s->stmts[i], indent + 1);
         printf("%*s)\n", indent * 2, "");
         break;

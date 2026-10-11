@@ -1,0 +1,1 @@
+argument 'b' of 'f' expects Box<int>, got Box<str>

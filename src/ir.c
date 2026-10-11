@@ -78,7 +78,10 @@ bool ir_ty_parse(const IrModule *m, const char *s, IrTy *out) {
     const char *p = s;
     if (!*p) return false;
     for (;;) {
-        size_t len = strcspn(p, "|?");
+        /* a member ends at '|' or a final '?' outside type arguments (Box<int?>) */
+        size_t len = 0;
+        for (int depth = 0; p[len] && !(depth == 0 && (p[len] == '|' || p[len] == '?')); len++)
+            depth += p[len] == '<' ? 1 : p[len] == '>' ? -1 : 0;
         IrTy part = 0;
         bool found = false;
         for (size_t i = 0; i < sizeof N / sizeof *N && !found; i++)
@@ -118,7 +121,15 @@ IrStructKind ir_struct_kind_of(const char *name) {
 void ir_struct_display(const char *name, char *buf, size_t n) {
     if (strcmp(name, "Rc") == 0) snprintf(buf, n, "Rc<any>");
     else if (strncmp(name, "Rc.", 3) == 0) snprintf(buf, n, "Rc<%s>", name + 3);
-    else snprintf(buf, n, "%s", name);
+    else {
+        /* generic instances: Pair<int,str> reads Pair<int, str> */
+        size_t o = 0;
+        for (const char *c = name; *c && o + 2 < n; c++) {
+            buf[o++] = *c;
+            if (*c == ',') buf[o++] = ' ';
+        }
+        buf[o] = '\0';
+    }
 }
 
 int ir_add_struct(IrModule *m, const char *name) {

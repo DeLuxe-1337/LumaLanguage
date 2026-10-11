@@ -113,6 +113,10 @@ static void test_roundtrip(void) {
                      "fn @luma_main() {\nentry:\n  %0 = const 1\n  store @var.count, %0\n"
                      "  %1 = load @var.count\n  call @luma_print(%1)\n  ret %1\n}\n");
     expect_roundtrip("module \"x\"\n\nfn @f() {\nb:\n  %0 = const 1\n  ret %0\n}\n");
+    /* generic instances: names with type arguments, in types and field references */
+    expect_roundtrip("module \"g\"\n\nstruct Box<int?> {value: int?}\nstruct Pair<Box<int?>,str> {first: Box<int?>, second: str}\n\ndata @ctx = str \"x\"\n\n"
+                     "fn @f(%p: Pair<Box<int?>,str>?): int? {\nentry:\n  %p = check %p, Pair<Box<int?>,str>, @ctx\n"
+                     "  %b = getfield %p, Pair<Box<int?>,str>.first\n  %v = getfield %b, Box<int?>.value\n  ret %v\n}\n");
 }
 
 static void test_parse_details(void) {

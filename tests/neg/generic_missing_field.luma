@@ -1,0 +1,2 @@
+struct Pair<A, B> { first: A, second: B }
+var p = Pair { first: 1 };

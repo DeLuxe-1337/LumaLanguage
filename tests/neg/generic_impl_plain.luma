@@ -1,0 +1,2 @@
+struct P { x: int }
+impl P<T> { fun get(self) { return self.x; } }

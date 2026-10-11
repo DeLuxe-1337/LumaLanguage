@@ -1,0 +1,2 @@
+struct Box<T> { value: T }
+var b: Box? = nil;
