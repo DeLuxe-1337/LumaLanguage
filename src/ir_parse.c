@@ -726,6 +726,12 @@ static bool prescan_structs(P *p) {
     while (i < p->len) {
         size_t j = i;
         while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
+        bool shared = false;
+        if (p->len - j > 7 && memcmp(p->src + j, "shared", 6) == 0 && (p->src[j + 6] == ' ' || p->src[j + 6] == '\t')) {
+            shared = true;
+            j += 6;
+            while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
+        }
         if (p->len - j > 7 && memcmp(p->src + j, "struct", 6) == 0 && (p->src[j + 6] == ' ' || p->src[j + 6] == '\t')) {
             j += 6;
             while (j < p->len && (p->src[j] == ' ' || p->src[j] == '\t')) j++;
@@ -760,6 +766,7 @@ static bool prescan_structs(P *p) {
                 }
             int sid = ir_add_struct(p->m, name);
             p->m->structs[sid].line = line;
+            p->m->structs[sid].shared = shared;
         }
         while (i < p->len && p->src[i] != '\n') i++;
         i++;
@@ -964,6 +971,13 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
                 out->globals[g].ty = ty;
             }
             if (!expect_nl(&p)) goto fail;
+        } else if (is_ident(&p, "shared")) {
+            next(&p); /* (recorded by the prescan) */
+            if (!is_ident(&p, "struct")) {
+                perr(&p, p.tok.line, "expected 'struct' after 'shared'");
+                goto fail;
+            }
+            if (!parse_struct(&p)) goto fail;
         } else if (is_ident(&p, "struct")) {
             if (!parse_struct(&p)) goto fail;
         } else if (is_ident(&p, "fn")) {

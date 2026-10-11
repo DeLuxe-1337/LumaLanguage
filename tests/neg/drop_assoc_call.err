@@ -1,0 +1,1 @@
+drop() runs by itself when an instance is freed; call free(x) or dispose(x) instead

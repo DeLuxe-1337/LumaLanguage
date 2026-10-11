@@ -1,0 +1,6 @@
+struct A { b: B? }
+struct B { a: A? }
+impl A { fun deref(self): B { return self.b; } }
+impl B { fun deref(self): A { return self.a; } }
+var a: A = A { b: nil };
+print(a.z);

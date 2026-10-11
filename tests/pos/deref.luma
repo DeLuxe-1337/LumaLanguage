@@ -1,0 +1,38 @@
+// deref(self): members a struct lacks are looked up on what deref returns
+struct Point { x: int, y: int }
+impl Point {
+  fun len2(self): int { return self.x * self.x + self.y * self.y; }
+  fun scaled(self, a: int, b: int): Point { return Point { x: self.x * a, y: self.y * b }; }
+}
+
+// a trivial deref (return self.field) compiles to a field read
+struct Handle { inner: Point, tag: str }
+impl Handle {
+  fun deref(self): Point { return self.inner; }
+  fun describe(self): str { return "handle " + self.tag; }
+}
+
+var h: Handle = Handle { inner: Point { x: 3, y: 4 }, tag: "h" };
+print(h.x, h.y, h.len2(), h.describe(), h.tag);   // own members win
+h.x = 10;                                         // writes go through too
+print(h.inner.x, h.scaled(2, 3).y);
+
+// a computed deref is a call; chains are followed
+var calls = 0;
+struct Counted { target: Handle }
+impl Counted {
+  fun deref(self): Handle { calls = calls + 1; return self.target; }
+}
+var c: Counted = Counted { target: h };
+print(c.x, c.describe(), c.len2(), calls);
+
+// dynamic: the same lookups through untyped values (the runtime calls deref)
+fun dyn(v) { return v; }
+var d = dyn(c);
+print(d.x, d.tag, d.len2(), d.scaled(1, 2).y, calls);
+d.y = 7;
+print(h.y, d.len2());
+
+// a temporary owner lives until its field has been read
+fun wrap(x: int): Handle { return Handle { inner: Point { x: x, y: 0 }, tag: "t" }; }
+print(wrap(5).x, wrap(6).len2(), dyn(wrap(7)).x);

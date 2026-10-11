@@ -1,0 +1,4 @@
+shared struct T { x: int }
+fun dyn(v) { return v; }
+var t = T { x: 1 };
+free(dyn(t));

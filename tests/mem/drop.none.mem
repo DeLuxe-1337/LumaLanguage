@@ -1,0 +1,3 @@
+luma: memcheck: --mm=none, 14 allocated, 0 freed, 10 leaked, 4 reachable from globals
+luma: memcheck: leaked: 3 Tracked, 4 Manual, 2 Counter, 1 Arena
+luma: memcheck: reachable from globals: 3 Manual, 1 Holder

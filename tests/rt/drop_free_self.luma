@@ -1,0 +1,5 @@
+var n = 0;
+struct T { x: int }
+impl T { fun drop(self) { n = n + 1; if (n < 3) self.again(); } fun again(self) { free(self); } }
+var t = T { x: 1 };
+free(t);

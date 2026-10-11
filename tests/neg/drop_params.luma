@@ -1,0 +1,2 @@
+struct T { x: int }
+impl T { fun drop(self, how) { print(how); } }

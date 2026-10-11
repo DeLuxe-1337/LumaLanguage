@@ -345,6 +345,7 @@ bool opt_gvn(IrModule *m, IrFunc *f) {
     while (cap < ninstr * 2 + 16) cap *= 2;
     Tab tab = {xcalloc(cap, sizeof(Ent)), cap - 1, NULL, 0, 0};
     int *known = xmalloc((size_t)(m->nglobals ? m->nglobals : 1) * sizeof *known);
+    bool has_drop = opt_module_has_drop(m);
     int **ptrs = NULL, cap_ptrs = 0;
     bool any = false;
 
@@ -426,6 +427,7 @@ bool opt_gvn(IrModule *m, IrFunc *f) {
                 }
                 break;
             case IR_LOAD:
+                if (has_drop) continue; /* (see opt_module_has_drop) */
                 if (known[in->global] >= 0) {
                     repl[in->dst] = known[in->global];
                     in->op = IR_NOP;
@@ -435,11 +437,13 @@ bool opt_gvn(IrModule *m, IrFunc *f) {
                 }
                 continue;
             case IR_STORE:
-                known[in->global] = in->a;
+                if (!has_drop) known[in->global] = in->a;
                 continue;
             case IR_CALL:
             case IR_CALLM:
-                if (in->op == IR_CALLM || m->globals[in->global].kind == IRG_FUNC) /* Luma functions may store to globals */
+            case IR_GETFIELD:
+            case IR_SETFIELD:
+                if (opt_runs_code(m, in)) /* Luma functions (and deref) may store to globals */
                     for (int g = 0; g < m->nglobals; g++) known[g] = -1;
                 continue;
             default:
@@ -703,13 +707,13 @@ bool opt_licm(IrModule *m, IrFunc *f) {
             for (int k = 0; k < f->blocks[b].n; k++)
                 if (f->blocks[b].instrs[k].dst >= 0) defb[f->blocks[b].instrs[k].dst] = b;
         bool *stored = xcalloc((size_t)(m->nglobals ? m->nglobals : 1), sizeof *stored);
-        bool calls = false;
+        bool calls = opt_module_has_drop(m); /* (a drop may run at any release: loads stay put) */
         for (int b = 0; b < nb; b++) {
             if (!bit_get(lp->body, b)) continue;
             for (int k = 0; k < f->blocks[b].n; k++) {
                 const IrInstr *in = &f->blocks[b].instrs[k];
                 if (in->op == IR_STORE) stored[in->global] = true;
-                if ((in->op == IR_CALL && m->globals[in->global].kind == IRG_FUNC) || in->op == IR_CALLM) calls = true;
+                if (opt_runs_code(m, in)) calls = true;
             }
         }
         int *ptrs_buf[16];

@@ -1,0 +1,9 @@
+var keep = nil;
+shared struct T { x: int }
+impl T {
+  fun drop(self) { self.stash(); }
+  fun stash(self) { keep = self; }
+}
+fun f() { var t = T { x: 1 }; }
+f();
+print("unreachable");

@@ -55,7 +55,12 @@ static const char *var_name(const IrFunc *f, int v, char *buf, size_t n) {
 
 static bool is_free_call(const IrModule *m, const IrInstr *in) {
     return in->op == IR_CALL && in->nargs == 1 && m->globals[in->global].kind == IRG_EXTERN &&
-           strcmp(m->globals[in->global].name, "luma_free") == 0;
+           (strcmp(m->globals[in->global].name, "luma_free") == 0 || strcmp(m->globals[in->global].name, "luma_dispose") == 0);
+}
+
+/* "free" or "dispose", for messages */
+static const char *free_word(const IrModule *m, const IrInstr *in) {
+    return strcmp(m->globals[in->global].name, "luma_dispose") == 0 ? "dispose" : "free";
 }
 
 /* Rc::new(x) moves x into the box: `new Rc.S(%x)` or `call @luma_rc_new(%x)`.
@@ -68,10 +73,12 @@ static int moved_into_rc(const IrModule *m, const IrInstr *in) {
     return -1;
 }
 
+#define DISPOSED (1 << 24) /* state bit: freed by dispose() rather than free() */
+
 /* One step of the must-be-freed analysis. state[v] = line of the free()
  * that freed v on every path (or minus the line of the Rc::new that moved
- * it), or 0. With report set, the first violation is printed and false
- * returned. */
+ * it), or 0; how[v]: which call freed it (0 free, 1 dispose). With report
+ * set, the first violation is printed and false returned. */
 static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, int *state, bool report, const char *path) {
     int *ptrs[80];
     int **pp = in->nargs + 2 > 80 ? xmalloc((size_t)(in->nargs + 2) * sizeof *pp) : ptrs;
@@ -92,17 +99,18 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
                 fprintf(stderr, "%s:%s: error: '%s' was moved into an Rc on line %d; use the Rc instead%s\n", path, at,
                         name, -state[v], freeing ? " (the Rc frees it)" : "");
             else if (freeing)
-                fprintf(stderr, "%s:%s: error: '%s' is freed twice (free(%s) on line %d already freed it)\n", path, at,
-                        name, name, state[v]);
+                fprintf(stderr, "%s:%s: error: '%s' is freed twice (%s(%s) on line %d already freed it)\n", path, at,
+                        name, state[v] & DISPOSED ? "dispose" : "free", name, state[v] & ~DISPOSED);
             else
-                fprintf(stderr, "%s:%s: error: '%s' is used after free(%s) on line %d\n", path, at, name, name,
-                        state[v]);
+                fprintf(stderr, "%s:%s: error: '%s' is used after %s(%s) on line %d\n", path, at, name,
+                        state[v] & DISPOSED ? "dispose" : "free", name, state[v] & ~DISPOSED);
         }
         ok = false;
     }
     if (pp != ptrs) free(pp);
     if (in->dst >= 0) state[in->dst] = 0;
-    if (freeing && in->args[0] >= 0) state[in->args[0]] = in->line > 0 ? in->line : 1;
+    if (freeing && in->args[0] >= 0)
+        state[in->args[0]] = (in->line > 0 ? in->line : 1) | (strcmp(free_word(m, in), "dispose") == 0 ? DISPOSED : 0);
     int mv = moved_into_rc(m, in);
     if (mv >= 0) state[mv] = -(in->line > 0 ? in->line : 1);
     return ok || !report;
@@ -185,7 +193,8 @@ static int uf_find(int *p, int x) {
 /* Runtime functions that only look at their arguments. */
 static bool extern_borrows(const char *name) {
     return strcmp(name, "luma_write") == 0 || strcmp(name, "luma_write_space") == 0 ||
-           strcmp(name, "luma_write_newline") == 0 || strcmp(name, "luma_print") == 0;
+           strcmp(name, "luma_write_newline") == 0 || strcmp(name, "luma_print") == 0 ||
+           strcmp(name, "luma_refcount") == 0;
 }
 
 /* Union-find over f's vregs joined by mov / check (they hold the same
@@ -252,7 +261,7 @@ static void choose_counted(IrModule *m, bool *sid_counted) {
     }
     /* Rc boxes and arena handles are always counted (Rc::new of a dynamic
      * value creates boxes in the runtime, where no `new` shows them) */
-    for (int s = 0; s < m->nstructs; s++) sid_counted[s] = m->structs[s].kind != IR_STRUCT_USER;
+    for (int s = 0; s < m->nstructs; s++) sid_counted[s] = m->structs[s].kind != IR_STRUCT_USER || m->structs[s].shared;
     bool **pesc = xcalloc((size_t)m->nfuncs + 1, sizeof *pesc);
     for (int i = 0; i < m->nfuncs; i++) pesc[i] = xcalloc((size_t)m->funcs[i].nparams + 1, sizeof **pesc);
     int maxv = 1;
@@ -282,7 +291,8 @@ static void choose_counted(IrModule *m, bool *sid_counted) {
                 if (in->op != IR_NEW) continue;
                 /* Rc boxes and arena handles are always counted: their lifetime
                  * is the point; user structs when they never escape */
-                in->imm = m->structs[in->sid].kind != IR_STRUCT_USER || (in->dst >= 0 && !esc[uf_find(parent, in->dst)]);
+                in->imm = m->structs[in->sid].kind != IR_STRUCT_USER || m->structs[in->sid].shared ||
+                          (in->dst >= 0 && !esc[uf_find(parent, in->dst)]);
                 if (in->imm) sid_counted[in->sid] = true;
             }
     }
@@ -349,7 +359,9 @@ static int collect_uses(const IrInstr *in, UseCount *u) {
     return n;
 }
 
-static bool result_borrowed(IrOp op) { return op == IR_LOAD || op == IR_GETFIELD; }
+/* load and a static getfield return the slot's own reference; a dynamic
+ * getfield (the runtime, which may go through deref) returns a new one. */
+static bool result_borrowed(const IrInstr *in) { return in->op == IR_LOAD || (in->op == IR_GETFIELD && in->sid >= 0); }
 
 /* Operations that fail (a runtime error) unless every operand is a fixnum:
  * after them an operand that dies needs no release. */
@@ -362,7 +374,10 @@ static bool int_only_op(IrOp op) {
 }
 
 /* Runtime functions that return nil. */
-static bool extern_returns_nil(const char *name) { return extern_borrows(name) || strcmp(name, "luma_free") == 0; }
+static bool extern_returns_nil(const char *name) {
+    return (extern_borrows(name) && strcmp(name, "luma_refcount") != 0) || strcmp(name, "luma_free") == 0 ||
+           strcmp(name, "luma_dispose") == 0;
+}
 
 /* May a call whose result is discarded (no dst) still return a counted
  * object, which then has to be released? */
@@ -442,11 +457,12 @@ static int fusable_compare(const IrBlock *bl) {
 static bool may_free(const IrModule *m, const IrInstr *in) {
     switch (in->op) {
     case IR_STORE: case IR_SETFIELD: case IR_CALLM: case IR_RETAIN: case IR_RELEASE: return true;
+    case IR_GETFIELD: return in->sid < 0; /* the runtime may call deref */
     case IR_CALL: {
         const IrGlobal *g = &m->globals[in->global];
         if (g->kind == IRG_CEXTERN) return false;
         if (g->kind == IRG_FUNC) return true;
-        static const char *const SAFE[] = {"luma_write", "luma_write_space", "luma_write_newline", "luma_print",
+        static const char *const SAFE[] = {"luma_write", "luma_write_space", "luma_write_newline", "luma_print", "luma_refcount",
                                            "luma_rc_count", "luma_rc_get", "luma_rc_new"};
         for (size_t i = 0; i < sizeof SAFE / sizeof *SAFE; i++)
             if (strcmp(g->name, SAFE[i]) == 0) return false;
@@ -477,7 +493,7 @@ static void find_borrowed_reads(const IrModule *m, const IrFunc *f, const Livene
         for (int k = 0; k < bl->n; k++) {
             const IrInstr *in = &bl->instrs[k];
             int d = in->dst;
-            if ((in->op != IR_LOAD && in->op != IR_GETFIELD) || d < 0 || !managed[d] || borrowed[d] || ndefs[d] != 1 ||
+            if (!result_borrowed(in) || d < 0 || !managed[d] || borrowed[d] || ndefs[d] != 1 ||
                 bit_get(live_out(lv, b), d))
                 continue;
             int o = in->op == IR_GETFIELD ? in->a : -1;
@@ -705,7 +721,7 @@ static void lower_func(Mem *mm, IrFunc *f) {
             }
             /* the result */
             if (d >= 0 && managed[d] && !borrowed[d]) {
-                if (result_borrowed(in.op)) {
+                if (result_borrowed(&in)) {
                     if (bit_get(live, d)) ilist_push(&post, rc_instr(IR_RETAIN, d, line));
                 } else if (!bit_get(live, d)) {
                     ilist_push(&post, rc_instr(IR_RELEASE, d, line));

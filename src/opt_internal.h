@@ -15,6 +15,14 @@ IrTy *opt_value_types(const IrModule *m, const IrFunc *f);
 /* Does executing `in` matter beyond defining its destination? True for
  * calls, stores, terminators and anything that may raise a runtime error
  * (given the operand types vty, which may be NULL = unknown). */
+/* Does some struct have a drop method? Then a release the memory pass
+ * inserts after optimization can run Luma code that writes globals and
+ * fields, so loads are not forwarded across instructions. */
+bool opt_module_has_drop(const IrModule *m);
+/* Can `in` run Luma code (which may write globals and fields)? Calls of
+ * Luma functions and methods, and dynamic field accesses when some struct
+ * has a deref method (the runtime calls it on a miss). */
+bool opt_runs_code(const IrModule *m, const IrInstr *in);
 bool opt_has_effect(const IrModule *m, const IrInstr *in, const IrTy *vty);
 /* May `in` raise a runtime error? */
 bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty);

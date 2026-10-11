@@ -1,0 +1,1 @@
+luma: runtime error: deref chain of 'A' is longer than 8 steps.

@@ -1,0 +1,4 @@
+struct T { x: int }
+impl T { fun drop(self) { print(1); } }
+var t = T { x: 1 };
+T::drop(t);

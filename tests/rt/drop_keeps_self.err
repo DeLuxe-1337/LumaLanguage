@@ -1,0 +1,1 @@
+luma: runtime error: T.drop() kept a reference to self.

@@ -336,6 +336,13 @@ static void emit_structs(const IrModule *m, Buf *out) {
         int rc = st->kind == IR_STRUCT_USER ? ir_find_struct(m, rcname) : -1;
         if (rc >= 0) buf_printf(out, "    .quad .Lstruct.%d    # Rc<%s>\n", rc, st->name);
         else buf_printf(out, "    .quad 0\n");
+        /* drop: the method named drop (called when an instance dies), or 0 */
+        int drop = -1;
+        for (int k = 0; k < st->nmethods; k++)
+            if (strcmp(st->mnames[k], "drop") == 0) drop = st->mglobals[k];
+        if (drop >= 0) buf_printf(out, "    .quad %s    # drop\n", m->globals[drop].name);
+        else buf_printf(out, "    .quad 0    # no drop\n");
+        buf_printf(out, "    .quad %d    # flags%s\n", st->shared ? 1 : 0, st->shared ? ": shared" : "");
         if (st->nfields) {
             buf_printf(out, ".Lsfields.%d:\n", i);
             for (int k = 0; k < st->nfields; k++) buf_printf(out, "    .quad .Lsfname.%d.%d    # %s\n", i, k, st->fields[k]);

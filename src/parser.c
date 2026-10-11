@@ -869,6 +869,15 @@ static Stmt *declaration(Parser *p) {
         Token *kw = advance(p);
         return struct_declaration(p, kw);
     }
+    /* `shared` is a keyword only right before `struct` */
+    if (check(p, TOK_IDENTIFIER) && cur(p)->lexeme_len == 6 && memcmp(cur(p)->lexeme, "shared", 6) == 0 &&
+        p->pos + 1 < p->toks->len && p->toks->items[p->pos + 1].kind == TOK_STRUCT) {
+        advance(p);
+        Token *kw = advance(p);
+        Stmt *s = struct_declaration(p, kw);
+        if (s) s->shared = true;
+        return s;
+    }
     if (check(p, TOK_IMPL)) {
         Token *kw = advance(p);
         return impl_declaration(p, kw);
@@ -1138,7 +1147,7 @@ static void dump_stmt(const Stmt *s, int indent) {
         printf(")\n");
         break;
     case STMT_STRUCT:
-        printf("(struct %s", s->name);
+        printf("(%sstruct %s", s->shared ? "shared " : "", s->name);
         dump_tparams(s);
         printf(" ");
         dump_params(s);

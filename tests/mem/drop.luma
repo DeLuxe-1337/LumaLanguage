@@ -1,0 +1,75 @@
+// drop(self): runs once per instance, right before it is freed, for each
+// way an instance dies. The log is printed after each step. --mm=none
+// frees nothing, so it runs no drop (drop.none.out).
+var log = "";
+fun note(s: str) { log = log + s + " "; }
+fun flush() { print(log); log = ""; }
+
+shared struct Tracked { name: str }
+impl Tracked {
+  fun drop(self) { note("drop:" + self.name); }
+}
+
+struct Manual { name: str, inner }
+impl Manual {
+  fun drop(self) { note("drop:" + self.name); dispose(self.inner); }   // owns inner
+}
+
+// 1. the count reaches 0 (a shared struct)
+fun scope() {
+  var t = Tracked { name: "a" };
+  print(t.name);
+}
+scope();
+flush();
+var g = Tracked { name: "g" };
+var h = g;
+print(refcount(g));
+g = nil;
+flush();                          // h still holds it
+h = nil;
+flush();
+
+// 2. free() and 3. dispose() of instances managed by hand
+var m = Manual { name: "m", inner: Manual { name: "inner", inner: nil } };
+free(m);
+flush();
+var n = Manual { name: "n", inner: 5 };
+dispose(n);
+dispose(42);
+dispose("text");
+dispose(nil);
+dispose(Tracked { name: "counted" });   // dispose leaves counted instances alone; the count frees it
+flush();
+
+// 4. the arena ends: newest first
+var keep = nil;
+arena {
+  keep = Manual { name: "a1", inner: nil };
+  keep = Manual { name: "a2", inner: keep };   // (inner is in the arena too: dispose leaves it)
+  keep = Manual { name: "a3", inner: keep };
+  keep = nil;
+}
+flush();
+
+// instances the compiler frees (they never leave their function) drop too
+fun local(): int {
+  var p = Manual { name: "local", inner: nil };
+  return 1;
+}
+print(local());
+flush();
+
+// a drop that writes a global: loads are not forwarded across releases
+var count = 0;
+shared struct Counter { x: int }
+impl Counter { fun drop(self) { count = count + 1; } }
+count = 0;
+{ var c = Counter { x: 1 }; }
+print(count);
+struct Holder { c: Counter? }
+var holder = Holder { c: Counter { x: 2 } };
+var before = holder.c.x;
+holder.c = nil;
+print(count, before);
+print(refcount(5), refcount("s"));

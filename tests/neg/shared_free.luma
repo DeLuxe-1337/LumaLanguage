@@ -1,0 +1,3 @@
+shared struct T { x: int }
+var t: T = T { x: 1 };
+free(t);

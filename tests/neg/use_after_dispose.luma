@@ -1,0 +1,7 @@
+struct T { x: int }
+fun f() {
+  var t = T { x: 1 };
+  dispose(t);
+  print(t.x);
+}
+f();

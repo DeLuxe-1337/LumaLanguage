@@ -1,0 +1,5 @@
+struct Point { x: int }
+struct Handle { inner: Point }
+impl Handle { fun deref(self): Point { return self.inner; } }
+fun dyn(v) { return v; }
+print(dyn(Handle { inner: Point { x: 1 } }).z);

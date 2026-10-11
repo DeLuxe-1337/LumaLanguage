@@ -43,6 +43,7 @@ typedef uint64_t LumaValue;
 #define LUMA_POISON ((LumaValue)0x00000DEAD0000004)
 
 /* Memory-management modes (luma --mm=..., emitted as the luma_mm symbol). */
+#define LUMA_STRUCT_SHARED 1 /* descriptor flags: every instance is counted */
 #define LUMA_MM_NONE 0
 #define LUMA_MM_MANUAL 1
 

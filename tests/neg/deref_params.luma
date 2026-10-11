@@ -1,0 +1,2 @@
+struct T { x: int }
+impl T { fun deref(self, k) { return k; } }

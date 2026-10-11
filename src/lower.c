@@ -112,6 +112,10 @@ typedef struct {
     int ntemps, nlabels;
     int narenas;  /* arena blocks entered at this point (left before a return) */
     int info;     /* index into L.fns; -1 for luma_main */
+    /* Temporaries that live to the end of their full expression (hold_temp) */
+    int *held;
+    int nheld, cap_held;
+    int edepth;   /* nesting of lower_expr within the current statement */
 } Fn;
 
 typedef struct {
@@ -134,6 +138,7 @@ typedef struct {
     Ty expect;        /* the type the expression being lowered flows into, or 0 */
     int nstrings;
     int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
+    int dispose_fn, refcount_fn;
     int rc_new_fn, rc_get_fn, rc_count_fn, arena_enter_fn, arena_leave_fn;
     bool uses_rc, uses_arena; /* builtin structs are added only when used */
     Fn *f;
@@ -494,10 +499,12 @@ static int find_gvar(L *l, const char *name) {
     return -1;
 }
 
-enum { BUILTIN_PRINT, BUILTIN_FREE };
+enum { BUILTIN_PRINT, BUILTIN_FREE, BUILTIN_DISPOSE, BUILTIN_REFCOUNT };
 static int builtin_index(const char *name) {
     if (strcmp(name, "print") == 0) return BUILTIN_PRINT;
     if (strcmp(name, "free") == 0) return BUILTIN_FREE;
+    if (strcmp(name, "dispose") == 0) return BUILTIN_DISPOSE;
+    if (strcmp(name, "refcount") == 0) return BUILTIN_REFCOUNT;
     return -1;
 }
 static bool is_builtin(const char *name) { return builtin_index(name) >= 0; }
@@ -631,6 +638,31 @@ static Ty binary_type(L *l, const Expr *e, Ty a, Ty b) {
 
 static Val lower_expr(L *l, const Expr *e, int hint);
 
+/* Temporaries live to the end of their full expression (as in C++): the
+ * receiver of a method call or field access and the arguments of a call,
+ * when they are not plain variables, get a `keep` after the outermost
+ * expression. A value a method returns may be owned by its receiver (an
+ * object whose drop() frees it): `make().peek().n` must not free make()'s
+ * result before `.n` is read. Values that can't be instances are skipped. */
+static void hold_temp(L *l, const Expr *src, Val v) {
+    Fn *f = l->f;
+    if (v.v < 0 || src->kind == EXPR_VAR || f->edepth == 0 || !ir_ty_inter(v.ty, TY_STRUCT)) return;
+    if (f->nheld == f->cap_held) {
+        f->cap_held = f->cap_held ? 2 * f->cap_held : 8;
+        f->held = xrealloc(f->held, (size_t)f->cap_held * sizeof *f->held);
+    }
+    f->held[f->nheld++] = v.v;
+}
+
+/* Ends the temporaries held since mark (a `keep` each, unless the block
+ * already ended). */
+static void release_held(L *l, int mark, int line) {
+    Fn *f = l->f;
+    if (!ir_block_terminated(&fn(l)->blocks[f->cur]))
+        for (int i = mark; i < f->nheld; i++) emit(l, IR_KEEP, line)->a = f->held[i];
+    f->nheld = mark;
+}
+
 static Val lower_into(L *l, const Expr *e, int dst) {
     Val v = lower_expr(l, e, dst);
     if (v.v >= 0) emit_mov(l, dst, v.v, e->line);
@@ -690,6 +722,8 @@ static Val lower_call(L *l, const Expr *e, int hint) {
     if (!lower_operands(l, e->args, e->nargs, vals)) goto done;
     for (size_t i = 0; i < e->nargs; i++) args[i] = vals[i].v;
     int d = hint >= 0 ? hint : -1;
+    if (n.kind == NAME_FUNCTION)
+        for (size_t i = 0; i < e->nargs; i++) hold_temp(l, e->args[i], vals[i]);
 
     if (n.kind == NAME_BUILTIN && n.index == BUILTIN_FREE) {
         /* free(x): releases a struct instance in --mm=manual (docs/DESIGN.md
@@ -703,6 +737,13 @@ static Val lower_call(L *l, const Expr *e, int hint) {
             ty_name(l, vals[0].ty, tn, sizeof tn);
             lerr(l, e->args[0]->line, e->args[0]->col, "free() expects a struct instance, got %s%s", tn,
                  vals[0].ty == T_STR ? " (strings are freed automatically)" : "");
+            goto done;
+        }
+        int ssi = static_struct_of(l, vals[0].ty);
+        if (ssi >= 0 && l->m->structs[l->structs[ssi].sid].shared) {
+            char tn[600];
+            ir_struct_display(l->structs[ssi].name, tn, sizeof tn);
+            lerr(l, e->args[0]->line, e->args[0]->col, "'%s' is a shared struct; it is freed when its last reference goes away", tn);
             goto done;
         }
         IrStructKind k = static_kind(l, vals[0].ty);
@@ -719,6 +760,28 @@ static Val lower_call(L *l, const Expr *e, int hint) {
             r = result(l, hint, &d);
             emit(l, IR_CONST_NIL, e->line)->dst = d;
             r.ty = T_NIL;
+        }
+        goto done;
+    }
+    if (n.kind == NAME_BUILTIN && (n.index == BUILTIN_DISPOSE || n.index == BUILTIN_REFCOUNT)) {
+        /* dispose(x): frees x if it is an instance managed by hand, else
+         * nothing (docs/DESIGN.md "Memory"); refcount(x): x's reference count */
+        bool dispose = n.index == BUILTIN_DISPOSE;
+        if (e->nargs != 1) {
+            lerr(l, e->line, e->col, "'%s' expects 1 argument, got %zu", e->name, e->nargs);
+            goto done;
+        }
+        if (dispose) {
+            emit_call(l, IR_NONE, runtime_extern(l, &l->dispose_fn, "luma_dispose", 1), args, 1, e->line);
+            if (hint != DISCARD) {
+                r = result(l, hint, &d);
+                emit(l, IR_CONST_NIL, e->line)->dst = d;
+                r.ty = T_NIL;
+            }
+        } else {
+            r = result(l, hint, &d);
+            emit_call(l, hint == DISCARD ? IR_NONE : d, runtime_extern(l, &l->refcount_fn, "luma_refcount", 1), args, 1, e->line);
+            r.ty = T_INT;
         }
         goto done;
     }
@@ -828,12 +891,76 @@ static IrStructKind static_kind(L *l, Ty t) {
  * as its box, so the boxes passed through are recorded in boxes[] (up to 4)
  * and the caller ends the access with `keep %box` (keep_boxes). */
 typedef struct {
-    int v[4];
+    int v[16];
     int n;
 } Boxes;
 
 static void keep_boxes(L *l, const Boxes *b, int line) {
     for (int i = 0; i < b->n; i++) emit(l, IR_KEEP, line)->a = b->v[i];
+}
+
+static bool is_self_var(const Expr *e) { return e && e->kind == EXPR_VAR && strcmp(e->name, "self") == 0; }
+
+/* The field a trivial deref returns: a body that is exactly
+ * `return self.f;` with f a field of struct si. -1 otherwise. */
+static int trivial_deref_field(L *l, int si, const FnInfo *fi) {
+    const Stmt *d = fi->decl;
+    if (d->n != 1 || d->stmts[0]->kind != STMT_RETURN) return -1;
+    const Expr *e = d->stmts[0]->expr;
+    if (!e || e->kind != EXPR_GET || !is_self_var(e->left)) return -1;
+    const IrStruct *st = &l->m->structs[l->structs[si].sid];
+    int k = ir_struct_field(st, e->name);
+    /* the function's return check would accept every value of the field */
+    return k >= 0 && ir_ty_sub(st->ftys[k], fi->ret) ? k : -1;
+}
+
+/* deref (docs/DESIGN.md "Memory"): an access to a member (a field, or a
+ * method when `method`) that the value's struct lacks goes to what its
+ * deref(self) returns, repeatedly (at most 8 steps). Applies only when the
+ * struct is known statically; values known at run time are handled by the
+ * runtime. Each owner the access went through is recorded in boxes (the
+ * caller ends the access with keep_boxes). *first is set to the struct the
+ * access started at when deref was followed (for messages), else -1. */
+static Val deref_member(L *l, Val v, const char *name, bool method, int line, int col, Boxes *boxes, int *first) {
+    *first = -1;
+    int seen[9], nseen = 0;
+    for (;;) {
+        int si = static_struct(l, v.ty);
+        if (si < 0 || !l->structs[si].decl) return v;
+        bool has = method ? find_impl_fn(l, si, name) >= 0
+                          : ir_struct_field(&l->m->structs[l->structs[si].sid], name) >= 0;
+        int dfi = find_impl_fn(l, si, "deref");
+        if (has || dfi < 0) return v;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i] == si) {
+                char a[600];
+                ir_struct_display(l->structs[si].name, a, sizeof a);
+                lerr(l, line, col, "deref of '%s' leads back to '%s' (a cycle)", a, a);
+                return NO_VAL;
+            }
+        if (nseen == 8) {
+            lerr(l, line, col, "deref chain longer than 8 steps");
+            return NO_VAL;
+        }
+        seen[nseen++] = si;
+        if (*first < 0) *first = si;
+        if (boxes->n < 16) boxes->v[boxes->n++] = v.v;
+        int k = trivial_deref_field(l, si, &l->fns[dfi]);
+        if (k >= 0) { /* `return self.f;`: the field itself, no call */
+            int sid = l->structs[si].sid;
+            int d = temp(l);
+            IrInstr *in = emit(l, IR_GETFIELD, line);
+            in->dst = d;
+            in->a = v.v;
+            in->sid = sid;
+            in->field = k;
+            v = (Val){d, l->m->structs[sid].ftys[k]};
+        } else {
+            v = call_fn(l, &l->fns[dfi], &v, NULL, -1, line, col);
+            if (v.v < 0) return NO_VAL;
+            if (boxes->n < 16) boxes->v[boxes->n++] = v.v; /* (an owned result: keep it too) */
+        }
+    }
 }
 
 static Val deref_rc(L *l, Val v, const char *what, int line, int col, Boxes *boxes) {
@@ -1104,27 +1231,39 @@ static Val lower_field(L *l, const Expr *e, int hint) {
     Val v[2];
     if (!lower_operands(l, ops, set ? 2 : 1, v)) return NO_VAL;
     if (not_an_instance(l, v[0].ty, "fields", e->line, e->col)) return NO_VAL;
+    hold_temp(l, e->left, v[0]);
     Boxes boxes;
     v[0] = deref_rc(l, v[0], "fields", e->line, e->col, &boxes);
     if (v[0].v < 0 || not_an_instance(l, v[0].ty, "fields", e->line, e->col)) return NO_VAL;
+    int first;
+    v[0] = deref_member(l, v[0], e->name, false, e->line, e->col, &boxes, &first);
+    if (v[0].v < 0) return NO_VAL;
     int si = static_struct(l, v[0].ty);
     int sid = -1, k = -1;
     if (si >= 0) {
         sid = l->structs[si].sid;
         const IrStruct *ir = &l->m->structs[sid];
+        char sn[600], via[700] = "";
+        ir_struct_display(ir->name, sn, sizeof sn);
         k = ir_struct_field(ir, e->name);
         if (k < 0) {
+            if (first >= 0) { /* "struct 'W' has no field 'z' (nor does 'Point', through deref)" */
+                char f0[600];
+                ir_struct_display(l->structs[first].name, f0, sizeof f0);
+                snprintf(via, sizeof via, " (nor does '%s', through deref)", sn);
+                snprintf(sn, sizeof sn, "%s", f0);
+            }
             int fi = find_impl_fn(l, si, e->name);
-            if (fi >= 0)
+            if (fi >= 0 && first < 0)
                 lerr(l, e->line, e->col, "struct '%s' has no field '%s' ('%s' is a function of its impl: call it with ()",
-                     ir->name, e->name, e->name);
+                     sn, e->name, e->name);
             else
-                lerr(l, e->line, e->col, "struct '%s' has no field '%s'", ir->name, e->name);
+                lerr(l, e->line, e->col, "struct '%s' has no field '%s'%s", sn, e->name, via);
             return NO_VAL;
         }
         if (set) {
-            char what[300];
-            snprintf(what, sizeof what, "field '%s' of '%s'", ir->fields[k], ir->name);
+            char what[700];
+            snprintf(what, sizeof what, "field '%s' of '%s'", ir->fields[k], sn);
             v[1].ty = flow(l, v[1], ir->ftys[k], what, e->right->line, e->right->col);
             if (l->failed) return NO_VAL;
         }
@@ -1160,15 +1299,28 @@ static Val lower_method_call(L *l, const Expr *e, int hint) {
     Val r = NO_VAL;
     if (!lower_operands(l, ops, n, vals)) goto done;
     if (not_an_instance(l, vals[0].ty, "methods", e->line, e->col)) goto done;
+    for (size_t i = 0; i < n; i++) hold_temp(l, ops[i], vals[i]);
     Boxes boxes;
     vals[0] = deref_rc(l, vals[0], "methods", e->line, e->col, &boxes);
     if (vals[0].v < 0 || not_an_instance(l, vals[0].ty, "methods", e->line, e->col)) goto done;
+    if (strcmp(e->name, "drop") == 0) {
+        lerr(l, e->line, e->col, "drop() runs by itself when an instance is freed; call free(x) or dispose(x) instead");
+        goto done;
+    }
+    int first;
+    vals[0] = deref_member(l, vals[0], e->name, true, e->line, e->col, &boxes, &first);
+    if (vals[0].v < 0) goto done;
     int si = static_struct(l, vals[0].ty);
     if (si >= 0) {
-        const char *sname = l->structs[si].name;
+        char sname[600];
+        ir_struct_display(l->structs[si].name, sname, sizeof sname);
         int fi = find_impl_fn(l, si, e->name);
         if (fi < 0) {
-            if (ir_struct_field(&l->m->structs[l->structs[si].sid], e->name) >= 0)
+            if (first >= 0) {
+                char f0[600];
+                ir_struct_display(l->structs[first].name, f0, sizeof f0);
+                lerr(l, e->line, e->col, "struct '%s' has no method '%s' (nor does '%s', through deref)", f0, e->name, sname);
+            } else if (ir_struct_field(&l->m->structs[l->structs[si].sid], e->name) >= 0)
                 lerr(l, e->line, e->col, "struct '%s' has no method '%s' ('%s' is a field; functions are not first-class values yet)",
                      sname, e->name, e->name);
             else
@@ -1231,6 +1383,10 @@ static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
         lerr(l, e->line, e->col, "unknown struct '%s'", e->name);
         return NO_VAL;
     }
+    if (strcmp(e->str, "drop") == 0) {
+        lerr(l, e->line, e->col, "drop() runs by itself when an instance is freed; call free(x) or dispose(x) instead");
+        return NO_VAL;
+    }
     if (gi >= 0) {
         /* Box::new(args): the instance comes from the argument types (and the
          * type the result flows into), so arguments are lowered first */
@@ -1254,6 +1410,7 @@ static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
         Val *vals = xmalloc((e->nargs ? e->nargs : 1) * sizeof *vals);
         Val r = NO_VAL;
         if (lower_operands(l, e->args, e->nargs, vals)) {
+            for (size_t k = 0; k < e->nargs; k++) hold_temp(l, e->args[k], vals[k]);
             const TypeRef **pats = xmalloc((e->nargs ? e->nargs : 1) * sizeof *pats);
             Ty *tys = xmalloc((e->nargs ? e->nargs : 1) * sizeof *tys);
             for (size_t k = 0; k < e->nargs; k++) {
@@ -1309,7 +1466,10 @@ static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
     Val *vals = xmalloc((e->nargs ? e->nargs : 1) * sizeof *vals);
     Val r = NO_VAL;
     /* (lowering the arguments may create instances, which moves l->fns) */
-    if (lower_operands(l, e->args, e->nargs, vals)) r = call_fn(l, &l->fns[fi], vals, e->args, hint, e->line, e->col);
+    if (lower_operands(l, e->args, e->nargs, vals)) {
+        for (size_t k = 0; k < e->nargs; k++) hold_temp(l, e->args[k], vals[k]);
+        r = call_fn(l, &l->fns[fi], vals, e->args, hint, e->line, e->col);
+    }
     free(vals);
     return r;
 }
@@ -1353,7 +1513,12 @@ static Val lower_expr(L *l, const Expr *e, int hint) {
     Ty expect = l->expect;
     l->expect = 0;
     l->col = e->col;
+    Fn *f = l->f;
+    int mark = f->edepth == 0 ? f->nheld : -1; /* a full expression: its temporaries end here */
+    f->edepth++;
     Val v = lower_expr_at(l, e, hint, expect);
+    f->edepth--;
+    if (mark >= 0) release_held(l, mark, e->line);
     l->col = saved;
     return v;
 }
@@ -1457,7 +1622,9 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
         if (is_or) emit_br(l, r, end, rhs, e->line);
         else emit_br(l, r, rhs, end, e->line);
         set_block(l, rhs);
+        int mark = l->f->nheld; /* the right operand's temporaries end in its own block */
         Val b = lower_into(l, e->right, r);
+        release_held(l, mark, e->line);
         emit_jmp(l, end, e->line);
         set_block(l, end);
         Ty t = ir_ty_union(a.ty, b.ty);
@@ -1539,7 +1706,18 @@ static void lower_var(L *l, const Stmt *s) {
     f->scope[idx].vreg = v;
 }
 
+static void lower_stmt_at(L *l, const Stmt *s);
+
+/* A statement (also one inside an expression, as in an arena block) starts
+ * its own full expressions. */
 static void lower_stmt(L *l, const Stmt *s) {
+    int depth = l->f->edepth;
+    l->f->edepth = 0;
+    lower_stmt_at(l, s);
+    l->f->edepth = depth;
+}
+
+static void lower_stmt_at(L *l, const Stmt *s) {
     if (l->failed) return;
     switch (s->kind) {
     case STMT_EXPR:
@@ -1720,6 +1898,7 @@ static void end_function(L *l, int line, int col) {
     free(f->scope);
     free(f->order);
     free(f->is_var);
+    free(f->held);
     memset(f, 0, sizeof *f);
 }
 
@@ -1801,6 +1980,7 @@ static void collect_structs(L *l, const Program *prog) {
         }
         l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
         l->structs[l->nstructs++] = (StructInfo){s->name, ir_add_struct(l->m, s->name), s, NULL, 0, -1, NULL};
+        l->m->structs[l->structs[l->nstructs - 1].sid].shared = s->shared;
     }
     /* impl blocks of generic structs: their functions are added per instance */
     for (size_t i = 0; i < prog->len && !l->failed; i++) {
@@ -1865,6 +2045,74 @@ static void collect_structs(L *l, const Program *prog) {
     }
 }
 
+/* `self` inside drop(): the instance is about to be freed, so drop must not
+ * keep it. Storing, returning or passing it on (except as the receiver of a
+ * field access or method call, or to print/refcount) is a compile error; a
+ * reference kept some other way is caught at run time. */
+static bool is_self(const Expr *e) { return e && e->kind == EXPR_VAR && strcmp(e->name, "self") == 0; }
+
+static const Expr *self_kept_expr(const Expr *e) {
+    if (!e) return NULL;
+    const Expr *r;
+    switch (e->kind) {
+    case EXPR_ASSIGN: case EXPR_SET:
+        if (is_self(e->right)) return e->right;
+        break;
+    case EXPR_STRUCT:
+        for (size_t i = 0; i < e->nargs; i++)
+            if (is_self(e->args[i])) return e->args[i];
+        break;
+    case EXPR_CALL:
+        if (strcmp(e->name, "print") != 0 && strcmp(e->name, "refcount") != 0)
+            for (size_t i = 0; i < e->nargs; i++)
+                if (is_self(e->args[i])) return e->args[i];
+        break;
+    case EXPR_METHOD:
+        for (size_t i = 0; i < e->nargs; i++)
+            if (is_self(e->args[i])) return e->args[i];
+        break;
+    case EXPR_ASSOC:
+        for (size_t i = 0; i < e->nargs; i++)
+            if (is_self(e->args[i]) && (i > 0 || strcmp(e->name, "Rc") == 0)) return e->args[i];
+        break;
+    default: break;
+    }
+    if ((r = self_kept_expr(e->left)) || (r = self_kept_expr(e->right))) return r;
+    for (size_t i = 0; i < e->nargs; i++)
+        if ((r = self_kept_expr(e->args[i]))) return r;
+    return NULL;
+}
+
+static const Expr *self_kept(const Stmt *s) {
+    if (!s) return NULL;
+    if ((s->kind == STMT_VAR || s->kind == STMT_RETURN) && is_self(s->expr)) return s->expr;
+    const Expr *r = self_kept_expr(s->expr);
+    for (size_t i = 0; i < s->n && !r; i++) r = self_kept(s->stmts[i]);
+    if (!r) r = self_kept(s->then_branch);
+    if (!r) r = self_kept(s->else_branch);
+    if (!r) r = self_kept(s->body);
+    return r;
+}
+
+static bool check_drop(L *l, const Stmt *f) {
+    if (f->nparams != 1 || strcmp(f->params[0], "self") != 0) {
+        lerr(l, f->line, f->col, "drop must take only self: fun drop(self) { ... }");
+        return false;
+    }
+    if (f->type.name) {
+        lerr(l, f->type.line, f->type.col, "drop returns nothing (remove the return type)");
+        return false;
+    }
+    for (size_t i = 0; i < f->n; i++) {
+        const Expr *k = self_kept(f->stmts[i]);
+        if (k) {
+            lerr(l, k->line, k->col, "drop() must not keep 'self': the instance is freed when drop returns");
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Symbol-safe form of a struct name for function symbols: Pair<int,Box<str?>>
  * -> Pair..int.Box..str_opt (the assembler's names have no <, > or ?). */
 static void mangle(const char *in, char *out, size_t n) {
@@ -1910,6 +2158,11 @@ static void collect_impl_fns(L *l, const Stmt *s, int si, const TArg *tenv, int 
         if (bad) break;
         if (f->nparams > MAX_PARAMS) {
             lerr(l, f->line, f->col, "functions with more than %d parameters are not supported yet", MAX_PARAMS);
+            break;
+        }
+        if (strcmp(f->name, "drop") == 0 && !check_drop(l, f)) break;
+        if (strcmp(f->name, "deref") == 0 && (f->nparams != 1 || strcmp(f->params[0], "self") != 0)) {
+            lerr(l, f->line, f->col, "deref must take only self: fun deref(self) { ... }");
             break;
         }
         char sym[700];
@@ -2005,6 +2258,7 @@ static int instantiate(L *l, int gi, const Ty *targs_in, int line, int col) {
         return -1;
     }
     int sid = ir_add_struct(l->m, name);
+    l->m->structs[sid].shared = d->shared;
     l->structs = xrealloc(l->structs, (size_t)(l->nstructs + 1) * sizeof *l->structs);
     si = l->nstructs++;
     l->structs[si] = (StructInfo){l->m->structs[sid].name, sid, d, NULL, 0, gi, targs};
@@ -2287,6 +2541,7 @@ bool lower_program(const Program *prog, IrModule *out) {
     l.path = prog->source_path;
     l.m = out;
     l.write_fn = l.space_fn = l.newline_fn = l.free_fn = -1;
+    l.dispose_fn = l.refcount_fn = -1;
     l.rc_new_fn = l.rc_get_fn = l.rc_count_fn = l.arena_enter_fn = l.arena_leave_fn = -1;
     Fn main_fn;
     int main_fi = ir_add_func(out, "luma_main", 0);

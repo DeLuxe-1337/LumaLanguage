@@ -223,7 +223,7 @@ def render_s(s, ind=0):
     if k in ("struct", "impl") and "<" in s[1]:
         return ""   # an instance: the interpreter's view of a generic struct (rendered by gstruct/gimpl)
     if k == "gstruct":
-        return p + "struct %s<%s> {\n" % (s[1], ", ".join(s[2])) + "".join(p + "  %s%s,\n" % (f, ann(a)) for f, a in s[3]) + p + "}\n"
+        return p + "%sstruct %s<%s> {\n" % ("shared " if s[4] else "", s[1], ", ".join(s[2])) + "".join(p + "  %s%s,\n" % (f, ann(a)) for f, a in s[3]) + p + "}\n"
     if k == "gimpl":
         return p + "impl %s<%s> {\n" % (s[1], ", ".join(s[2])) + "".join(render_s(x, ind + 1) for x in s[3]) + p + "}\n"
     if k == "struct":
@@ -504,6 +504,7 @@ class Gen:
         self.methods_ok = False  # may expressions call methods? (only from main code: no recursion)
         self.self_struct = None  # inside a method of S: `self` may be the receiver of field accesses
         self.generic = {}        # instance "G<int>" -> its constructor function (see generic())
+        self.shared = set()      # instances of shared structs
 
     def fresh(self, prefix):
         self.n += 1
@@ -692,8 +693,8 @@ class Gen:
             if self.structs[S]["fields"]:
                 f, ft, fa = r.choice(self.structs[S]["fields"])
                 return ("expr", ("set", self.receiver(S, 2)[0], f, self.field_value(S, f, ft, fa, 2)))
-        if c < 0.655 and self.structs:   # a fresh local instance, read, then freed
-            S = r.choice(sorted(self.structs))
+        if c < 0.655 and set(self.structs) - self.shared:   # a fresh local instance, read, then freed
+            S = r.choice(sorted(set(self.structs) - self.shared))
             t = self.fresh("t")
             new = self.construct(S, lambda f, ft, fa: self.slot_expr(ft, fa, 2))
             body = [("var", t, new, S if r.random() < 0.5 else None)]
@@ -765,16 +766,21 @@ class Gen:
         plain struct with T substituted; each has a constructor function
         mkG_x(val: x, link): G<x> that builds it from an annotated variable."""
         G = self.fresh("G")
-        decls = [("gstruct", G, ["T"], [("val", "T"), ("link", None)]),
+        shared = self.r.random() < 0.4   # every instance counted; free() of one is never generated
+        drop = [("fun", "drop", ["self"], [("var", "d", ("get", ("var", "self"), "val"), None)], [None], None)] \
+            if self.r.random() < 0.5 else []   # a drop without visible effects (it runs when the compiler frees)
+        decls = [("gstruct", G, ["T"], [("val", "T"), ("link", None)], shared),
                  ("gimpl", G, ["T"], [("fun", "get", ["self"], [("return", ("get", ("var", "self"), "val"))], [None], "T"),
                                       ("fun", "put", ["self", "v"], [("expr", ("set", ("var", "self"), "val", ("var", "v")))],
-                                       [None, "T"], None)])]
+                                       [None, "T"], None)] + drop)]
         for X in self.r.sample(("int", "str", "bool", "nil"), self.r.randint(1, 3)):
             S = "%s<%s>" % (G, X)
             fields = [("val", X, X), ("link", "nil", None)]
             self.structs[S] = {"fields": fields, "methods": [("get", [], [], X), ("put", [X], [X], "nil")]}
             mk = "mk%s_%s" % (G, X)
             self.generic[S] = mk
+            if shared:
+                self.shared.add(S)
             decls += [("struct", S, fields),
                       ("impl", S, [("fun", "get", ["self"], [("return", ("get", ("var", "self"), "val"))], [None], X),
                                    ("fun", "put", ["self", "v"], [("expr", ("set", ("var", "self"), "val", ("var", "v")))],

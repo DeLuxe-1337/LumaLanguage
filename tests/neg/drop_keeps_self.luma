@@ -1,0 +1,3 @@
+var saved = nil;
+struct T { x: int }
+impl T { fun drop(self) { saved = self; } }

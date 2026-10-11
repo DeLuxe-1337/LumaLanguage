@@ -81,3 +81,17 @@ fun dyn(x) { return x; }
 print(dyn(b).get(), dyn(q).first, dyn(h).boxed.value.x);
 dyn(maybe).set(nil);
 print(maybe.get());
+
+// a shared generic with a drop: the box frees what it holds
+struct Leaf { n: int }
+shared struct Owner<T> { held: T }
+impl Owner<T> {
+  fun drop(self) { dispose(self.held); }
+  fun peek(self): T { return self.held; }
+}
+fun make(n: int): Owner<Leaf> { return Owner { held: Leaf { n: n } }; }
+var total = 0;
+for (var i = 0; i < 5; i = i + 1) total = total + make(i).peek().n;
+var o = make(7);
+var o2 = o;
+print(total, o2.peek().n, o == o2);

@@ -100,6 +100,7 @@ bool opt_objects(IrModule *m, IrFunc *f) {
     int nv = f->nvregs;
     IrTy *st = xmalloc((size_t)(nv ? nv : 1) * sizeof *st);
     Known *known = NULL;
+    bool has_drop = opt_module_has_drop(m);
     int nknown = 0, capknown = 0;
     for (int b = 0; b < f->nblocks; b++) {
         IrBlock *bl = &f->blocks[b];
@@ -117,7 +118,8 @@ bool opt_objects(IrModule *m, IrFunc *f) {
                 }
                 break;
             case IR_GETFIELD:
-                if (in->sid < 0) break;
+                if (in->sid < 0 && opt_runs_code(m, in)) nknown = 0; /* deref code may write fields */
+                if (in->sid < 0 || has_drop) break; /* (see opt_module_has_drop) */
                 for (int i = 0; i < nknown; i++)
                     if (known[i].obj == in->a && known[i].sid == in->sid && known[i].field == in->field) {
                         in->op = IR_MOV;
@@ -139,7 +141,8 @@ bool opt_objects(IrModule *m, IrFunc *f) {
                  * see the bug): only runtime calls known to do neither keep
                  * what we know */
                 static const char *const KEEP[] = {"luma_write", "luma_write_space", "luma_write_newline", "luma_print",
-                                                   "luma_rc_new", "luma_rc_get", "luma_rc_count", "luma_arena_enter"};
+                                                   "luma_rc_new", "luma_rc_get", "luma_rc_count", "luma_arena_enter",
+                                                   "luma_refcount"};
                 bool keep = g->kind == IRG_CEXTERN;
                 for (size_t i = 0; g->kind == IRG_EXTERN && i < sizeof KEEP / sizeof *KEEP; i++)
                     keep |= strcmp(g->name, KEEP[i]) == 0;

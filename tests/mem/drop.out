@@ -1,0 +1,13 @@
+a
+drop:a 
+2
+
+drop:g 
+drop:m drop:inner 
+drop:n drop:counted 
+drop:a3 drop:a2 drop:a1 
+1
+drop:local 
+1
+2 2
+0 0

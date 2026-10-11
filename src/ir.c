@@ -707,7 +707,7 @@ void ir_print_module(const IrModule *m, Buf *out) {
     if (m->nstructs) buf_byte(out, '\n');
     for (int i = 0; i < m->nstructs; i++) {
         const IrStruct *st = &m->structs[i];
-        buf_printf(out, "struct %s {", st->name);
+        buf_printf(out, "%sstruct %s {", st->shared ? "shared " : "", st->name);
         for (int k = 0; k < st->nfields; k++) {
             buf_printf(out, "%s%s", k ? ", " : "", st->fields[k]);
             if (st->ftys[k] != TY_ANY) {

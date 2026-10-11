@@ -1,0 +1,1 @@
+deref must take only self: fun deref(self) { ... }

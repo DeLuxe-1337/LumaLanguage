@@ -55,6 +55,8 @@ struct LumaStructDesc {
     const LumaMethod *methods;
     int64_t kind;          /* LUMA_STRUCT_USER / _RC (field 0: the value) / _ARENA (field 0: its state) */
     const LumaStructDesc *rc; /* user structs: the Rc<S> descriptor (NULL if the program uses no Rc) */
+    LumaFn drop;           /* the struct's drop(self) method, called when an instance dies; or NULL */
+    int64_t flags;         /* LUMA_STRUCT_SHARED */
 };
 
 typedef struct {
@@ -74,6 +76,8 @@ extern const int64_t luma_mm;           /* emitted into every program: LUMA_MM_*
 extern const uintptr_t luma_globals[];  /* emitted into every program: [count, &slot...] */
 
 LumaValue luma_main(void);
+
+static _Noreturn void panicf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static _Noreturn void luma_panic(const char *msg) {
     fflush(stdout);
@@ -251,6 +255,7 @@ typedef struct {
     ArenaChunk *cur;    /* the chunk small objects are bumped from */
     PtrVec objs;        /* LUMA_MEMCHECK: the instances (allocated individually) */
     uint64_t nobjects;
+    bool any_drop;      /* some instance has a drop method */
 } ArenaState;
 
 #define ARENA_CHUNK (64 * 1024)
@@ -294,11 +299,67 @@ static void *arena_alloc(ArenaState *a, size_t size) {
 
 static size_t instance_size(int64_t nfields) { return sizeof(LumaStruct) + (size_t)nfields * sizeof(LumaValue); }
 
+/* ---- drop ----
+ * A struct's drop(self) runs once per instance, right before its fields are
+ * released and its memory freed: when a counted instance's count reaches 0,
+ * when free()/dispose() frees one managed by hand, or when its arena is
+ * destroyed. While it runs, a counted instance's count is held at 1, so
+ * drop's own retains and releases of self balance; anything else means drop
+ * kept a reference to an instance that is about to disappear. */
+typedef LumaValue (*LumaDropFn)(LumaValue self);
+#define MAX_DROP_DEPTH 1024
+static const LumaStruct *dropping[MAX_DROP_DEPTH]; /* instances whose drop is running */
+static int ndropping;
+
+static bool is_dropping(const LumaStruct *o) {
+    for (int i = 0; i < ndropping; i++)
+        if (dropping[i] == o) return true;
+    return false;
+}
+
+static void drop(LumaValue v);
+
+static void run_drop(LumaStruct *o, bool counted) {
+    const LumaStructDesc *d = desc_of(o);
+    if (!d->drop) return;
+    if (ndropping == MAX_DROP_DEPTH) luma_panic("drop() calls nested too deeply.");
+    dropping[ndropping++] = o;
+    uint32_t *c = rc_word(o);
+    if (counted) *c = 1;
+    LumaValue r = ((LumaDropFn)(void (*)(void))d->drop)((LumaValue)(uintptr_t)o);
+    ndropping--;
+    if (counted) {
+        if (*c != 1) panicf("%s.drop() kept a reference to self.", d->name);
+        *c = 0;
+    }
+    drop(r); /* (a result is owned; drop normally returns nil) */
+}
+
 /* The handle's last reference is gone: release what the instances refer
  * to, then free them all. */
 static void arena_destroy(LumaValue state) {
     if (state == luma_fixnum(0)) return; /* never used */
     ArenaState *a = (ArenaState *)(uintptr_t)(state & ~(LumaValue)1);
+    if (a->any_drop) { /* the instances' drop methods first, newest first */
+        PtrVec all = {0}; /* in allocation order (oldest first) */
+        if (memcheck) {
+            for (size_t i = 0; i < a->objs.n; i++) vec_push(&all, a->objs.items[i]);
+        } else {
+            PtrVec chunks = {0};
+            for (ArenaChunk *c = a->chunks; c; c = c->next) vec_push(&chunks, c);
+            for (size_t k = chunks.n; k-- > 0;) { /* the list is newest first */
+                ArenaChunk *c = chunks.items[k];
+                for (size_t off = 0; off < c->used;) {
+                    LumaStruct *o = (LumaStruct *)((char *)c->data + off);
+                    vec_push(&all, o);
+                    off += instance_size(desc_of(o)->nfields);
+                }
+            }
+            free(chunks.items);
+        }
+        for (size_t i = all.n; i-- > 0;) run_drop(all.items[i], false);
+        free(all.items);
+    }
     if (memcheck) {
         for (size_t i = 0; i < a->objs.n; i++) {
             LumaStruct *o = a->objs.items[i];
@@ -338,6 +399,7 @@ static void drain(void) {
         void *o = dying.items[--dying.n];
         if ((*(uint64_t *)o & 0xff) == LUMA_TYPE_STRUCT) {
             LumaStruct *s = o;
+            run_drop(s, true);
             const LumaStructDesc *d = desc_of(s);
             int64_t n = d->nfields;
             if (d->kind == LUMA_STRUCT_RC) destroy_owned(s->fields[0]); /* an Rc owns its value */
@@ -355,6 +417,7 @@ static void drain(void) {
 /* Frees a struct instance the program manages by hand (count 0, not in an
  * arena): releases its fields, then its memory goes back to the pool. */
 static void free_manual(LumaStruct *o) {
+    run_drop(o, false);
     int64_t n = desc_of(o)->nfields;
     for (int64_t k = 0; k < n; k++) drop(o->fields[k]);
     free_object(o, true, n);
@@ -423,7 +486,6 @@ static inline void need_numbers(LumaValue a, LumaValue b) {
 enum { MASK_INT = 1, MASK_STR = 2, MASK_BOOL = 4, MASK_NIL = 8, MASK_STRUCT = 16 };
 #define MASK_SID_SHIFT 8 /* a mask's struct bits: 0 = any struct, k = struct with id k */
 
-static _Noreturn void panicf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static _Noreturn void panicf(const char *fmt, ...) {
     fflush(stdout);
     va_list ap;
@@ -712,7 +774,11 @@ LumaValue luma_new_struct(const LumaStructDesc *d, int64_t counted) {
     size_t size = instance_size(d->nfields);
     LumaStruct *o;
     bool arena = !counted && luma_mm == LUMA_MM_MANUAL && narena_stack > 0;
-    if (arena) o = arena_alloc(arena_state(as_struct(arena_stack[narena_stack - 1])), size);
+    if (arena) {
+        ArenaState *a = arena_state(as_struct(arena_stack[narena_stack - 1]));
+        a->any_drop |= d->drop != NULL;
+        o = arena_alloc(a, size);
+    }
     else if (!counted && luma_mm == LUMA_MM_MANUAL && !memcheck) o = pool_get(d->nfields, size);
     else o = alloc_object(size);
     o->header = LUMA_TYPE_STRUCT | ((uint64_t)d->id << LUMA_STRUCT_ID_SHIFT) | ((uint64_t)(counted != 0) << 32);
@@ -741,20 +807,77 @@ static LumaStruct *deref_instance(LumaValue o, const char *what) {
     }
 }
 
-static int64_t field_index(const LumaStruct *s, const char *name) {
+static int64_t find_field(const LumaStruct *s, const char *name) {
     for (int64_t i = 0; i < desc_of(s)->nfields; i++)
         if (strcmp(desc_of(s)->fields[i], name) == 0) return i;
-    panicf("Struct '%s' has no field '%s'.", desc_of(s)->name, name);
+    return -1;
 }
 
+static const LumaMethod *find_method(const LumaStruct *s, const char *name) {
+    for (int64_t i = 0; i < desc_of(s)->nmethods; i++)
+        if (strcmp(desc_of(s)->methods[i].name, name) == 0) return &desc_of(s)->methods[i];
+    return NULL;
+}
+
+/* deref (docs/DESIGN.md "Memory"): a member an instance's struct lacks is
+ * looked up on what its deref(self) method returns. The results are kept in
+ * Derefs (each is a reference the runtime owns) and released when the access
+ * is done. */
+#define MAX_DEREF 8
+typedef struct {
+    LumaValue v[MAX_DEREF];
+    int n;
+    const char *first; /* the struct the access started at */
+} Derefs;
+
+typedef LumaValue (*LumaFn1)(LumaValue);
+
+/* The instance to access for member `name` (a field, or a method when
+ * `method`), starting at s. */
+static LumaStruct *deref_for(LumaStruct *s, const char *name, bool method, const char *what, Derefs *ds) {
+    ds->n = 0;
+    ds->first = desc_of(s)->name;
+    for (;;) {
+        if (method ? find_method(s, name) != NULL : find_field(s, name) >= 0) return s;
+        const LumaMethod *d = find_method(s, "deref");
+        if (!d || d->arity != 1) return s;
+        if (ds->n == MAX_DEREF) panicf("deref chain of '%s' is longer than %d steps.", ds->first, MAX_DEREF);
+        LumaValue t = ((LumaFn1)(void (*)(void))d->fn)((LumaValue)(uintptr_t)s);
+        ds->v[ds->n++] = t;
+        s = need_instance(t, what);
+    }
+}
+
+static void derefs_done(Derefs *ds) {
+    for (int i = ds->n; i-- > 0;) luma_release(ds->v[i]);
+    ds->n = 0;
+}
+
+static _Noreturn void no_member(const LumaStruct *s, const char *kind, const char *name, const Derefs *ds) {
+    if (ds->n > 0) panicf("Struct '%s' has no %s '%s' (nor does '%s', through deref).", ds->first, kind, name, desc_of(s)->name);
+    panicf("Struct '%s' has no %s '%s'.", desc_of(s)->name, kind, name);
+}
+
+/* A dynamic getfield returns a reference of its own (it may come from a
+ * temporary that deref returned). */
 LumaValue luma_getfield(LumaValue o, const char *name) {
     LumaStruct *s = deref_instance(o, "fields");
-    return s->fields[field_index(s, name)];
+    Derefs ds;
+    s = deref_for(s, name, false, "fields", &ds);
+    int64_t k = find_field(s, name);
+    if (k < 0) no_member(s, "field", name, &ds);
+    LumaValue v = s->fields[k];
+    luma_retain(v);
+    derefs_done(&ds);
+    return v;
 }
 
 LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
     LumaStruct *s = deref_instance(o, "fields");
-    int64_t k = field_index(s, name);
+    Derefs ds;
+    s = deref_for(s, name, false, "fields", &ds);
+    int64_t k = find_field(s, name);
+    if (k < 0) no_member(s, "field", name, &ds);
     check_valid(v);
     unsigned m = (unsigned)desc_of(s)->ftys[k];
     if (!mask_accepts(m, value_mask(v))) {
@@ -765,6 +888,7 @@ LumaValue luma_setfield(LumaValue o, const char *name, LumaValue v) {
     LumaValue old = s->fields[k];
     s->fields[k] = v; /* the field takes over the caller's reference to v */
     luma_release(old);
+    derefs_done(&ds);
     return LUMA_NIL;
 }
 
@@ -780,6 +904,9 @@ LumaValue luma_free(LumaValue v) {
     if (!is_struct(v)) panicf("free() expects a struct instance, got %s.", value_type_name(v));
     LumaStruct *o = as_struct(v);
     const LumaStructDesc *d = desc_of(o);
+    if (d->flags & LUMA_STRUCT_SHARED)
+        panicf("'%s' is a shared struct; it is freed when its last reference goes away.", d->name);
+    if (is_dropping(o)) panicf("free() of an instance of '%s' whose drop() is running.", d->name);
     if (d->kind == LUMA_STRUCT_RC)
         panicf("free() expects a struct instance, got %s (an Rc frees its value when its last reference goes away).", d->name);
     if (d->kind == LUMA_STRUCT_ARENA)
@@ -790,6 +917,28 @@ LumaValue luma_free(LumaValue v) {
     free_manual(o);
     drain();
     return LUMA_NIL;
+}
+
+/* dispose(v): frees v when it is an instance managed by hand (as free()
+ * would); does nothing for anything else, whose lifetime is managed already:
+ * values that are not structs, counted and shared instances, instances in an
+ * arena. For generic code that owns a value of any type. */
+LumaValue luma_dispose(LumaValue v) {
+    if (is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FREED) luma_panic("Double free: this object was already freed.");
+    check_valid(v);
+    if (!is_struct(v) || luma_mm != LUMA_MM_MANUAL) return LUMA_NIL;
+    LumaStruct *o = as_struct(v);
+    if (*rc_word(o) != 0 || in_arena(o) || desc_of(o)->kind != LUMA_STRUCT_USER || is_dropping(o)) return LUMA_NIL;
+    free_manual(o);
+    drain();
+    return LUMA_NIL;
+}
+
+/* refcount(v): the number of references to a counted object; 0 for
+ * anything else. */
+LumaValue luma_refcount(LumaValue v) {
+    check_valid(v);
+    return luma_fixnum(is_object(v) ? *rc_word((void *)(uintptr_t)v) : 0);
 }
 
 /* ---- Rc ------------------------------------------------------------------
@@ -858,8 +1007,34 @@ LumaValue luma_arena_leave(void) {
 
 /* The code of method `name` of o's struct, for a call with nargs arguments
  * after self. */
+/* A method call whose receiver lacks the method but has deref: luma_method
+ * returns this function, which compiled code calls at once with the
+ * receiver and the arguments (at most 5 after self; extra registers are
+ * ignored by the callee under the SysV ABI). The method name comes from the
+ * luma_method call just before. */
+static const char *tramp_name;
+static int64_t tramp_nargs;
+typedef LumaValue (*LumaFn6)(LumaValue, LumaValue, LumaValue, LumaValue, LumaValue, LumaValue);
+
+static LumaValue deref_trampoline(LumaValue self, LumaValue a1, LumaValue a2, LumaValue a3, LumaValue a4, LumaValue a5) {
+    const char *name = tramp_name;
+    int64_t nargs = tramp_nargs;
+    Derefs ds;
+    LumaStruct *s = deref_for(as_struct(self), name, true, "methods", &ds);
+    const LumaMethod *mt = find_method(s, name);
+    if (!mt) no_member(s, "method", name, &ds);
+    if (mt->arity - 1 != nargs)
+        panicf("'%s::%s' expects %" PRId64 " argument%s, got %" PRId64 ".", desc_of(s)->name, name, mt->arity - 1,
+               mt->arity == 2 ? "" : "s", nargs);
+    LumaValue r = ((LumaFn6)(void (*)(void))mt->fn)((LumaValue)(uintptr_t)s, a1, a2, a3, a4, a5);
+    derefs_done(&ds);
+    return r;
+}
+
 LumaFn luma_method(LumaValue o, const char *name, int64_t nargs) {
     LumaStruct *s = need_instance(o, "methods");
+    if (strcmp(name, "drop") == 0)
+        luma_panic("drop() runs by itself when an instance is freed; call free(x) or dispose(x) instead.");
     if (desc_of(s)->kind == LUMA_STRUCT_ARENA) luma_panic("An Arena has no methods.");
     /* an Rc<S>'s table forwards S's methods; anything else in an Rc has none */
     const LumaStruct *named = s;
@@ -871,6 +1046,12 @@ LumaFn luma_method(LumaValue o, const char *name, int64_t nargs) {
             panicf("'%s::%s' expects %" PRId64 " argument%s, got %" PRId64 ".", desc_of(named)->name, name, mt->arity - 1,
                    mt->arity == 2 ? "" : "s", nargs);
         return mt->fn;
+    }
+    const LumaMethod *d = find_method(s, "deref");
+    if (d && d->arity == 1) { /* called right away with (o, args...): see deref_trampoline */
+        tramp_name = name;
+        tramp_nargs = nargs;
+        return (LumaFn)(void (*)(void))deref_trampoline;
     }
     panicf("Struct '%s' has no method '%s'.", desc_of(named)->name, name);
 }

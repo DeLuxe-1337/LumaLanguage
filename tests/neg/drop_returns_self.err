@@ -1,0 +1,1 @@
+drop() must not keep 'self': the instance is freed when drop returns

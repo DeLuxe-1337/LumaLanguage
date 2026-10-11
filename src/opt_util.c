@@ -43,6 +43,22 @@ bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty) {
     }
 }
 
+static bool has_method(const IrModule *m, const char *name) {
+    for (int s = 0; s < m->nstructs; s++)
+        for (int k = 0; k < m->structs[s].nmethods; k++)
+            if (strcmp(m->structs[s].mnames[k], name) == 0) return true;
+    return false;
+}
+
+bool opt_module_has_drop(const IrModule *m) { return has_method(m, "drop"); }
+
+bool opt_runs_code(const IrModule *m, const IrInstr *in) {
+    if (in->op == IR_CALLM) return true;
+    if (in->op == IR_CALL) return m->globals[in->global].kind == IRG_FUNC;
+    if ((in->op == IR_GETFIELD || in->op == IR_SETFIELD) && in->sid < 0) return has_method(m, "deref");
+    return false;
+}
+
 bool opt_has_effect(const IrModule *m, const IrInstr *in, const IrTy *vty) {
     switch (in->op) {
     case IR_CALL: case IR_STORE: case IR_JMP: case IR_BR: case IR_RET: return true;

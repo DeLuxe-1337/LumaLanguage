@@ -171,6 +171,7 @@ typedef struct {
     int nmethods;     /* methods callable on an instance whose type is not known statically */
     char **mnames;    /* method names (owned) */
     int *mglobals;    /* the IR function implementing each (params: self, then the arguments) */
+    bool shared;      /* `shared struct`: every instance is reference counted (v0.8) */
     int line;
 } IrStruct;
 
