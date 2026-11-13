@@ -1,1 +1,1 @@
-export fun f(): str { return "a"; }
+export fun f(): List<int> { return List::new(); }

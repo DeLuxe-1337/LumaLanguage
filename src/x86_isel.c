@@ -545,20 +545,40 @@ void x86_emit_data(const IrModule *m, Buf *out) {
 }
 
 /* C entry points of `export fun` functions (v0.10): System V arguments
- * (int64_t, double, bool) become Luma values (tagged ints, raw doubles,
- * tagged bools), and the Luma function runs under the runtime's guard
- * (luma_invoke: a runtime error returns to the caller instead of exiting).
- * Its result goes back as int64_t, double or bool (nothing for others). */
+ * (int64_t, double, bool, const char *) become Luma values (tagged ints, raw
+ * doubles, tagged bools, new strings), and the Luma function runs under the
+ * runtime's guard (luma_invoke: a runtime error returns to the caller instead
+ * of exiting). Its result goes back as int64_t, double, bool or const char *
+ * (luma_lib_str_out: valid until the next string result; NULL after an
+ * error); nothing for others. String arguments are released after the call
+ * (parameters are borrowed).
+ *
+ * `luma_exports` lists them for hosts that call exports by name (v0.11): one
+ * line per function, "name:PARAMS>RESULT\n", with i int, f float, b bool,
+ * s str and v (result only) nothing. */
+static char export_code(IrTy t) {
+    if (t == TY_INT) return 'i';
+    if (t == TY_F64) return 'f';
+    if (t == TY_BOOL) return 'b';
+    if (t == TY_STR) return 's';
+    return 'v';
+}
+
 void x86_emit_exports(const IrModule *m, Buf *out) {
     static const char *const DEST[5] = {"rsi", "rdx", "rcx", "r8", "r9"};
     static const char *const IREG[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    Buf table = {0};
     for (int gi = 0; gi < m->nglobals; gi++) {
         const IrGlobal *g = &m->globals[gi];
         if (g->kind != IRG_FUNC || !g->exported) continue;
+        buf_printf(&table, "%s:", g->csym);
+        for (int k = 0; k < g->arity; k++) buf_printf(&table, "%c", export_code(ir_param_ty(g, k)));
+        buf_printf(&table, ">%c\\n", export_code(g->ty));
         buf_printf(out, "\n    .text\n    .globl %s\n    .type %s, @function\n%s:    # C entry point of %s\n", g->csym, g->csym,
                    g->csym, g->name);
         buf_printf(out, "    push rbp\n    mov rbp, rsp\n    sub rsp, 112    # the C arguments, saved\n");
         int ni = 0, nf = 0;
+        bool strs = false;
         for (int k = 0; k < g->arity; k++) {
             if (ir_param_ty(g, k) == TY_F64) {
                 buf_printf(out, "    movq r11, xmm%d\n    mov [rbp - %d], r11\n", nf, 8 * (k + 1));
@@ -566,7 +586,12 @@ void x86_emit_exports(const IrModule *m, Buf *out) {
             } else {
                 buf_printf(out, "    mov [rbp - %d], %s\n", 8 * (k + 1), IREG[ni++]);
             }
+            strs |= ir_param_ty(g, k) == TY_STR;
         }
+        for (int k = 0; k < g->arity; k++) /* C strings -> Luma strings (owned here) */
+            if (ir_param_ty(g, k) == TY_STR)
+                buf_printf(out, "    mov rdi, [rbp - %d]\n    call luma_lib_str_in@PLT\n    mov [rbp - %d], rax\n", 8 * (k + 1),
+                           8 * (k + 1));
         for (int k = g->arity - 1; k >= 0; k--) { /* the last first: parameter 5 goes on the stack */
             IrTy t = ir_param_ty(g, k);
             buf_printf(out, "    mov r11, [rbp - %d]\n", 8 * (k + 1));
@@ -576,11 +601,24 @@ void x86_emit_exports(const IrModule *m, Buf *out) {
             else buf_printf(out, "    mov %s, r11\n", DEST[k]);
         }
         buf_printf(out, "    lea rdi, [rip + %s]\n    call luma_invoke@PLT\n", g->name);
+        if (strs || g->ty == TY_STR) {
+            buf_printf(out, "    lea rsp, [rbp - 112]\n    mov [rbp - 64], rax    # the result\n");
+            for (int k = 0; k < g->arity; k++)
+                if (ir_param_ty(g, k) == TY_STR) buf_printf(out, "    mov rdi, [rbp - %d]\n    call luma_release@PLT\n", 8 * (k + 1));
+            if (g->ty == TY_STR) buf_printf(out, "    mov rdi, [rbp - 64]\n    call luma_lib_str_out@PLT    # -> const char *\n");
+            else buf_printf(out, "    mov rax, [rbp - 64]\n");
+        }
         if (g->ty == TY_INT) buf_printf(out, "    sar rax, 1    # int -> int64_t (0 after an error)\n");
         else if (g->ty == TY_F64) buf_printf(out, "    movq xmm0, rax\n");
         else if (g->ty == TY_BOOL) buf_printf(out, "    cmp rax, %d\n    sete al\n    movzx eax, al\n", (int)LUMA_TRUE);
         buf_printf(out, "    mov rsp, rbp\n    pop rbp\n    ret\n    .size %s, .-%s\n", g->csym, g->csym);
     }
+    if (table.len) {
+        buf_printf(out, "\n    .section .rodata\n    .globl luma_exports\n    .type luma_exports, @object\nluma_exports:\n");
+        buf_printf(out, "    .ascii \"%.*s\"\n    .byte 0\n", (int)table.len, table.data);
+        buf_printf(out, "    .size luma_exports, .-luma_exports\n");
+    }
+    buf_free(&table);
 }
 
 void x86_emit_module(const IrModule *m, Buf *out) {

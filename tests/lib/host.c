@@ -38,6 +38,12 @@ int main(int argc, char **argv) {
     Six six = SYM(Six, "six");
     Boom boom = SYM(Boom, "boom");
     IsPos is_pos = SYM(IsPos, "is_pos");
+    typedef const char *(*Greet)(const char *, int64_t);
+    typedef const char *(*Shout)(const char *);
+    Greet greet = SYM(Greet, "greet");
+    Shout shout = SYM(Shout, "shout");
+    __typeof__(&luma_lib_str_len) str_len = SYM(__typeof__(&luma_lib_str_len), "luma_lib_str_len");
+    const char *exports = SYM(const char *, "luma_exports");
 
     printf("init -> %d\n", init());
     fflush(stdout);
@@ -53,6 +59,13 @@ int main(int argc, char **argv) {
     printf("boom(5) -> %lld, errors %llu, '%s'\n", (long long)r, (unsigned long long)error_count(), error());
     printf("boom(2) after the error -> %lld\n", (long long)boom(2));
     printf("is_pos -> %d %d\n", is_pos(2.0), is_pos(-1.0));
+    printf("exports:\n%s", exports);
+    const char *g = greet("ward", 3);
+    printf("greet -> '%s' (%llu bytes)\n", g, (unsigned long long)str_len());
+    for (int i = 0; i < 100000; i++) greet("x", 2); /* (strings in and out are released) */
+    printf("shout -> '%s'\n", shout("brains"));
+    const char *none = shout("");
+    printf("shout('') -> %s, '%s'\n", none ? none : "NULL", error());
     fflush(stdout);
     shutdown();
     dlclose(h);

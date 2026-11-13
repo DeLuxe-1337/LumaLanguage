@@ -1167,8 +1167,11 @@ export @fn.update "update"
 ```
 
 makes `@fn.update` a C entry point named `update`: parameters `int` (C
-`int64_t`), `f64` (`double`) or `bool` (`bool`); the result is converted
-back the same way (anything else: `void`). Both backends emit a wrapper that
+`int64_t`), `f64` (`double`), `bool` (`bool`) or `str` (`const char *`,
+v0.11); the result is converted back the same way (anything else: `void`).
+A `str` argument becomes a new string (`luma_lib_str_in`) released after the
+call; a `str` result is copied out (`luma_lib_str_out`). The module's exports
+are listed in the `luma_exports` data symbol (`name:PARAMS>RESULT` lines). Both backends emit a wrapper that
 tags the C arguments and calls the function through the runtime's
 `luma_invoke(fn, a0..a5)`, which guards it (setjmp): a runtime error
 returns to the C caller. See README "Shared libraries".

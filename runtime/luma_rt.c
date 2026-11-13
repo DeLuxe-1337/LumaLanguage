@@ -1848,6 +1848,37 @@ uint64_t luma_invoke(uintptr_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64
  * no C++ objects alive in its own frames, as it does not return. */
 _Noreturn void luma_lib_raise(const char *msg) { runtime_error(msg ? msg : "error"); }
 
+/* String parameters and results of exported functions (v0.11). */
+LumaValue luma_lib_str_in(const char *p) { return string_from_c(p ? p : ""); }
+
+static char *str_out;
+static size_t str_out_cap, str_out_len;
+
+/* The result string, copied into a buffer that stays valid until the next
+ * string result (the Luma string is released); NULL after an error. */
+const char *luma_lib_str_out(LumaValue v) {
+    if (v == 0) {
+        str_out_len = 0;
+        return NULL;
+    }
+    const LumaString *s = as_string(v);
+    if (s->len + 1 > str_out_cap) {
+        str_out_cap = s->len + 1 > 2 * str_out_cap ? s->len + 1 : 2 * str_out_cap;
+        str_out = realloc(str_out, str_out_cap);
+        if (!str_out) {
+            fprintf(stderr, "luma: out of memory\n");
+            exit(1);
+        }
+    }
+    memcpy(str_out, s->bytes, s->len);
+    str_out[s->len] = 0;
+    str_out_len = s->len;
+    luma_release(v);
+    return str_out;
+}
+
+uint64_t luma_lib_str_len(void) { return str_out_len; }
+
 const char *luma_lib_error(void) { return last_error; }
 uint64_t luma_lib_error_count(void) { return error_count; }
 void luma_lib_set_error_handler(void (*fn)(const char *msg)) { error_handler = fn; }

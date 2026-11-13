@@ -230,7 +230,13 @@ update(0.016);
 ```
 
 - Parameter and result types map `int` <-> `int64_t`, `float` <-> `double`,
-  `bool` <-> `bool`; a function without a return type returns `void`.
+  `bool` <-> `bool`, `str` <-> `const char *`; a function without a return
+  type returns `void`. A string argument is copied in; a string result stays
+  valid until the next call that returns one (`NULL` after an error;
+  `luma_lib_str_len()` is its length). At most 6 parameters.
+- `luma_exports` (a string, `dlsym` it) lists the exports for hosts that
+  call them by name, one line each: `name:PARAMS>RESULT`, with `i` int,
+  `f` float, `b` bool, `s` str and `v` (result) nothing, e.g. `greet:si>s`.
 - A runtime error in an exported call (or in `luma_lib_init`) does not end
   the process: the call returns `0`/`0.0`/`false`, `luma_lib_error()` has
   the message and `luma_lib_error_count()` goes up (the message is printed

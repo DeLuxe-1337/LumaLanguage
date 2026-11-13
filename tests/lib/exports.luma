@@ -14,3 +14,12 @@ export fun boom(n: int): int {
   return n * 10;
 }
 export fun is_pos(x: float): bool { return x > 0.0; }
+export fun greet(name: str, times: int): str {
+  var parts: List<str> = List::new();
+  for (var i = 0; i < times; i = i + 1) parts.push(name);
+  return Str::join(parts, ", ") + "!";
+}
+export fun shout(s: str): str {
+  if (Str::len(s) == 0) return Sys::fail("nothing to shout");
+  return Str::upper(s);
+}

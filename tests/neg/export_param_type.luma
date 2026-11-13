@@ -1,1 +1,1 @@
-export fun f(s: str) {}
+export fun f(s: List<int>) {}

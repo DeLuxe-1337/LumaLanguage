@@ -366,7 +366,7 @@ for lvl in 0 2; do
         bad "lib/exports -O$lvl builds a shared library"; sed 's/^/      /' "$OUT/last.log"; continue
     fi
     check "lib/exports -O$lvl: exports only its entry points and luma_lib_*" sh -c \
-        "nm -D --defined-only $lib | awk '{print \$3}' | sort | tr '\\n' ' ' | grep -qx 'add boom is_pos luma_lib_error luma_lib_error_count luma_lib_init luma_lib_raise luma_lib_set_error_handler luma_lib_set_output_handler luma_lib_shutdown on_update scale six '"
+        "nm -D --defined-only $lib | awk '{print \$3}' | sort | tr '\\n' ' ' | grep -qx 'add boom greet is_pos luma_exports luma_lib_error luma_lib_error_count luma_lib_init luma_lib_raise luma_lib_set_error_handler luma_lib_set_output_handler luma_lib_shutdown luma_lib_str_len on_update scale shout six '"
     "$OUT/lib_host" "$lib" >"$OUT/lib$lvl.actual" 2>"$OUT/lib$lvl.stderr"
     st=$?
     if [ $st -eq 0 ] && cmp -s "$OUT/lib$lvl.actual" tests/lib/exports.out; then ok "lib/exports -O$lvl: host calls, errors return to the host, reload"

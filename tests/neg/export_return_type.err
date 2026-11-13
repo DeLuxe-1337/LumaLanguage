@@ -1,1 +1,1 @@
-exported function 'f' returns int, float, bool or nothing (no return type)
+exported function 'f' returns int, float, bool, str or nothing (no return type)

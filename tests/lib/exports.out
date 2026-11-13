@@ -9,5 +9,18 @@ host: error handler: boom at 5
 boom(5) -> 0, errors 1, 'boom at 5'
 boom(2) after the error -> 20
 is_pos -> 1 0
+exports:
+on_update:f>v
+add:ii>i
+scale:fib>f
+six:ififbi>f
+boom:i>i
+is_pos:f>b
+greet:si>s
+shout:s>s
+greet -> 'ward, ward, ward!' (17 bytes)
+shout -> 'BRAINS'
+host: error handler: nothing to shout
+shout('') -> NULL, 'nothing to shout'
 game: top-level ran
 reloaded: init -> 0

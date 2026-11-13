@@ -7,8 +7,16 @@
  *   void (*on_update)(double) = dlsym(h, "on_update");   // export fun on_update(dt: float)
  *
  * Every `export fun` is a C function of the same name. Parameter and result
- * types map as: int <-> int64_t, float <-> double, bool <-> bool; a function
- * without a return type returns void. Ints must fit in 63 bits.
+ * types map as: int <-> int64_t, float <-> double, bool <-> bool,
+ * str <-> const char * (NUL-terminated; the library copies an argument, and
+ * a result stays valid until the next call that returns a str; NULL after an
+ * error; luma_lib_str_len() is its length); a function without a return type
+ * returns void. Ints must fit in 63 bits. At most 6 parameters.
+ *
+ * `const char luma_exports[]` (dlsym) lists the exports for hosts that call
+ * them by name: a line per function, "name:PARAMS>RESULT", where each of
+ * PARAMS and RESULT is i (int), f (float), b (bool), s (str); v is a result
+ * of nothing. E.g. "update:f>v\ngenerate:is>s\n".
  *
  * A runtime error inside an exported function (or the top-level code run by
  * luma_lib_init) does not end the process: the call returns (0, 0.0 or
@@ -44,6 +52,8 @@ void luma_lib_set_output_handler(void (*handler)(const char *line));
  * exported call with a Luma runtime error. Does not return (longjmp): call
  * it only with no C++ objects alive in the calling frames. */
 void luma_lib_raise(const char *message);
+/* The length of the last str result (it may hold NUL bytes). */
+uint64_t luma_lib_str_len(void);
 
 #ifdef __cplusplus
 }

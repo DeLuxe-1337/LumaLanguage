@@ -981,7 +981,11 @@ declarations, and more than 6 parameters.
 - `export fun` lowers to an ordinary function plus an IR `export` line;
   both backends emit a C-ABI wrapper (x86_isel.c `x86_emit_exports`) that
   saves the C arguments, tags them (`int64_t` -> fixnum, `bool` -> 2/10,
-  `double` stays raw) and calls `luma_invoke(fn, a0..a5)`.
+  `double` stays raw, `const char *` -> a new string, released after the
+  call) and calls `luma_invoke(fn, a0..a5)`. A `str` result is copied into
+  a runtime buffer (valid until the next one) and released. A `luma_exports`
+  string describes every export (`name:PARAMS>RESULT`), so a host such as a
+  scripting bridge can call them without headers.
 - `luma_invoke` pushes a `jmp_buf` on a guard stack; `runtime_error` (every
   panic) longjmps to the innermost guard when there is one, else exits as
   before. After an error the guard drops arenas the call entered and the
