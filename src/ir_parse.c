@@ -917,6 +917,8 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
     }
     ir_module_init(out, "");
     p.m = out;
+    struct { char *name, *csym; int line; } *exports = NULL;
+    int nexports = 0;
     if (!prescan_structs(&p)) goto fail;
     next(&p);
     skip_nl(&p);
@@ -1045,6 +1047,20 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
             out->globals[g].line = line;
             next(&p);
             if (!expect_nl(&p)) goto fail;
+        } else if (is_ident(&p, "export")) { /* export @fn "csym": a C entry point (resolved after the functions) */
+            next(&p);
+            if (p.tok.kind != T_GLOBAL) { perr(&p, p.tok.line, "expected the exported function's name"); goto fail; }
+            char gname[256];
+            snprintf(gname, sizeof gname, "%s", p.tok.text);
+            next(&p);
+            if (p.tok.kind != T_STRING || !p.tok.str.len) { perr(&p, p.tok.line, "expected the C symbol as a string"); goto fail; }
+            nexports++;
+            exports = xrealloc(exports, (size_t)nexports * sizeof *exports);
+            exports[nexports - 1].name = xstrdup(gname);
+            exports[nexports - 1].csym = xstrndup((char *)p.tok.str.data, p.tok.str.len);
+            exports[nexports - 1].line = line;
+            next(&p);
+            if (!expect_nl(&p)) goto fail;
         } else if (is_ident(&p, "global")) {
             next(&p);
             if (p.tok.kind != T_GLOBAL) { perr(&p, p.tok.line, "expected global name"); goto fail; }
@@ -1096,12 +1112,33 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
         }
         ir_struct_add_method(out, q->sid, q->method, g);
     }
+    for (int i = 0; i < nexports; i++) {
+        int g = ir_find_global(out, exports[i].name);
+        if (g < 0 || out->globals[g].kind != IRG_FUNC) {
+            perr(&p, exports[i].line, "export must name a function, not '@%s'", exports[i].name);
+            goto fail;
+        }
+        out->globals[g].exported = true;
+        free(out->globals[g].csym);
+        out->globals[g].csym = exports[i].csym;
+        exports[i].csym = NULL;
+    }
+    for (int i = 0; i < nexports; i++) {
+        free(exports[i].name);
+        free(exports[i].csym);
+    }
+    free(exports);
     free(p.pmeth);
     free(p.pend);
     buf_free(&p.tok.str);
     return true;
 fail:
     if (!p.failed) fprintf(stderr, "%s: error: malformed IR\n", path);
+    for (int i = 0; i < nexports; i++) {
+        free(exports[i].name);
+        free(exports[i].csym);
+    }
+    free(exports);
     free(p.pmeth);
     free(p.pend);
     buf_free(&p.tok.str);

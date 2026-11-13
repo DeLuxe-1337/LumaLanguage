@@ -403,6 +403,15 @@ bool ir_verify(const IrModule *m, const char *path) {
             continue;
         }
         if (f->nparams > MAX_ARGS) verr(&v, f, -1, NULL, "functions with more than %d parameters are not supported yet", MAX_ARGS);
+        const IrGlobal *fg = &m->globals[f->global];
+        if (fg->exported) { /* C entry points pass int64_t, double and bool */
+            for (int i = 0; i < fg->arity; i++) {
+                IrTy t = ir_param_ty(fg, i);
+                if (t != TY_INT && t != TY_F64 && t != TY_BOOL)
+                    verr(&v, f, -1, NULL, "exported function: parameter %d must be int, f64 or bool", i + 1);
+            }
+            if (!fg->csym || !*fg->csym) verr(&v, f, -1, NULL, "exported function needs a C symbol");
+        }
         for (int b = 0; b < f->nblocks; b++) {
             const IrBlock *bl = &f->blocks[b];
             for (int c = b + 1; c < f->nblocks; c++)

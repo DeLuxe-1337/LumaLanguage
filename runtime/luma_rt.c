@@ -19,6 +19,7 @@
 #define _XOPEN_SOURCE 700 /* sigaction, sigaltstack, SA_ONSTACK, SA_SIGINFO (XSI) */
 #include <inttypes.h>
 #include <math.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -89,11 +90,12 @@ LumaValue luma_main(void);
 
 static _Noreturn void panicf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-static _Noreturn void luma_panic(const char *msg) {
-    fflush(stdout);
-    fprintf(stderr, "luma: runtime error: %s\n", msg);
-    exit(1);
-}
+/* Runtime errors end the program, except inside a guarded call (a library
+ * build's exported functions and luma_lib_init, LUMA_LIBRARY): the message is
+ * kept for luma_lib_error() and the call returns to its caller. */
+static _Noreturn void runtime_error(const char *msg);
+
+static _Noreturn void luma_panic(const char *msg) { runtime_error(msg); }
 
 static bool is_fixnum(LumaValue v) { return v & 1; }
 static int64_t fixnum_val(LumaValue v) { return (int64_t)v >> 1; }
@@ -642,14 +644,12 @@ enum { MASK_INT = 1, MASK_STR = 2, MASK_BOOL = 4, MASK_NIL = 8, MASK_STRUCT = 16
 #define MASK_SID_SHIFT 8 /* a mask's struct bits: 0 = any struct, k = struct with id k */
 
 static _Noreturn void panicf(const char *fmt, ...) {
-    fflush(stdout);
+    char msg[2048];
     va_list ap;
     va_start(ap, fmt);
-    fputs("luma: runtime error: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
-    exit(1);
+    runtime_error(msg);
 }
 
 static unsigned value_mask(LumaValue v) {
@@ -1110,11 +1110,7 @@ _Noreturn void luma_int_overflow(void) { luma_panic("Integer overflow."); }
 _Noreturn void luma_div_zero(void) { luma_panic("Division by zero."); }
 
 /* Called by a checked `load` of a global slot that was never assigned. */
-_Noreturn void luma_undefined_variable(const char *name) {
-    fflush(stdout);
-    fprintf(stderr, "luma: runtime error: Undefined variable '%s'.\n", name);
-    exit(1);
-}
+_Noreturn void luma_undefined_variable(const char *name) { panicf("Undefined variable '%s'.", name); }
 
 /* ---- structs -----------------------------------------------------------
  * `new` allocates with luma_new_struct and the compiler stores the fields;
@@ -1578,6 +1574,16 @@ LumaValue luma_arena_leave(void) {
     return LUMA_NIL;
 }
 
+/* After a runtime error unwound a guarded call: the arenas it entered are
+ * left (not released: that could run more Luma code), objects that were
+ * being destroyed are abandoned (leaked), printing state is reset. */
+static void reset_after_error(size_t arenas) {
+    if (narena_stack > arenas) narena_stack = arenas;
+    dying.n = 0;
+    draining = false;
+    nprinting = 0;
+}
+
 /* The code of method `name` of o's struct, for a call with nargs arguments
  * after self. */
 /* A method call whose receiver lacks the method but has deref: luma_method
@@ -1738,6 +1744,68 @@ LumaValue luma_le(LumaValue a, LumaValue b) { int c = ordered(a, b); return make
 LumaValue luma_gt(LumaValue a, LumaValue b) { int c = ordered(a, b); return make_bool(c == 1); }
 LumaValue luma_ge(LumaValue a, LumaValue b) { int c = ordered(a, b); return make_bool(c == 1 || c == 0); }
 
+/* ---- guarded calls (library builds) ---------------------------------------
+ * A Luma program built with `luma --shared` is a shared library a host (a
+ * game engine) loads. Its `export fun` functions get C entry points that
+ * call the Luma function through luma_invoke: a runtime error inside unwinds
+ * (longjmp) back to luma_invoke, which returns 0; the host reads the message
+ * with luma_lib_error(). Objects the interrupted code held may leak. */
+
+#define MAX_GUARDS 64
+static jmp_buf *guards[MAX_GUARDS];
+static int nguards;
+static char last_error[2048];
+static uint64_t error_count;
+static void (*error_handler)(const char *msg);
+
+static void reset_after_error(size_t arenas);
+
+static _Noreturn void runtime_error(const char *msg) {
+    fflush(stdout);
+    if (nguards > 0) {
+        snprintf(last_error, sizeof last_error, "%s", msg);
+        error_count++;
+        if (error_handler) error_handler(msg);
+        else fprintf(stderr, "luma: runtime error: %s\n", msg);
+        longjmp(*guards[nguards - 1], 1);
+    }
+    fprintf(stderr, "luma: runtime error: %s\n", msg);
+    exit(1);
+}
+
+typedef uint64_t (*LumaFnRaw6)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+/* Calls a compiled Luma function with up to 6 arguments (raw words: tagged
+ * values or, for float parameters, the double's bits) under a guard. Returns
+ * its result, or 0 after a runtime error (0 is never a value; a raw float
+ * result of 0.0 is also 0: check luma_lib_error_count()). */
+uint64_t luma_invoke(uintptr_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (nguards == MAX_GUARDS) {
+        snprintf(last_error, sizeof last_error, "Luma calls nested more than %d deep.", MAX_GUARDS);
+        error_count++;
+        if (error_handler) error_handler(last_error);
+        return 0;
+    }
+    jmp_buf jb;
+    int depth = nguards;
+    size_t arenas = narena_stack;
+    guards[nguards++] = &jb;
+    if (setjmp(jb)) {
+        nguards = depth;
+        reset_after_error(arenas);
+        return 0;
+    }
+    LumaFnRaw6 f;
+    memcpy(&f, &fn, sizeof f); /* (an address from compiled code) */
+    uint64_t r = f(a0, a1, a2, a3, a4, a5);
+    nguards = depth;
+    return r;
+}
+
+const char *luma_lib_error(void) { return last_error; }
+uint64_t luma_lib_error_count(void) { return error_count; }
+void luma_lib_set_error_handler(void (*fn)(const char *msg)) { error_handler = fn; }
+
 /* ---- process entry ----------------------------------------------------- */
 
 /* Unbounded recursion overflows the native stack. The fault is caught on an
@@ -1745,6 +1813,7 @@ LumaValue luma_ge(LumaValue a, LumaValue b) { int c = ordered(a, b); return make
  * bare "Segmentation fault". Any SIGSEGV in a Luma program is reported this
  * way; generated code never dereferences memory other than its own frame,
  * globals and runtime objects, so the stack is by far the likely cause. */
+#ifndef LUMA_LIBRARY /* (a library leaves signals to its host) */
 static char alt_stack[64 * 1024];
 
 static void on_segv(int sig, siginfo_t *si, void *ctx) {
@@ -1775,6 +1844,7 @@ static void install_stack_guard(void) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
 }
+#endif
 
 /* ---- LUMA_MEMCHECK report ----------------------------------------------- */
 
@@ -1856,6 +1926,29 @@ static void memcheck_report(void) {
     free(marked);
 }
 
+#ifdef LUMA_LIBRARY
+/* A library build (`luma --shared`): the host calls luma_lib_init() once,
+ * which runs the program's top-level code (guarded), then calls the
+ * exported functions. Returns 0, or 1 after a runtime error. */
+int luma_lib_init(void) {
+    const char *mc = getenv("LUMA_MEMCHECK");
+    memcheck = mc && *mc && strcmp(mc, "0") != 0;
+    uint64_t before = error_count;
+    LumaValue (*m)(void) = luma_main;
+    uintptr_t addr;
+    memcpy(&addr, &m, sizeof addr);
+    luma_invoke(addr, 0, 0, 0, 0, 0, 0);
+    fflush(stdout);
+    return error_count != before;
+}
+
+/* The host is done with the library (before dlclose): flushes output and,
+ * under LUMA_MEMCHECK=1, reports what the program leaves behind. */
+void luma_lib_shutdown(void) {
+    fflush(stdout);
+    if (memcheck) memcheck_report();
+}
+#else
 int main(int argc, char **argv) {
     main_argc = argc;
     main_argv = argv;
@@ -1867,3 +1960,4 @@ int main(int argc, char **argv) {
     if (memcheck) memcheck_report();
     return 0;
 }
+#endif

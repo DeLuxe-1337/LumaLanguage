@@ -945,6 +945,15 @@ static Stmt *declaration(Parser *p) {
         Token *kw = advance(p);
         return impl_declaration(p, kw);
     }
+    /* `export` is a keyword only right before `fun` (a C entry point, v0.10) */
+    if (check(p, TOK_IDENTIFIER) && cur(p)->lexeme_len == 6 && memcmp(cur(p)->lexeme, "export", 6) == 0 &&
+        peek_is(p, 1, TOK_FUN)) {
+        advance(p);
+        Token *kw = advance(p);
+        Stmt *s = fun_declaration(p, kw);
+        if (s) s->exported = true;
+        return s;
+    }
     if (check(p, TOK_EXTERN) && peek_is(p, 1, TOK_STRUCT)) { /* extern struct NAME { field: ctype, ... } */
         Token *kw = advance(p);
         advance(p);

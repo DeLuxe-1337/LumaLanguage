@@ -26,7 +26,7 @@ HEADERS   := $(wildcard src/*.h)
 
 .PHONY: all clean test unit e2e difftest selftest hello inspect bench
 
-all: $(BUILD)/luma $(BUILD)/lasm $(BUILD)/libluma_rt.a
+all: $(BUILD)/luma $(BUILD)/lasm $(BUILD)/libluma_rt.a $(BUILD)/libluma_rt_pic.a
 
 # The runtime is part of the toolchain (like libc): built once here with the
 # system C compiler, then linked into every Luma program by `luma`.
@@ -34,6 +34,15 @@ $(BUILD)/obj/luma_rt.o: runtime/luma_rt.c src/value.h | $(BUILD)/obj
 	$(CC) $(RT_CFLAGS) -c $< -o $@
 
 $(BUILD)/libluma_rt.a: $(BUILD)/obj/luma_rt.o
+	rm -f $@
+	ar rcs $@ $^
+
+# The runtime of library builds (luma --shared): position-independent, no
+# main (the host calls luma_lib_init), runtime errors return to the host.
+$(BUILD)/obj/luma_rt_pic.o: runtime/luma_rt.c src/value.h | $(BUILD)/obj
+	$(CC) $(RT_CFLAGS) -fPIC -DLUMA_LIBRARY -c $< -o $@
+
+$(BUILD)/libluma_rt_pic.a: $(BUILD)/obj/luma_rt_pic.o
 	rm -f $@
 	ar rcs $@ $^
 

@@ -1916,6 +1916,7 @@ void x86_gen_module(const IrModule *m, Buf *out) {
     buf_free(&ffi_data);
     for (int i = 0; i < m->nglobals; i++)
         if (m->globals[i].kind == IRG_FUNC) gen_func(m, &m->funcs[m->globals[i].func], out);
+    x86_emit_exports(m, out);
     if (ffi_data.len) {
         buf_printf(out, "\n    .section .rodata    # FFI error-message contexts\n");
         buf_append(out, ffi_data.data, ffi_data.len);

@@ -1,0 +1,16 @@
+var t: float = 0.0;
+var frames = 0;
+print("game: top-level ran");
+export fun on_update(dt: float) {
+  t = t + dt;
+  frames = frames + 1;
+  if (frames == 3) print("game: t =", t);
+}
+export fun add(a: int, b: int): int { return a + b; }
+export fun scale(x: float, k: int, flip: bool): float { if (flip) return -x * k; return x * k; }
+export fun six(a: int, b: float, c: int, d: float, e: bool, f: int): float { return a + b + c + d + f + (e and 100 or 0); }
+export fun boom(n: int): int {
+  if (n > 2) return Sys::fail("boom at " + Str::from_int(n));
+  return n * 10;
+}
+export fun is_pos(x: float): bool { return x > 0.0; }

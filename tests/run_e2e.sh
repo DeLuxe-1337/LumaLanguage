@@ -345,6 +345,22 @@ for lvl in 0 2; do
 done
 check "--mm=rc points to Rc::new" sh -c "! $LUMA --mm=rc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'use Rc::new' $OUT/e"
 
+# ---------------------------------------------------------- shared libraries
+printf '== shared libraries (--shared, export fun) ==\n'
+check "build the test host (tests/lib/host.c, system cc)" sh -c "cc -std=c11 -O2 -o $OUT/lib_host tests/lib/host.c -ldl"
+for lvl in 0 2; do
+    lib="$OUT/libexports$lvl.so"
+    if ! "$LUMA" -O$lvl --shared tests/lib/exports.luma -o "$lib" >"$OUT/last.log" 2>&1; then
+        bad "lib/exports -O$lvl builds a shared library"; sed 's/^/      /' "$OUT/last.log"; continue
+    fi
+    check "lib/exports -O$lvl: exports only its entry points and luma_lib_*" sh -c \
+        "nm -D --defined-only $lib | awk '{print \$3}' | sort | tr '\\n' ' ' | grep -qx 'add boom is_pos luma_lib_error luma_lib_error_count luma_lib_init luma_lib_set_error_handler luma_lib_shutdown on_update scale six '"
+    "$OUT/lib_host" "$lib" >"$OUT/lib$lvl.actual" 2>"$OUT/lib$lvl.stderr"
+    st=$?
+    if [ $st -eq 0 ] && cmp -s "$OUT/lib$lvl.actual" tests/lib/exports.out; then ok "lib/exports -O$lvl: host calls, errors return to the host, reload"
+    else bad "lib/exports -O$lvl (exit $st)"; diff tests/lib/exports.out "$OUT/lib$lvl.actual" | sed 's/^/      /'; cat "$OUT/lib$lvl.stderr"; fi
+done
+
 # ---------------------------------------------------------- C FFI
 printf '== C FFI (extern fun) ==\n'
 FFILIB="$OUT/ffilib"

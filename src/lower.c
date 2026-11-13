@@ -2836,6 +2836,20 @@ static void collect_declarations(L *l, const Program *prog) {
                 g->ptys = xmalloc(s->nparams * sizeof *g->ptys);
                 for (size_t k = 0; k < s->nparams; k++) g->ptys[k] = info.ptypes[k];
             }
+            if (s->exported) { /* a C entry point: C types only */
+                for (size_t k = 0; k < s->nparams; k++)
+                    if (info.ptypes[k] != T_INT && info.ptypes[k] != T_F64 && info.ptypes[k] != T_BOOL)
+                        lerr(l, s->param_line[k], s->param_col[k],
+                             "parameter '%s' of exported function '%s' needs a type C can pass: int, float or bool",
+                             s->params[k], s->name);
+                if (info.ret != T_ANY && info.ret != T_INT && info.ret != T_F64 && info.ret != T_BOOL)
+                    lerr(l, s->type.line, s->type.col,
+                         "exported function '%s' returns int, float, bool or nothing (no return type)", s->name);
+                if (strncmp(s->name, "luma_", 5) == 0)
+                    lerr(l, s->line, s->col, "names starting with 'luma_' are reserved for the Luma runtime");
+                g->exported = true;
+                g->csym = xstrdup(s->name);
+            }
             l->fns = xrealloc(l->fns, (size_t)(l->nfns + 1) * sizeof *l->fns);
             l->fns[l->nfns++] = info;
         } else if (s->kind == STMT_EXTERN) {

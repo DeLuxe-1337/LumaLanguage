@@ -17,4 +17,6 @@ void x86_emit_module(const IrModule *m, Buf *out);
 void x86_emit_data(const IrModule *m, Buf *out);
 void x86_emit_ascii(Buf *out, const char *s, size_t n);
 
+void x86_emit_exports(const IrModule *m, Buf *out); /* C entry points of export fun (both backends) */
+
 #endif

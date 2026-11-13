@@ -1,0 +1,1 @@
+parameter 's' of exported function 'f' needs a type C can pass: int, float or bool

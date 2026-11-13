@@ -897,6 +897,13 @@ void ir_print_module(const IrModule *m, Buf *out) {
             buf_byte(out, '\n');
         }
     }
+    for (int i = 0; i < m->nglobals; i++) { /* C entry points (export fun, v0.10) */
+        const IrGlobal *g = &m->globals[i];
+        if (g->kind != IRG_FUNC || !g->exported) continue;
+        buf_printf(out, "export @%s ", g->name);
+        print_string(out, g->csym, strlen(g->csym));
+        buf_byte(out, '\n');
+    }
     for (int i = 0; i < m->nglobals; i++) {
         const IrGlobal *g = &m->globals[i];
         if (g->kind != IRG_FUNC) continue;

@@ -1,0 +1,13 @@
+game: top-level ran
+init -> 0
+game: t = 0.75
+add -> 42
+scale -> 4.5 -4.5
+six -> 107.75
+boom(1) -> 10, errors 0
+host: error handler: boom at 5
+boom(5) -> 0, errors 1, 'boom at 5'
+boom(2) after the error -> 20
+is_pos -> 1 0
+game: top-level ran
+reloaded: init -> 0

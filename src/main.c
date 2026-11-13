@@ -52,6 +52,9 @@ static void usage(FILE *f) {
             "  --emit-ir       stop after writing OUT.lir\n"
             "  -S              stop after writing OUT.s\n"
             "  -c              stop after writing OUT.o\n"
+            "  --shared        build a shared library OUT (for a host program that loads\n"
+            "                  it): `export fun` functions are its C entry points, plus\n"
+            "                  luma_lib_init / luma_lib_error / ... (runtime/luma.h)\n"
             "  --dump-tokens   print the token stream\n"
             "  --dump-ast      print the AST\n"
             "  --dump-ir       print the LIR module\n"
@@ -67,7 +70,8 @@ static void usage(FILE *f) {
             "  EXTRA.o/.a/.so  additional objects or libraries passed to the linker\n"
             "environment:\n"
             "  LUMA_CC         linker driver to use (default: cc)\n"
-            "  LUMA_RUNTIME    path to libluma_rt.a (default: next to the luma binary)\n"
+            "  LUMA_RUNTIME    path to libluma_rt.a (default: next to the luma binary;\n"
+            "                  --shared uses libluma_rt_pic.a there)\n"
             "  LUMA_MEMCHECK=1 (when running a compiled program) report leaks at exit and\n"
             "                  turn use-after-free / double free into runtime errors\n");
 }
@@ -85,17 +89,28 @@ static bool ends_with(const char *s, const char *suffix) {
     return n >= m && strcmp(s + n - m, suffix) == 0;
 }
 
-/* $LUMA_RUNTIME, else libluma_rt.a in the directory containing this binary. */
-static char *runtime_path(void) {
+/* $LUMA_RUNTIME, else libluma_rt.a (libluma_rt_pic.a for --shared) in the
+ * directory containing this binary. */
+static char *runtime_path(bool shared) {
     const char *env = getenv("LUMA_RUNTIME");
-    if (env && *env) return xstrdup(env);
+    if (env && *env) {
+        if (!shared) return xstrdup(env);
+        /* .../libluma_rt.a -> .../libluma_rt_pic.a */
+        if (ends_with(env, "libluma_rt.a")) {
+            char *p = xmalloc(strlen(env) + 8);
+            memcpy(p, env, strlen(env) - 2);
+            strcpy(p + strlen(env) - 2, "_pic.a");
+            return p;
+        }
+        return xstrdup(env);
+    }
     char exe[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) return xstrdup("libluma_rt.a");
     exe[n] = '\0';
     char *slash = strrchr(exe, '/');
     if (slash) slash[1] = '\0';
-    return with_ext(exe, "libluma_rt.a");
+    return with_ext(exe, shared ? "libluma_rt_pic.a" : "libluma_rt.a");
 }
 
 typedef struct {
@@ -116,10 +131,11 @@ static void strlist_free(StrList *l) {
     free(l->items);
 }
 
-static int run_linker(const char *obj, const char *out, const StrList *extra, const StrList *libs, bool verbose) {
+static int run_linker(const char *obj, const char *out, const StrList *extra, const StrList *libs, bool verbose,
+                      const char *version_script) {
     const char *cc = getenv("LUMA_CC");
     if (!cc || !*cc) cc = "cc";
-    char *rt = runtime_path();
+    char *rt = runtime_path(version_script != NULL);
     if (access(rt, R_OK) != 0) {
         fprintf(stderr, "luma: error: runtime library '%s' not found (build it with `make`, or set LUMA_RUNTIME)\n", rt);
         free(rt);
@@ -127,8 +143,15 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
     }
     /* cc -o OUT OUT.o EXTRA... RUNTIME -L.../-l...  (libraries after the objects that use them) */
     int n = 0;
-    char **argv = xmalloc((size_t)(7 + extra->n + libs->n) * sizeof *argv);
+    char **argv = xmalloc((size_t)(10 + extra->n + libs->n) * sizeof *argv);
+    char *vs_opt = NULL;
     argv[n++] = (char *)cc;
+    if (version_script) { /* a shared library exporting only its C entry points */
+        argv[n++] = "-shared";
+        vs_opt = xmalloc(strlen(version_script) + 32);
+        sprintf(vs_opt, "-Wl,--version-script=%s", version_script);
+        argv[n++] = vs_opt;
+    }
     argv[n++] = "-o";
     argv[n++] = (char *)out;
     argv[n++] = (char *)obj;
@@ -146,6 +169,7 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
     int err = posix_spawnp(&pid, cc, NULL, NULL, argv, environ);
     free(argv);
     free(rt);
+    free(vs_opt);
     if (err != 0) {
         fprintf(stderr, "luma: error: cannot run linker '%s': %s\n", cc, strerror(err));
         return 1;
@@ -166,7 +190,7 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
 
 int main(int argc, char **argv) {
     const char *input = NULL, *out = "a.out";
-    bool stop_ir = false, stop_s = false, stop_c = false;
+    bool stop_ir = false, stop_s = false, stop_c = false, shared = false;
     bool dump_tokens = false, dump_ast = false, dump_ir = false, dump_opt_ir = false, dump_mem_ir = false, verbose = false;
     int opt_level = 2;
     int mm = -1; /* -1: not given (manual for .luma input, the file's own mode for .lir) */
@@ -193,6 +217,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "--emit-ir") == 0) stop_ir = true;
         else if (strcmp(a, "-S") == 0) stop_s = true;
         else if (strcmp(a, "-c") == 0) stop_c = true;
+        else if (strcmp(a, "--shared") == 0) shared = true;
         else if (strcmp(a, "--dump-tokens") == 0) dump_tokens = true;
         else if (strcmp(a, "--dump-ast") == 0) dump_ast = true;
         else if (strcmp(a, "--dump-ir") == 0) dump_ir = true;
@@ -224,6 +249,7 @@ int main(int argc, char **argv) {
     Buf opt_buf = {0}, mem_buf = {0};
     char *asm_path = with_ext(out, ".s");
     char *obj_path = with_ext(out, ".o");
+    char *vs_path = NULL;
     size_t src_len = 0, asm_len = 0;
     char *src = NULL, *asm_text = NULL;
     TokenList toks = {0};
@@ -317,9 +343,21 @@ int main(int argc, char **argv) {
     if (verbose) fprintf(stderr, "luma: wrote ELF64 object %s\n", obj_path);
     if (stop_c) { rc = 0; goto done; }
 
-    /* 7. link */
-    rc = run_linker(obj_path, out, &extra, &libs, verbose);
-    if (rc == 0 && verbose) fprintf(stderr, "luma: wrote executable %s\n", out);
+    /* 7. link (--shared: a version script exports the C entry points only) */
+    if (shared) {
+        Buf vs = {0};
+        buf_printf(&vs, "{\n  global:\n    luma_lib_init;\n    luma_lib_shutdown;\n    luma_lib_error;\n"
+                        "    luma_lib_error_count;\n    luma_lib_set_error_handler;\n");
+        for (int i = 0; i < ir.nglobals; i++)
+            if (ir.globals[i].kind == IRG_FUNC && ir.globals[i].exported) buf_printf(&vs, "    %s;\n", ir.globals[i].csym);
+        buf_printf(&vs, "  local: *;\n};\n");
+        vs_path = with_ext(out, ".map");
+        bool ok = write_file(vs_path, vs.data, vs.len);
+        buf_free(&vs);
+        if (!ok) goto done;
+    }
+    rc = run_linker(obj_path, out, &extra, &libs, verbose, vs_path);
+    if (rc == 0 && verbose) fprintf(stderr, "luma: wrote %s %s\n", shared ? "shared library" : "executable", out);
 
 done:
     free(src);
@@ -337,6 +375,7 @@ done:
     buf_free(&mem_buf);
     free(asm_path);
     free(obj_path);
+    free(vs_path);
     strlist_free(&extra);
     strlist_free(&libs);
     return rc;

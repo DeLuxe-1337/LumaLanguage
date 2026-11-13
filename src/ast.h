@@ -2,7 +2,7 @@
  *
  *   program     → declaration* EOF
  *   declaration → funDecl | externDecl | structDecl | implDecl | varDecl | statement
- *   funDecl     → "fun" IDENTIFIER "(" parameters? ")" ( ":" type )? block   (top level only, for now)
+ *   funDecl     → "export"? "fun" IDENTIFIER "(" parameters? ")" ( ":" type )? block   (top level only, for now)
  *   structDecl  → "shared"? "struct" IDENTIFIER tparams? "{" ( field ( "," field )* ","? )? "}"   (top level)
  *   tparams     → "<" IDENTIFIER ( "," IDENTIFIER )* ">"                   (a generic struct)
  *   field       → IDENTIFIER ( ":" type )?
@@ -143,6 +143,7 @@ struct Stmt {
     size_t ntparams;
     bool shared;    /* STMT_STRUCT: `shared struct` (every instance reference counted) */
     bool cstruct;   /* STMT_STRUCT: `extern struct` (a C struct: fields have C types) */
+    bool exported;  /* STMT_FUN: `export fun`: also a C function named `name` (v0.10) */
 };
 
 typedef struct {
