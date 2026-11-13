@@ -92,6 +92,7 @@ Options:
 ```
 --emit-ir       stop after writing OUT.lir
 --shared        build a shared library OUT (export fun entry points; see below)
+several inputs  .luma files, or folders of them: one program (see below)
 -S              stop after writing OUT.s
 -c              stop after writing OUT.o
 --dump-tokens   print the token stream
@@ -189,6 +190,21 @@ print(area, Math::sqrt(2.0), 7 / 2, 7 / 2.0, 1 == 1.0, 0.1 + 0.2);
 One cost: in untyped code `n - 1` may now be a boxed float, which the caller
 releases after a call returns, so `return f(n - 1)` with an untyped `n` is
 no longer a tail call. Typed code (`n: int`) is unchanged.
+
+## Programs of several files
+
+`luma main.luma player.luma util.luma -o game`, or `luma game/ -o game` for
+a folder (its `.luma` files and those of its subfolders: `main.luma` first,
+then by path), compiles one program from several files:
+
+- every file sees every other file's functions, structs, impls, externs and
+  global variables, as if they were one file;
+- the top-level code runs file by file, in that order;
+- diagnostics name the file and the line within it
+  (`game/enemies.luma:12:5: error: ...`).
+
+There are no modules or imports yet: names share one namespace. Works with
+`--shared` too (a game's scripts as one library).
 
 ## Shared libraries
 

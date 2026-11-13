@@ -15,7 +15,16 @@ extern const char *const luma_std_srcs[];
 static const char *const DISPLAY[] = {"<prelude>"}; /* the core file's name in messages */
 static char display_buf[64][64];
 
+static char **user_paths; /* the program's files after the first */
+static int nuser_paths;
+
+bool prelude_line_is_std(int line) { return line >= LUMA_PRELUDE_LINE && line < LUMA_FILE_LINE_BASE; }
+
 const char *prelude_path(const char *path, int line) {
+    if (line >= LUMA_FILE_LINE_BASE) {
+        int k = (line - LUMA_FILE_LINE_BASE) / LUMA_FILE_LINE_STRIDE;
+        return k < nuser_paths ? user_paths[k] : path;
+    }
     if (line < LUMA_PRELUDE_LINE) return path;
     int k = line / LUMA_PRELUDE_LINE - 1;
     if (k == 0) return DISPLAY[0];
@@ -26,7 +35,10 @@ const char *prelude_path(const char *path, int line) {
     return "<std>";
 }
 
-int prelude_line(int line) { return line >= LUMA_PRELUDE_LINE ? line % LUMA_PRELUDE_LINE : line; }
+int prelude_line(int line) {
+    if (line >= LUMA_FILE_LINE_BASE) return (line - LUMA_FILE_LINE_BASE) % LUMA_FILE_LINE_STRIDE;
+    return line >= LUMA_PRELUDE_LINE ? line % LUMA_PRELUDE_LINE : line;
+}
 
 bool prelude_is_core(int line) { return line >= LUMA_PRELUDE_LINE && line < 2 * LUMA_PRELUDE_LINE; }
 
@@ -61,8 +73,8 @@ static void shift_stmt(Stmt *s, int by) {
     shift_stmt(s->body, by);
 }
 
-/* Parses one file, appending its statements to out. */
-static bool load_one(const char *path, const char *src, size_t len, int index, Program *out) {
+/* Parses one file, appending its statements to out with lines shifted by `by`. */
+static bool load_shifted(const char *path, const char *src, size_t len, int by, Program *out) {
     TokenList toks = {0};
     Program p = {0};
     bool ok = lex(path, src, len, &toks) && parse(path, &toks, &p);
@@ -72,7 +84,7 @@ static bool load_one(const char *path, const char *src, size_t len, int index, P
         return false;
     }
     for (size_t i = 0; i < p.len; i++) {
-        shift_stmt(p.stmts[i], LUMA_PRELUDE_LINE * (index + 1));
+        if (by) shift_stmt(p.stmts[i], by);
         if (out->len == out->cap) {
             out->cap = out->cap ? 2 * out->cap : 64;
             out->stmts = xrealloc(out->stmts, out->cap * sizeof *out->stmts);
@@ -80,6 +92,37 @@ static bool load_one(const char *path, const char *src, size_t len, int index, P
         out->stmts[out->len++] = p.stmts[i];
     }
     free(p.stmts);
+    return true;
+}
+
+static bool load_one(const char *path, const char *src, size_t len, int index, Program *out) {
+    return load_shifted(path, src, len, LUMA_PRELUDE_LINE * (index + 1), out);
+}
+
+bool program_load_files(const char *const *paths, int n, Program *out) {
+    if (n > LUMA_MAX_FILES) {
+        fprintf(stderr, "luma: error: more than %d input files\n", LUMA_MAX_FILES);
+        return false;
+    }
+    for (int k = 1; k < n; k++) {
+        user_paths = xrealloc(user_paths, (size_t)(nuser_paths + 1) * sizeof *user_paths);
+        user_paths[nuser_paths++] = xstrdup(paths[k]);
+    }
+    for (int k = 0; k < n; k++) {
+        size_t len;
+        char *src = read_file(paths[k], &len);
+        if (!src) return false;
+        if (memchr(src, '\0', len)) {
+            fprintf(stderr, "%s: error: source contains NUL bytes\n", paths[k]);
+            free(src);
+            return false;
+        }
+        int by = k == 0 ? 0 : LUMA_FILE_LINE_BASE + (k - 1) * LUMA_FILE_LINE_STRIDE;
+        bool ok = load_shifted(paths[k], src, len, by, out);
+        free(src);
+        if (!ok) return false;
+    }
+    out->source_path = paths[0];
     return true;
 }
 

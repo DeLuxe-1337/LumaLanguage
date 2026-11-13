@@ -854,7 +854,7 @@ static const struct {
 
 static bool in_prelude(L *l) {
     const FnInfo *fi = cur_info(l);
-    return fi && fi->decl->line >= LUMA_PRELUDE_LINE;
+    return fi && prelude_line_is_std(fi->decl->line);
 }
 
 static size_t intrinsic_index(const char *name) {
@@ -3045,7 +3045,7 @@ static bool with_prelude(const char *path, const Program *prog, const Program *p
             core = prelude_is_core(pre->stmts[k]->line) && pre->stmts[k]->kind == STMT_STRUCT &&
                    strcmp(pre->stmts[k]->name, n) == 0;
         if (strncmp(n, "__", 2) == 0 || core) {
-            fprintf(stderr, "%s:%d:%d: error: '%s' is %s%s\n", path, s->line, s->col, n,
+            fprintf(stderr, "%s:%d:%d: error: '%s' is %s%s\n", prelude_path(path, s->line), prelude_line(s->line), s->col, n,
                     core ? "defined by the prelude" : "reserved (names starting with __ belong to the prelude)",
                     core && s->kind == STMT_IMPL ? "; it cannot have another impl block" : "");
             ok = false;
@@ -3074,7 +3074,7 @@ static bool with_prelude(const char *path, const Program *prog, const Program *p
                     if (defines(prog->stmts[i]) && strcmp(defines(prog->stmts[i]), n) == 0) u = prog->stmts[i];
                 if (s->kind == STMT_EXTERN && u->kind == STMT_EXTERN && same_extern(s, u)) continue;
                 fprintf(stderr, "%s:%d:%d: error: '%s' is defined by the program and by the standard library (%s), which needs its own\n",
-                        path, u->line, u->col, n, prelude_path(path, s->line));
+                        prelude_path(path, u->line), prelude_line(u->line), u->col, n, prelude_path(path, s->line));
                 ok = false;
                 break;
             }

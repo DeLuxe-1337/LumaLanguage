@@ -21,12 +21,14 @@
  *
  * No external assembler is ever invoked for Luma code: `cc` receives only
  * object files and an archive, so it runs only the linker. */
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -38,6 +40,7 @@
 #include "mem.h"
 #include "opt.h"
 #include "parser.h"
+#include "prelude.h"
 #include "util.h"
 #include "x86_gen.h"
 #include "x86_isel.h"
@@ -46,7 +49,10 @@ extern char **environ;
 
 static void usage(FILE *f) {
     fprintf(f,
-            "usage: luma INPUT.luma|INPUT.lir [-o OUT] [--emit-ir | -S | -c] [options]\n"
+            "usage: luma INPUT.luma... | DIR | INPUT.lir [-o OUT] [--emit-ir | -S | -c | --shared] [options]\n"
+            "  several .luma files (or a folder: its .luma files, main.luma first, then by\n"
+            "  path) are one program: their declarations are shared, their top-level\n"
+            "  code runs in that order\n"
             "  -o OUT          output executable (default: a.out);\n"
             "                  intermediates are OUT.lir, OUT.s and OUT.o\n"
             "  --emit-ir       stop after writing OUT.lir\n"
@@ -131,6 +137,51 @@ static void strlist_free(StrList *l) {
     free(l->items);
 }
 
+/* The .luma files in dir and its subfolders, sorted by path, main.luma (of
+ * dir itself) first: a project folder. Hidden entries are skipped. */
+static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+static void collect_rec(const char *dir, StrList *out) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        size_t n = strlen(dir) + strlen(e->d_name) + 2;
+        char *p = xmalloc(n);
+        snprintf(p, n, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
+            collect_rec(p, out);
+            free(p);
+        } else if (ends_with(p, ".luma")) {
+            strlist_push(out, p);
+        } else {
+            free(p);
+        }
+    }
+    closedir(d);
+}
+
+static void collect_luma_files(const char *dir, StrList *out) {
+    char base[PATH_MAX];
+    snprintf(base, sizeof base, "%s", dir);
+    size_t bl = strlen(base);
+    while (bl > 1 && base[bl - 1] == '/') base[--bl] = '\0';
+    int from = out->n;
+    collect_rec(base, out);
+    qsort(out->items + from, (size_t)(out->n - from), sizeof *out->items, cmp_str);
+    char main_path[PATH_MAX + 16];
+    snprintf(main_path, sizeof main_path, "%s/main.luma", base);
+    for (int i = from; i < out->n; i++)
+        if (strcmp(out->items[i], main_path) == 0) {
+            char *m = out->items[i];
+            memmove(&out->items[from + 1], &out->items[from], (size_t)(i - from) * sizeof *out->items);
+            out->items[from] = m;
+            break;
+        }
+}
+
 static int run_linker(const char *obj, const char *out, const StrList *extra, const StrList *libs, bool verbose,
                       const char *version_script) {
     const char *cc = getenv("LUMA_CC");
@@ -194,7 +245,7 @@ int main(int argc, char **argv) {
     bool dump_tokens = false, dump_ast = false, dump_ir = false, dump_opt_ir = false, dump_mem_ir = false, verbose = false;
     int opt_level = 2;
     int mm = -1; /* -1: not given (manual for .luma input, the file's own mode for .lir) */
-    StrList extra = {0}, libs = {0};
+    StrList extra = {0}, libs = {0}, inputs = {0};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if ((a[0] == '-' && (a[1] == 'l' || a[1] == 'L'))) {
@@ -235,10 +286,32 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "-v") == 0) verbose = true;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(stdout); return 0; }
         else if (a[0] == '-' && a[1]) { fprintf(stderr, "luma: error: unknown option '%s'\n", a); usage(stderr); return 2; }
-        else if (input) { fprintf(stderr, "luma: error: multiple input files\n"); return 2; }
-        else input = a;
+        else {
+            if (!input) input = a;
+            strlist_push(&inputs, xstrdup(a));
+        }
     }
     if (!input) { usage(stderr); return 2; }
+    /* several .luma files (or folders of them) make one program */
+    StrList files = {0};
+    for (int i = 0; i < inputs.n; i++) {
+        struct stat st;
+        if (stat(inputs.items[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+            int before = files.n;
+            collect_luma_files(inputs.items[i], &files);
+            if (files.n == before) { fprintf(stderr, "luma: error: no .luma files in %s\n", inputs.items[i]); return 2; }
+        } else {
+            strlist_push(&files, xstrdup(inputs.items[i]));
+        }
+    }
+    if (files.n > 1 || strcmp(files.items[0], input) != 0) {
+        for (int i = 0; i < files.n; i++)
+            if (!ends_with(files.items[i], ".luma")) {
+                fprintf(stderr, "luma: error: %s: a program of several files takes .luma files only\n", files.items[i]);
+                return 2;
+            }
+        input = files.items[0];
+    }
     if (!*out) { fprintf(stderr, "luma: error: empty output name\n"); return 2; }
     bool from_ir = ends_with(input, ".lir");
 
@@ -259,6 +332,16 @@ int main(int argc, char **argv) {
     Buf ir_buf = {0}, asm_buf = {0};
     ObjFile obj = {0};
 
+    if (files.n > 1) {
+        /* 1. front end, several files: one program, the files' statements in order */
+        if (!program_load_files((const char *const *)files.items, files.n, &prog)) goto done;
+        if (dump_ast) program_dump(&prog);
+        if (verbose) fprintf(stderr, "luma: parsed %zu top-level statement(s) from %d files\n", prog.len, files.n);
+        if (!lower_program(&prog, &ir)) goto done;
+        have_ir = true;
+        ir.mm = IR_MM_MANUAL;
+        if (!mem_check_frees(&ir, input)) goto done;
+    } else {
     if (!(src = read_file(input, &src_len))) goto done;
     if (memchr(src, '\0', src_len)) { fprintf(stderr, "%s: error: source contains NUL bytes\n", input); goto done; }
 
@@ -280,6 +363,7 @@ int main(int argc, char **argv) {
         /* free(x) followed by a use of x on every path is a compile error
          * (all modes); like every compile error, before any file is written */
         if (!mem_check_frees(&ir, input)) goto done;
+    }
     }
     if (mm >= 0) ir.mm = (IrMemMode)mm;
     ir_print_module(&ir, &ir_buf);
@@ -378,5 +462,7 @@ done:
     free(vs_path);
     strlist_free(&extra);
     strlist_free(&libs);
+    strlist_free(&inputs);
+    strlist_free(&files);
     return rc;
 }

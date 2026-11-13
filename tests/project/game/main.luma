@@ -1,0 +1,2 @@
+print("main starts", Player::new("ada").describe(), helper(2));
+var score = 10;

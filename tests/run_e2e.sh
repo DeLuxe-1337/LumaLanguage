@@ -345,6 +345,18 @@ for lvl in 0 2; do
 done
 check "--mm=rc points to Rc::new" sh -c "! $LUMA --mm=rc $OUT/temps.luma -o $OUT/x 2>$OUT/e && grep -q 'use Rc::new' $OUT/e"
 
+# ---------------------------------------------------------- programs of several files
+printf '== programs of several files (a project folder) ==\n'
+for lvl in 0 2; do
+    if "$LUMA" -O$lvl tests/project/game -o "$OUT/project$lvl" >"$OUT/last.log" 2>&1 && "$OUT/project$lvl" >"$OUT/project$lvl.actual" 2>&1 &&
+        cmp -s "$OUT/project$lvl.actual" tests/project/game.out; then ok "project folder -O$lvl: main.luma first, shared declarations, one executable"
+    else bad "project folder -O$lvl"; cat "$OUT/last.log" "$OUT/project$lvl.actual" 2>/dev/null | sed 's/^/      /'; fi
+done
+check "explicit file list in order" sh -c "$LUMA tests/project/game/main.luma tests/project/game/player.luma tests/project/game/sub/util.luma -o $OUT/project_list && $OUT/project_list | cmp -s - tests/project/game.out"
+check "errors name the file and its own line" sh -c \
+    "! $LUMA tests/project/bad -o $OUT/x 2>$OUT/e && grep -q '^tests/project/bad/b.luma:3:23: error: return value of .f. expects int, got str' $OUT/e"
+check "a project builds as a shared library" sh -c "$LUMA --shared tests/project/game -o $OUT/libproject.so"
+
 # ---------------------------------------------------------- shared libraries
 printf '== shared libraries (--shared, export fun) ==\n'
 check "build the test host (tests/lib/host.c, system cc)" sh -c "cc -std=c11 -O2 -o $OUT/lib_host tests/lib/host.c -ldl"

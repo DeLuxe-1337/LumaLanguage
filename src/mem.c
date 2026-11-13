@@ -94,7 +94,7 @@ static void fn_display(const char *sym, char *buf, size_t n) {
 
 static int *mover; /* per vreg: the global of the function a move went to */
 
-#define DISPOSED (1 << 24) /* state bit: freed by dispose() rather than free() */
+#define DISPOSED (1 << 30) /* state bit (above every line number, prelude.h): freed by dispose() rather than free() */
 
 /* One step of the must-be-freed analysis. state[v] = line of the free()
  * that freed v on every path (or minus the line of the Rc::new that moved
@@ -121,14 +121,14 @@ static bool freed_step(const IrModule *m, const IrFunc *f, const IrInstr *in, in
                 char fd[300];
                 fn_display(m->globals[mover[v]].name, fd, sizeof fd);
                 fprintf(stderr, "%s:%s: error: '%s' is %s after it was moved into %s() on line %d\n", path, at, name,
-                        freeing ? "freed" : "used", fd, -state[v]);
+                        freeing ? "freed" : "used", fd, prelude_line(-state[v]));
             }
             else if (freeing)
                 fprintf(stderr, "%s:%s: error: '%s' is freed twice (%s(%s) on line %d already freed it)\n", path, at,
-                        name, state[v] & DISPOSED ? "dispose" : "free", name, state[v] & ~DISPOSED);
+                        name, state[v] & DISPOSED ? "dispose" : "free", name, prelude_line(state[v] & ~DISPOSED));
             else
                 fprintf(stderr, "%s:%s: error: '%s' is used after %s(%s) on line %d\n", path, at, name,
-                        state[v] & DISPOSED ? "dispose" : "free", name, state[v] & ~DISPOSED);
+                        state[v] & DISPOSED ? "dispose" : "free", name, prelude_line(state[v] & ~DISPOSED));
         }
         ok = false;
     }

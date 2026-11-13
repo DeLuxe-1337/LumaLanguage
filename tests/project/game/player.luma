@@ -1,0 +1,6 @@
+struct Player { name: str, hp: float }
+impl Player {
+  fun new(name: str): Player { return Player { name, hp: 100 }; }
+  fun describe(self): str { return self.name + " " + Str::of(self.hp); }
+}
+print("player.luma top-level, score =", score);
