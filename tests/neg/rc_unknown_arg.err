@@ -1,1 +1,1 @@
-unknown type 'Q' (Luma types: int, str, bool, nil, any, or a struct)
+unknown type 'Q' (Luma types: int, float, number, str, bool, nil, any, or a struct)

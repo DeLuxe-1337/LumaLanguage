@@ -61,7 +61,9 @@ static bool devirtualize(const IrModule *m, IrInstr *in, const IrTy *st) {
             char real[512];
             snprintf(real, sizeof real, "%.*s", (int)(wl - 4), wn);
             int rg = ir_find_global(m, real);
-            bool fits = rg >= 0 && m->globals[rg].kind == IRG_FUNC && m->globals[rg].arity == in->nargs + 1;
+            /* (a raw f64 parameter or result needs the wrapper's unbox / box) */
+            bool fits = rg >= 0 && m->globals[rg].kind == IRG_FUNC && m->globals[rg].arity == in->nargs + 1 &&
+                        m->globals[rg].ty != TY_F64;
             for (int i = 0; fits && i <= in->nargs; i++) {
                 IrTy at = st[i == 0 ? in->a : in->args[i - 1]];
                 fits = at != 0 && ir_ty_sub(at, ir_param_ty(&m->globals[rg], i));

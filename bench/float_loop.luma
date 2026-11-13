@@ -1,0 +1,14 @@
+// Typed float code: raw doubles in registers, no boxing, no runtime calls.
+fun integrate(n: int): float {
+  var sum: float = 0.0;
+  var x: float = 0.0;
+  var dx: float = 1.0 / n;
+  var i = 0;
+  while (i < n) {
+    sum = sum + x * x * dx;
+    x = x + dx;
+    i = i + 1;
+  }
+  return sum;
+}
+print(integrate(10000000));

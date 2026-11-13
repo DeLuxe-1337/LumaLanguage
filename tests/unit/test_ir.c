@@ -264,7 +264,7 @@ static void test_verifier(void) {
     {
         IrModule m;
         CHECK(parse_str("module \"m\"\ndata @c = str \"ctx\"\nfn @f(%a: int): int {\ne:\n  ret %a\n}\n"
-                        "fn @g(%x, %y) {\ne:\n  %x = check %x, int, @c\n  %r = call @f(%x)\n  %s = sub %y, %x\n"
+                        "fn @g(%x, %y) {\ne:\n  %x = check %x, int, @c\n  %r = call @f(%x)\n  %s = sub %x, %x\n"
                         "  %t = call @f(%s)\n  br %y, a, b\na:\n  %u = const 1\n  jmp j\nb:\n  %u = const 2\n  jmp j\n"
                         "j:\n  %v = call @f(%u)\n  ret %v\n}\n", &m));
         CHECK(ir_verify(&m, "t.lir"));

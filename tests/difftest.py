@@ -100,6 +100,9 @@ STD = {
 }
 
 
+NUMBER_PARAMS = ("Math::abs", "Math::min", "Math::max")
+
+
 def truthy(v):
     return not (v is None or v is False)
 
@@ -394,7 +397,12 @@ class Interp:
             names, types, _, impl = STD[e[1]]
             args = [self.ev(a) for a in e[2]]
             for name, value, t in zip(names, args, types):
-                self.guard(value, t, "argument '%s' of '%s'" % (name, e[1]))
+                what = "argument '%s' of '%s'" % (name, e[1])
+                if e[1] in NUMBER_PARAMS:   # declared `number` (int or float); the generator passes ints
+                    if type_of(value) != "int":
+                        raise LumaError("%s expects number, got %s." % (what, type_of(value)))
+                else:
+                    self.guard(value, t, what)
             return impl(*args)
         if k == "log":
             left = self.ev(e[2])

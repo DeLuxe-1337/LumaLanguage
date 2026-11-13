@@ -406,6 +406,16 @@ static bool parse_operand(Asm *a, char *s, Operand *op) {
         return false;
     }
     if (*s == '[') return parse_mem(a, s, op);
+    if (strncmp(s, "xmm", 3) == 0 && isdigit((unsigned char)s[3])) { /* SSE registers: size 128 */
+        char *end;
+        long r = strtol(s + 3, &end, 10);
+        if (*end == '\0' && r >= 0 && r <= 15) {
+            op->kind = OP_REG;
+            op->reg = (int)r;
+            op->size = 128;
+            return true;
+        }
+    }
     if (lookup_reg(s, &op->reg, &op->size)) {
         op->kind = OP_REG;
         op->rex_byte = op->size == 8 && op->reg >= 4 && op->reg <= 7;
@@ -656,7 +666,82 @@ static void assemble_alu(Asm *a, const AluOp *op, Operand *ops, int n) {
 /* ------------------------------------------------------------------------ */
 /* Instructions                                                             */
 
+/* Scalar SSE2 (doubles, and the f32 conversions the FFI needs). The
+ * mandatory prefix (66/F2/F3) comes before REX. Encodings (as GNU as):
+ *   movq xmm, r64      66 REX.W 0F 6E /r      movq r64, xmm     66 REX.W 0F 7E /r
+ *   addsd subsd mulsd divsd sqrtsd xmm, xmm/m64    F2 0F 58 5C 59 5E 51 /r
+ *   ucomisd xmm, xmm/m64    66 0F 2E /r
+ *   cvtsi2sd xmm, r/m64     F2 REX.W 0F 2A /r     cvttsd2si r64, xmm/m64  F2 REX.W 0F 2C /r
+ *   cvtsd2ss xmm, xmm/m64   F2 0F 5A /r           cvtss2sd xmm, xmm/m32   F3 0F 5A /r */
+static bool assemble_sse(Asm *a, const char *mn, Operand *ops, int n) {
+    static const struct { const char *name; uint8_t prefix, op; } SD[] = {
+        {"addsd", 0xF2, 0x58}, {"subsd", 0xF2, 0x5C}, {"mulsd", 0xF2, 0x59}, {"divsd", 0xF2, 0x5E},
+        {"sqrtsd", 0xF2, 0x51}, {"ucomisd", 0x66, 0x2E}, {"cvtsd2ss", 0xF2, 0x5A}, {"cvtss2sd", 0xF3, 0x5A},
+    };
+    bool xr0 = n > 0 && ops[0].kind == OP_REG && ops[0].size == 128;
+    bool xr1 = n > 1 && ops[1].kind == OP_REG && ops[1].size == 128;
+    for (size_t i = 0; i < sizeof SD / sizeof *SD; i++) {
+        if (strcmp(mn, SD[i].name) != 0) continue;
+        if (!want(a, mn, n, 2)) return true;
+        if (!xr0 || !(xr1 || (ops[1].kind == OP_MEM && ops[1].size != 8 && ops[1].size != 32 + 32 * (SD[i].prefix != 0xF3)))) {
+            if (!xr0 || !(xr1 || ops[1].kind == OP_MEM)) {
+                bad_operands(a, mn);
+                return true;
+            }
+        }
+        buf_byte(code(a), SD[i].prefix);
+        uint8_t opc[2] = {0x0F, SD[i].op};
+        encode(a, 0, ops[0].reg, false, opc, 2, &ops[1], 0);
+        return true;
+    }
+    if (strcmp(mn, "movq") == 0) {
+        if (!want(a, mn, n, 2)) return true;
+        bool g0 = ops[0].kind == OP_REG && ops[0].size == 64, g1 = ops[1].kind == OP_REG && ops[1].size == 64;
+        if (xr0 && g1) { /* movq xmm, r64 */
+            buf_byte(code(a), 0x66);
+            uint8_t opc[2] = {0x0F, 0x6E};
+            encode(a, 1, ops[0].reg, false, opc, 2, &ops[1], 0);
+        } else if (g0 && xr1) { /* movq r64, xmm */
+            buf_byte(code(a), 0x66);
+            uint8_t opc[2] = {0x0F, 0x7E};
+            encode(a, 1, ops[1].reg, false, opc, 2, &ops[0], 0);
+        } else {
+            bad_operands(a, mn);
+        }
+        return true;
+    }
+    if (strcmp(mn, "cvtsi2sd") == 0) {
+        if (!want(a, mn, n, 2)) return true;
+        if (!xr0 || !((ops[1].kind == OP_REG && ops[1].size == 64) || (ops[1].kind == OP_MEM && ops[1].size == 64))) {
+            bad_operands(a, mn);
+            return true;
+        }
+        buf_byte(code(a), 0xF2);
+        uint8_t opc[2] = {0x0F, 0x2A};
+        encode(a, 1, ops[0].reg, false, opc, 2, &ops[1], 0);
+        return true;
+    }
+    if (strcmp(mn, "cvttsd2si") == 0) {
+        if (!want(a, mn, n, 2)) return true;
+        if (!(ops[0].kind == OP_REG && ops[0].size == 64) || !(xr1 || ops[1].kind == OP_MEM)) {
+            bad_operands(a, mn);
+            return true;
+        }
+        buf_byte(code(a), 0xF2);
+        uint8_t opc[2] = {0x0F, 0x2C};
+        encode(a, 1, ops[0].reg, false, opc, 2, &ops[1], 0);
+        return true;
+    }
+    for (int i = 0; i < n; i++)
+        if (ops[i].kind == OP_REG && ops[i].size == 128) {
+            asm_error(a, "'%s' does not take xmm registers", mn);
+            return true;
+        }
+    return false;
+}
+
 static void assemble_insn(Asm *a, const char *mn, Operand *ops, int n) {
+    if (assemble_sse(a, mn, ops, n)) return;
     if (!cur_is_exec(a)) {
         asm_error(a, "instruction '%s' in non-executable section '%s'", mn, a->o->sections[a->cur].name);
         return;
@@ -1089,7 +1174,7 @@ static void assemble_line(Asm *a, char *line) {
         return;
     }
     for (char *c = p; *c; c++) {
-        if (!isalpha((unsigned char)*c)) {
+        if (!isalnum((unsigned char)*c)) {
             asm_error(a, "invalid mnemonic '%s'", p);
             return;
         }

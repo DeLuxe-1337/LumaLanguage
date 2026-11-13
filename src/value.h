@@ -4,7 +4,8 @@
  *
  *   fixnum n   (n << 1) | 1         63-bit signed integer
  *   pointer    8-aligned address    object with a u64 header (low byte = type id:
- *                                   1 string, 2 struct instance; bits 32-63 = the
+ *                                   1 string, 2 struct instance, 3 array, 4 boxed
+ *                                   float; bits 32-63 = the
  *                                   reference count, 0 = not counted)
  *   false      0x02
  *   nil        0x06
@@ -32,6 +33,8 @@ typedef uint64_t LumaValue;
 #define LUMA_TYPE_STRING 1
 #define LUMA_TYPE_STRUCT 2
 #define LUMA_TYPE_ARRAY 3  /* the std library's List storage: header, length, items */
+#define LUMA_TYPE_FLOAT 4  /* a boxed float: header, then the double (immutable; v0.10) */
+#define LUMA_FLOAT_VALUE_OFFSET 8
 #define LUMA_TYPE_FREED 0x7F /* a freed object (kept readable: see runtime "memory") */
 
 /* Object header: bits 0-7 type id, bits 8-31 struct id (structs), bits 32-63
@@ -64,6 +67,8 @@ typedef uint64_t LumaValue;
 #define LUMA_CT_CSTR 9
 #define LUMA_CT_CSTR_OPT 10
 #define LUMA_CT_PTR 11
+#define LUMA_CT_F32 12
+#define LUMA_CT_F64 13
 
 /* A struct instance: header = LUMA_TYPE_STRUCT | (struct index + 1) << 8
  * | count << 32, then a pointer to the struct's descriptor, then one word

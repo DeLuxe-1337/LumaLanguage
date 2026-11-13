@@ -15,7 +15,7 @@
  *   4. x86-64 instruction selection  -> OUT.s        (stop: -S)
  *   5. Luma assembler reads OUT.s    -> ObjFile
  *   6. Luma ELF writer               -> OUT.o        (stop: -c)
- *   7. system linker: cc -o OUT OUT.o [EXTRA...] libluma_rt.a [-LDIR...] [-lLIB...]
+ *   7. system linker: cc -o OUT OUT.o [EXTRA...] libluma_rt.a [-LDIR...] [-lLIB...] -lm
  *      ($LUMA_CC, $LUMA_RUNTIME). -l/-L and extra objects are how `extern fun`
  *      declarations are resolved against C libraries.
  *
@@ -127,7 +127,7 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
     }
     /* cc -o OUT OUT.o EXTRA... RUNTIME -L.../-l...  (libraries after the objects that use them) */
     int n = 0;
-    char **argv = xmalloc((size_t)(6 + extra->n + libs->n) * sizeof *argv);
+    char **argv = xmalloc((size_t)(7 + extra->n + libs->n) * sizeof *argv);
     argv[n++] = (char *)cc;
     argv[n++] = "-o";
     argv[n++] = (char *)out;
@@ -135,6 +135,7 @@ static int run_linker(const char *obj, const char *out, const StrList *extra, co
     for (int i = 0; i < extra->n; i++) argv[n++] = extra->items[i];
     argv[n++] = rt;
     for (int i = 0; i < libs->n; i++) argv[n++] = libs->items[i];
+    argv[n++] = "-lm"; /* the runtime's float formatting, and Math's float functions */
     argv[n] = NULL;
     if (verbose) {
         fprintf(stderr, "luma: link:");

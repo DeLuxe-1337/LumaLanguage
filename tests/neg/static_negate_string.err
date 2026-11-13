@@ -1,1 +1,1 @@
-operand of '-' must be int, got str
+operand of '-' must be a number, got str

@@ -73,3 +73,15 @@ int64_t big_sum(const Big *b) { return b->a + b->b + b->c; }
 static Big the_big = {1, 2, 3};
 Big *big_global(void) { return &the_big; }
 Big *big_null(void) { return 0; }
+
+/* Floating-point arguments and results (xmm registers, counted apart from
+ * the integer registers), f32 conversions, and a struct with float fields. */
+double fmix(int64_t a, double b, int32_t c, float d, double e, int64_t f) {
+    return (double)a * 100000 + b * 1000 + c * 100 + d * 10 + e + (double)f * 0.5;
+}
+float fhalf(float x) { return x / 2; }
+double fsum3(double a, double b, double c) { return a + b + c; }
+int64_t ftrunc(double x) { return (int64_t)x; }
+typedef struct { double x; float y; int32_t tag; } FVec;
+void fvec_scale(FVec *v, double k) { v->x *= k; v->y = (float)(v->y * k); v->tag++; }
+double fvec_len2(const FVec *v) { return v->x * v->x + (double)v->y * v->y; }

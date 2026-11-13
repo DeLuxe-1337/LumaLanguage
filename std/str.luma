@@ -1,5 +1,6 @@
 // Str: functions on strings. Strings are immutable byte strings; indexes
 // count bytes from 0. Str::len("abc") is 3.
+extern "luma_f64_text" fun __str_of_float(x: f64): cstr;
 struct Str {}
 
 impl Str {
@@ -121,6 +122,11 @@ impl Str {
   fun replace(s: str, old: str, new: str): str { return Str::join(Str::split(s, old), new); }
 
   fun from_int(n: int): str { return __str_from_int(n); }
+  // the shortest text that reads back as x: "0.1", "2.0", "1e+100", "nan"
+  fun from_float(x: float): str { return __str_of_float(x); }
+  // the float s spells (a Luma number literal, "inf" or "nan"; spaces around
+  // are fine), or nil
+  fun to_float(s: str): float? { return __str_to_float(s); }
   // the int s spells (optional sign and digits only), or nil
   fun to_int(s: str): int? { return __str_to_int(s); }
 

@@ -1,1 +1,1 @@
-floating-point C types are not supported yet
+argument 'x' of 'sqrt' expects float, got str

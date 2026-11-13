@@ -348,7 +348,7 @@ typedef struct {
 
 /* May a value of type t be a counted object? */
 static bool heap_ty(const Mem *mm, IrTy t) {
-    if (t & TY_STR) return true;
+    if (t & (TY_STR | TY_FLOAT)) return true; /* (boxed floats are counted like strings; raw f64 never) */
     if (!(t & TY_STRUCT)) return false;
     int sid = ty_sid(t);
     return sid >= 0 ? mm->sid_counted[sid] : mm->any_counted;
@@ -399,14 +399,9 @@ static int collect_uses(const IrInstr *in, UseCount *u) {
 static bool result_borrowed(const IrInstr *in) { return in->op == IR_LOAD || (in->op == IR_GETFIELD && in->sid >= 0); }
 
 /* Operations that fail (a runtime error) unless every operand is a fixnum:
- * after them an operand that dies needs no release. */
-static bool int_only_op(IrOp op) {
-    switch (op) {
-    case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD: case IR_NEG:
-    case IR_LT: case IR_LE: case IR_GT: case IR_GE: return true;
-    default: return false;
-    }
-}
+ * after them an operand that dies needs no release. (Arithmetic and ordered
+ * compares also take boxed floats, which are counted.) */
+static bool int_only_op(IrOp op) { return op == IR_MOD; }
 
 /* Runtime functions that return nil. */
 static bool extern_returns_nil(const char *name) {

@@ -40,10 +40,10 @@ static bool lat_eq(Lat a, Lat b) { return a.st == b.st && (a.st != L_CONST || sa
 
 static bool const_truthy(Lat c) { return c.op != IR_CONST_NIL && c.op != IR_CONST_FALSE; }
 
-static IrTy const_ty(Lat c) {
+static IrTy const_ty(const IrModule *m, Lat c) {
     switch (c.op) {
     case IR_CONST_INT: return TY_INT;
-    case IR_CONST_DATA: return TY_STR;
+    case IR_CONST_DATA: return m->globals[c.v].fbox ? TY_FLOAT : TY_STR;
     case IR_CONST_NIL: return TY_NIL;
     default: return TY_BOOL;
     }
@@ -76,7 +76,33 @@ static Lat fold_int(IrOp op, int64_t x, int64_t y) {
     }
 }
 
+/* A constant's numeric value (an int, or a static boxed float). */
+static bool const_number(const IrModule *m, Lat c, double *out) {
+    if (c.op == IR_CONST_INT) {
+        *out = (double)c.v;
+        return true;
+    }
+    if (c.op == IR_CONST_DATA && m->globals[c.v].fbox) {
+        memcpy(out, m->globals[c.v].data, 8);
+        return true;
+    }
+    return false;
+}
+
 static bool const_equal(const IrModule *m, Lat a, Lat b) {
+    double dx, dy;
+    bool fa = a.op == IR_CONST_DATA && m->globals[a.v].fbox, fb = b.op == IR_CONST_DATA && m->globals[b.v].fbox;
+    if ((fa || fb) && const_number(m, a, &dx) && const_number(m, b, &dy)) {
+        if (a.op == IR_CONST_INT && (double)(int64_t)dx != dx) return false;
+        if (b.op == IR_CONST_INT && (double)(int64_t)dy != dy) return false;
+        /* (1 == 1.0; nan is never equal to anything). Ints beyond 2^53 compare
+         * exactly in the runtime: leave those to it. */
+        if ((a.op == IR_CONST_INT && (a.v > (1LL << 53) || a.v < -(1LL << 53))) ||
+            (b.op == IR_CONST_INT && (b.v > (1LL << 53) || b.v < -(1LL << 53))))
+            return false;
+        return dx == dy;
+    }
+    if (fa != fb) return false;
     if (a.op != b.op) return false;
     if (a.op == IR_CONST_DATA) {
         const IrGlobal *x = &m->globals[a.v], *y = &m->globals[b.v];
@@ -89,7 +115,7 @@ static bool const_equal(const IrModule *m, Lat a, Lat b) {
  * returns 1 (truthy), 0 (falsy) or -1 (unknown / not yet known). */
 static int known_truth(Lat c, IrTy t) {
     if (c.st == L_CONST) return const_truthy(c);
-    if (t && subty(t, TY_INT | TY_STR | TY_STRUCT)) return 1; /* every struct instance is truthy */
+    if (t && (subty(t, TY_INT | TY_STR | TY_STRUCT | TY_FLOAT) || t == TY_F64)) return 1; /* every struct instance is truthy */
     if (t && subty(t, TY_NIL)) return 0;
     return -1;
 }
@@ -104,7 +130,7 @@ static Lat sccp_eval(const IrModule *m, const IrInstr *in, const Lat *L, const I
     case IR_CONST_DATA: return lconst(IR_CONST_DATA, in->global);
     case IR_MOV: return a;
     case IR_CHECK:
-        if (a.st == L_CONST) return ir_ty_inter(const_ty(a), in->ty) ? a : BOT;
+        if (a.st == L_CONST) return ir_ty_inter(const_ty(m, a), in->ty) ? a : BOT;
         return a.st == L_TOP ? TOP : BOT;
     case IR_NOT: {
         int t = known_truth(a, vty[in->a]);
@@ -123,9 +149,18 @@ static Lat sccp_eval(const IrModule *m, const IrInstr *in, const Lat *L, const I
         return BOT;
     case IR_EQ:
     case IR_NE: {
-        if (a.st == L_CONST && b.st == L_CONST) return lbool(const_equal(m, a, b) == (in->op == IR_EQ));
+        if (a.st == L_CONST && b.st == L_CONST) {
+            double x, y;
+            bool big = (a.op == IR_CONST_INT && b.op == IR_CONST_DATA && const_number(m, b, &y)) ||
+                       (b.op == IR_CONST_INT && a.op == IR_CONST_DATA && const_number(m, a, &x));
+            if (big && !const_equal(m, a, b) && ((a.op == IR_CONST_INT && (a.v > (1LL << 53) || a.v < -(1LL << 53))) ||
+                                                 (b.op == IR_CONST_INT && (b.v > (1LL << 53) || b.v < -(1LL << 53)))))
+                return BOT; /* a huge int and a float: the runtime decides */
+            return lbool(const_equal(m, a, b) == (in->op == IR_EQ));
+        }
         IrTy ta = vty[in->a], tb = vty[in->b];
-        if (ta && tb && !ir_ty_inter(ta, tb)) return lbool(in->op == IR_NE); /* different types are never equal */
+        bool numbers = (ta & (TY_INT | TY_FLOAT)) && (tb & (TY_INT | TY_FLOAT)); /* 1 == 1.0 */
+        if (ta && tb && !numbers && !ir_ty_inter(ta, tb)) return lbool(in->op == IR_NE); /* different types are never equal */
         if (a.st == L_TOP || b.st == L_TOP) return TOP;
         return BOT;
     }
@@ -416,7 +451,10 @@ bool opt_gvn(IrModule *m, IrFunc *f) {
                 key.ty = in->ty;
                 key.global = 0; /* any earlier check of the same value and type subsumes this one */
                 break;
-            case IR_CONST_INT: key.imm = in->imm; break;
+            case IR_CONST_INT: case IR_CONST_F64: key.imm = in->imm; break;
+            case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV: case IR_FNEG: case IR_UNBOX:
+            case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE:
+                break;
             case IR_CONST_NIL: case IR_CONST_TRUE: case IR_CONST_FALSE: case IR_CONST_DATA:
             case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD: case IR_NEG: case IR_NOT:
             case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE:

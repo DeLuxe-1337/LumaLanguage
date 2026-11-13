@@ -8,7 +8,7 @@
 
 /* ---- types ---- */
 
-#define TY_BASE 15u /* int, str, bool, nil */
+#define TY_BASE 111u /* int, str, bool, nil, float, f64 (everything but the struct bit) */
 
 /* The struct component of a type: -2 none, -1 any struct, k struct k. */
 static int scomp(IrTy t) { return (t & TY_STRUCT) ? (int)(t >> TY_SID_SHIFT) - 1 : -2; }
@@ -39,31 +39,37 @@ bool ir_ty_sub(IrTy a, IrTy b) {
 }
 
 void ir_ty_describe(const IrModule *m, IrTy t, const char *sep, char *buf, size_t n) {
-    static const struct { IrTy bit; const char *name; } T[] = {
-        {TY_INT, "int"}, {TY_STR, "str"}, {TY_BOOL, "bool"}, {TY_NIL, "nil"}};
+    bool ir_text = strcmp(sep, "|") == 0; /* the IR's text form tells raw f64 from boxed float */
+    const struct { IrTy bit; const char *name; } T[] = {
+        {TY_INT, "int"}, {TY_STR, "str"}, {TY_BOOL, "bool"}, {TY_FLOAT, "float"}, {TY_F64, ir_text ? "f64" : "float"}, {TY_NIL, "nil"}};
     int c = scomp(t);
     const char *sname = c == -1 ? "struct"
                       : (c >= 0 && m && c < m->nstructs) ? m->structs[c].name : c >= 0 ? "?struct" : NULL;
     char disp[300];
-    if (c >= 0 && sname && strcmp(sep, "|") != 0) { /* messages: Pair<int, str> */
+    if (c >= 0 && sname && !ir_text) { /* messages: Pair<int, str> */
         ir_struct_display(sname, disp, sizeof disp);
         sname = disp;
     }
     if ((t & TY_ANY) == TY_ANY && c == -1) { snprintf(buf, n, "any"); return; }
-    if ((t & TY_ANY) == 0) { snprintf(buf, n, "never"); return; }
+    if ((t & (TY_ANY | TY_F64)) == 0) { snprintf(buf, n, "never"); return; }
+    /* messages say "number" for int or float (the type `number`) */
+    bool number = !ir_text && (t & TY_INT) && (t & TY_FLOAT);
     /* T? : exactly one non-nil member plus nil */
-    IrTy rest = t & (TY_INT | TY_STR | TY_BOOL);
-    int members = (rest ? __builtin_popcount(rest) : 0) + (sname ? 1 : 0);
+    IrTy rest = t & (TY_INT | TY_STR | TY_BOOL | TY_FLOAT | TY_F64);
+    int members = (rest ? __builtin_popcount(rest) : 0) + (sname ? 1 : 0) - (number ? 1 : 0);
     if ((t & TY_NIL) && members == 1) {
         const char *one = sname;
-        for (int i = 0; i < 3 && !one; i++)
+        if (number) one = "number";
+        for (int i = 0; i < 5 && !one; i++)
             if (T[i].bit == rest) one = T[i].name;
         snprintf(buf, n, "%s?", one);
         return;
     }
     buf[0] = '\0';
-    for (int i = 0; i < 5; i++) {
-        const char *name = i < 4 ? ((t & T[i].bit) ? T[i].name : NULL) : sname;
+    for (int i = 0; i < 7; i++) {
+        const char *name = i < 6 ? ((t & T[i].bit) ? T[i].name : NULL) : sname;
+        if (number && i < 6 && T[i].bit == TY_FLOAT) continue;
+        if (number && i < 6 && T[i].bit == TY_INT) name = "number";
         if (!name) continue;
         if (buf[0]) strncat(buf, sep, n - strlen(buf) - 1);
         strncat(buf, name, n - strlen(buf) - 1);
@@ -74,7 +80,8 @@ void ir_ty_name(const IrModule *m, IrTy t, char *buf, size_t n) { ir_ty_describe
 
 bool ir_ty_parse(const IrModule *m, const char *s, IrTy *out) {
     static const struct { const char *name; IrTy ty; } N[] = {
-        {"int", TY_INT}, {"str", TY_STR}, {"bool", TY_BOOL}, {"nil", TY_NIL}, {"any", TY_ANY}, {"struct", TY_STRUCT}};
+        {"int", TY_INT}, {"str", TY_STR}, {"bool", TY_BOOL}, {"nil", TY_NIL}, {"any", TY_ANY}, {"struct", TY_STRUCT},
+        {"float", TY_FLOAT}, {"f64", TY_F64}};
     IrTy t = 0;
     const char *p = s;
     if (!*p) return false;
@@ -190,6 +197,7 @@ IrTy ir_ctype_ty(CType c) {
     case CT_CSTR_OPT: return TY_STR | TY_NIL;
     case CT_VOID: return TY_NIL;
     case CT_CSRET: return TY_ANY; /* a C struct (lowering checks which) */
+    case CT_F32: case CT_F64: return TY_F64; /* raw at the call */
     default: return TY_INT; /* every integer type and ptr */
     }
 }
@@ -215,11 +223,13 @@ int ir_instr_uses(IrInstr *in, int **ptrs) {
     int n = 0;
     switch (in->op) {
     case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
-    case IR_RETAIN: case IR_RELEASE: case IR_KEEP:
+    case IR_RETAIN: case IR_RELEASE: case IR_KEEP: case IR_FNEG: case IR_BOX: case IR_UNBOX:
         ptrs[n++] = &in->a;
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
     case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE:
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE:
         ptrs[n++] = &in->a;
         ptrs[n++] = &in->b;
         break;
@@ -374,26 +384,52 @@ int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len) {
     return g;
 }
 
+int ir_add_fbox(IrModule *m, const char *name, double v) {
+    int g = add_global(m, IRG_DATA, name);
+    m->globals[g].data = xmalloc(9);
+    memcpy(m->globals[g].data, &v, 8);
+    m->globals[g].data[8] = 0;
+    m->globals[g].data_len = 8;
+    m->globals[g].fbox = true;
+    return g;
+}
+
+int ir_fbox_for(IrModule *m, double v) {
+    int n = 0;
+    for (int i = 0; i < m->nglobals; i++) {
+        const IrGlobal *g = &m->globals[i];
+        if (g->kind != IRG_DATA || !g->fbox) continue;
+        n++;
+        if (memcmp(g->data, &v, 8) == 0) return i;
+    }
+    char name[32];
+    for (;; n++) {
+        snprintf(name, sizeof name, "f.%d", n);
+        if (ir_find_global(m, name) < 0) break;
+    }
+    return ir_add_fbox(m, name, v);
+}
+
 int ir_add_var(IrModule *m, const char *name) { return add_global(m, IRG_VAR, name); }
 
 static const char *const CTYPE_NAMES[CT_COUNT] = {
-    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "bool", "cstr", "cstr?", "ptr", "void", "cs0", "cs1", "struct",
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "bool", "cstr", "cstr?", "ptr", "f32", "f64", "void", "cs0", "cs1", "struct",
 };
 
 /* The runtime reads C field types by number (src/value.h). */
 _Static_assert(CT_I8 == LUMA_CT_I8 && CT_I16 == LUMA_CT_I16 && CT_I32 == LUMA_CT_I32 && CT_I64 == LUMA_CT_I64 &&
                    CT_U8 == LUMA_CT_U8 && CT_U16 == LUMA_CT_U16 && CT_U32 == LUMA_CT_U32 && CT_U64 == LUMA_CT_U64 &&
                    CT_BOOL == LUMA_CT_BOOL && CT_CSTR == LUMA_CT_CSTR && CT_CSTR_OPT == LUMA_CT_CSTR_OPT &&
-                   CT_PTR == LUMA_CT_PTR,
+                   CT_PTR == LUMA_CT_PTR && CT_F32 == LUMA_CT_F32 && CT_F64 == LUMA_CT_F64,
                "C type numbers differ between ir.h and value.h");
 
-bool ctype_is_field(CType c) { return c <= CT_PTR; }
+bool ctype_is_field(CType c) { return c <= CT_F64; }
 
 int ctype_size(CType c) {
     switch (c) {
     case CT_I8: case CT_U8: case CT_BOOL: return 1;
     case CT_I16: case CT_U16: return 2;
-    case CT_I32: case CT_U32: return 4;
+    case CT_I32: case CT_U32: case CT_F32: return 4;
     default: return 8;
     }
 }
@@ -581,13 +617,29 @@ bool ir_block_terminated(const IrBlock *b) { return b->n > 0 && ir_op_is_termina
 
 bool ir_op_is_binary(IrOp op) { return op >= IR_ADD && op <= IR_GE; }
 bool ir_op_is_unary(IrOp op) { return op == IR_NEG || op == IR_NOT; }
+bool ir_op_is_fbinary(IrOp op) { return op >= IR_FADD && op <= IR_FDIV; }
+bool ir_op_is_fcompare(IrOp op) { return op >= IR_FEQ && op <= IR_FGE; }
 
 const char *ir_mm_name(IrMemMode mm) { return mm == IR_MM_MANUAL ? "manual" : "none"; }
 
 const char *ir_op_name(IrOp op) {
     switch (op) {
     case IR_CONST_INT: case IR_CONST_NIL: case IR_CONST_TRUE: case IR_CONST_FALSE: case IR_CONST_DATA:
+    case IR_CONST_F64:
         return "const";
+    case IR_FADD: return "fadd";
+    case IR_FSUB: return "fsub";
+    case IR_FMUL: return "fmul";
+    case IR_FDIV: return "fdiv";
+    case IR_FEQ: return "feq";
+    case IR_FNE: return "fne";
+    case IR_FLT: return "flt";
+    case IR_FLE: return "fle";
+    case IR_FGT: return "fgt";
+    case IR_FGE: return "fge";
+    case IR_FNEG: return "fneg";
+    case IR_BOX: return "box";
+    case IR_UNBOX: return "unbox";
     case IR_MOV: return "mov";
     case IR_ADD: return "add";
     case IR_SUB: return "sub";
@@ -643,6 +695,17 @@ const char *ir_op_runtime(IrOp op) {
 
 /* ---- printer ----------------------------------------------------------- */
 
+void ir_format_f64(double v, char *buf, size_t n) {
+    if (v != v) { snprintf(buf, n, "nan"); return; }
+    if (v == 1.0 / 0.0) { snprintf(buf, n, "inf"); return; }
+    if (v == -1.0 / 0.0) { snprintf(buf, n, "-inf"); return; }
+    for (int prec = 1; prec <= 17; prec++) { /* the shortest form that reads back exactly */
+        snprintf(buf, n, "%.*g", prec, v);
+        if (strtod(buf, NULL) == v) break;
+    }
+    if (!strpbrk(buf, ".eni")) strncat(buf, ".0", n - strlen(buf) - 1); /* 3 -> 3.0: a float literal */
+}
+
 static void print_string(Buf *out, const char *s, size_t n) {
     buf_byte(out, '"');
     for (size_t i = 0; i < n; i++) {
@@ -672,11 +735,22 @@ void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *
     case IR_CONST_TRUE: buf_printf(out, "const true"); break;
     case IR_CONST_FALSE: buf_printf(out, "const false"); break;
     case IR_CONST_DATA: buf_printf(out, "const @%s", gname(m, in->global)); break;
+    case IR_CONST_F64: {
+        char num[40];
+        double v;
+        memcpy(&v, &in->imm, 8);
+        ir_format_f64(v, num, sizeof num);
+        buf_printf(out, "const f64 %s", num);
+        break;
+    }
     case IR_MOV: case IR_NEG: case IR_NOT: case IR_RETAIN: case IR_RELEASE: case IR_KEEP:
+    case IR_FNEG: case IR_BOX: case IR_UNBOX:
         buf_printf(out, "%s %%%s", ir_op_name(in->op), vname(f, in->a));
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
     case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE:
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE:
         buf_printf(out, "%s %%%s, %%%s", ir_op_name(in->op), vname(f, in->a), vname(f, in->b));
         break;
     case IR_CALL:
@@ -811,6 +885,12 @@ void ir_print_module(const IrModule *m, Buf *out) {
                 print_string(out, g->csym, strlen(g->csym));
             }
             buf_byte(out, '\n');
+        } else if (g->fbox) {
+            char num[40];
+            double v;
+            memcpy(&v, g->data, 8);
+            ir_format_f64(v, num, sizeof num);
+            buf_printf(out, "data @%s = float %s\n", g->name, num);
         } else {
             buf_printf(out, "data @%s = str ", g->name);
             print_string(out, g->data, g->data_len);

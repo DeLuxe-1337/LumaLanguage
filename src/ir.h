@@ -25,14 +25,20 @@
  * match the runtime's luma_check_type masks. 0 means "no value" (the code
  * that would produce it always fails, or is unreachable).
  *
- * Bits 0-4 are int, str, bool, nil and "struct instance". When the struct bit
+ * Bits 0-5 are int, str, bool, nil, "struct instance" and float (a boxed
+ * double); bit 6 is a raw double (TY_F64, below). When the struct bit
  * is set, bits 8 and up say WHICH struct: 0 = any struct, k = exactly struct
  * k-1 of the module (IrModule.structs). So `Point` is TY_STRUCT | (sid+1) << 8
  * and `any` is all five bits with no struct id. A set of two different
  * structs is approximated by "any struct". Use the helpers below to combine
  * types; plain & and | are only safe on the low bits. */
 typedef unsigned IrTy;
-enum { TY_INT = 1, TY_STR = 2, TY_BOOL = 4, TY_NIL = 8, TY_STRUCT = 16, TY_ANY = 31 };
+enum { TY_INT = 1, TY_STR = 2, TY_BOOL = 4, TY_NIL = 8, TY_STRUCT = 16, TY_FLOAT = 32, TY_ANY = 63,
+       /* Not a Luma value: a raw IEEE double (its 64 bits in the vreg). Typed
+        * float code (locals, parameters, results annotated `float`) keeps
+        * floats raw; everywhere else a float is a boxed TY_FLOAT object. A
+        * type that includes TY_F64 is exactly TY_F64 (the verifier checks). */
+       TY_F64 = 64 };
 #define TY_SID_SHIFT 8
 
 static inline IrTy ty_struct_of(int sid) { return TY_STRUCT | ((IrTy)(sid + 1) << TY_SID_SHIFT); }
@@ -72,6 +78,13 @@ typedef enum {
                        or dynamic (sid < 0: looked up by `name` at run time) (v0.5) */
     IR_SETFIELD,    /* a.field = b   (no dst; static or dynamic as for getfield) (v0.5) */
     IR_CALLM,       /* [dst =] method `name` of a's struct, called with (a, args...) (v0.5) */
+    /* floats (v0.10). Raw operands and results are f64 (TY_F64) */
+    IR_CONST_F64,   /* dst = imm (the bits of a double) */
+    IR_FADD, IR_FSUB, IR_FMUL, IR_FDIV, /* dst = a op b (raw) */
+    IR_FEQ, IR_FNE, IR_FLT, IR_FLE, IR_FGT, IR_FGE, /* dst = a op b (raw operands; bool result) */
+    IR_FNEG,        /* dst = -a (raw) */
+    IR_BOX,         /* dst = a new boxed float holding raw a */
+    IR_UNBOX,       /* dst = raw value of a, an int or a boxed float */
     IR_KEEP,        /* a must stay alive until here (no code; no dst; v0.7): after an access through an Rc */
     IR_RETAIN,      /* reference count of a += 1 if a is a counted object (no dst; v0.6, inserted by mem.c) */
     IR_RELEASE,     /* reference count of a -= 1 if a is a counted object; frees it at 0 (no dst; v0.6) */
@@ -116,7 +129,9 @@ typedef enum { IRG_FUNC, IRG_EXTERN, IRG_DATA, IRG_VAR, IRG_CEXTERN } IrGlobalKi
  * (docs/IR.md section 16). */
 typedef enum {
     CT_I8, CT_I16, CT_I32, CT_I64, CT_U8, CT_U16, CT_U32, CT_U64,
-    CT_BOOL, CT_CSTR, CT_CSTR_OPT, CT_PTR, CT_VOID,
+    CT_BOOL, CT_CSTR, CT_CSTR_OPT, CT_PTR,
+    CT_F32, CT_F64, /* v0.10: passed in xmm registers; Luma side f64 (raw) */
+    CT_VOID,
     /* C structs passed by value (v0.9): the first / second eightbyte of a
      * struct argument (both take the struct's Luma value), and a struct
      * result (IrGlobal.cret_sid). Not written in Luma source. */
@@ -143,6 +158,8 @@ typedef struct {
     IrTy *ptys;       /* IRG_FUNC: declared parameter types (arity entries, owned; NULL = all any) */
     IrTy ty;          /* IRG_FUNC: declared result type; IRG_VAR: declared variable type */
     uint64_t moves;   /* IRG_FUNC: bit i set when parameter i is `move` (v0.8; checked by mem_check_frees) */
+    bool fbox;        /* IRG_DATA: a static boxed float (data = the 8 bytes of the double), not a string (v0.10) */
+    bool exported;    /* IRG_FUNC: `export fun`: also callable from C as `name` (v0.10) */
     int line;
 } IrGlobal;
 
@@ -162,7 +179,7 @@ typedef struct {
 /* The name used in messages and printed values: a space after each comma
  * of a generic instance's name ("Pair<int,str>" -> "Pair<int, str>"). */
 void ir_struct_display(const char *name, char *buf, size_t n);
-/* Can a C struct field have this C type? (scalars, bool, ptr, cstr, cstr?) */
+/* Can a C struct field have this C type? (scalars, bool, ptr, cstr, cstr?, f32, f64) */
 bool ctype_is_field(CType c);
 /* Size and alignment of a C field type (System V x86-64). */
 int ctype_size(CType c);
@@ -221,6 +238,11 @@ void ir_module_free(IrModule *m);
 int ir_find_global(const IrModule *m, const char *name);
 int ir_add_extern(IrModule *m, const char *name, int arity);  /* returns global index */
 int ir_add_data(IrModule *m, const char *name, const char *bytes, size_t len);
+int ir_add_fbox(IrModule *m, const char *name, double v);    /* a static boxed float (v0.10) */
+/* The static boxed float holding v (created on first use), named "f.N". */
+int ir_fbox_for(IrModule *m, double v);
+bool ir_op_is_fbinary(IrOp op);  /* fadd..fdiv */
+bool ir_op_is_fcompare(IrOp op); /* feq..fge */
 int ir_add_var(IrModule *m, const char *name);                /* module-level variable slot */
 /* A C function: params/names have `arity` entries (copied). */
 int ir_add_cextern(IrModule *m, const char *name, int arity, const CType *params, const char *const *names, CType ret);
@@ -272,6 +294,9 @@ const char *ir_op_name(IrOp op);
 const char *ir_op_runtime(IrOp op);
 
 /* ---- text form ---- */
+/* A double in the shortest decimal form that reads back exactly, always
+ * with a '.' or exponent ("1.0", "0.1", "1e+100"; "nan", "inf", "-inf"). */
+void ir_format_f64(double v, char *buf, size_t n);
 void ir_print_module(const IrModule *m, Buf *out);
 void ir_print_instr(const IrModule *m, const IrFunc *f, const IrInstr *in, Buf *out);
 /* Parses the text form. On error prints "path:line: error: ..." and returns false. */

@@ -1,1 +1,1 @@
-fun f(a: float) {}
+fun f(a: double) {}

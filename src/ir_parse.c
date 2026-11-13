@@ -89,6 +89,31 @@ static size_t name_end(const char *s, size_t len, size_t i, bool first) {
     }
 }
 
+static void next(P *p);
+
+/* The current token is the word introducing a double (`f64` / `float`):
+ * reads the number written after it ("1.5", "-2e10", "nan", "inf", "-inf")
+ * straight from the source, then the token after it. */
+static bool take_double(P *p, double *v) {
+    while (p->pos < p->len && (p->src[p->pos] == ' ' || p->src[p->pos] == '\t')) p->pos++;
+    char num[64];
+    size_t n = 0;
+    while (p->pos + n < p->len && n + 1 < sizeof num && strchr("0123456789+-.eEnaif", p->src[p->pos + n])) {
+        num[n] = p->src[p->pos + n];
+        n++;
+    }
+    num[n] = '\0';
+    char *end;
+    *v = strtod(num, &end);
+    if (n == 0 || *end) {
+        perr(p, p->line, "expected a floating-point number");
+        return false;
+    }
+    p->pos += n;
+    next(p);
+    return true;
+}
+
 /* Reads the next token into p->tok. */
 static void next(P *p) {
     Tok *t = &p->tok;
@@ -421,6 +446,8 @@ static bool parse_callm_tail(P *p, int fi, int bi, int dst, int line) {
 static const struct { const char *name; IrOp op; } BINOPS[] = {
     {"add", IR_ADD}, {"sub", IR_SUB}, {"mul", IR_MUL}, {"div", IR_DIV}, {"mod", IR_MOD}, {"eq", IR_EQ},
     {"ne", IR_NE},   {"lt", IR_LT},   {"le", IR_LE},   {"gt", IR_GT},   {"ge", IR_GE},
+    {"fadd", IR_FADD}, {"fsub", IR_FSUB}, {"fmul", IR_FMUL}, {"fdiv", IR_FDIV},
+    {"feq", IR_FEQ}, {"fne", IR_FNE}, {"flt", IR_FLT}, {"fle", IR_FLE}, {"fgt", IR_FGT}, {"fge", IR_FGE},
 };
 
 /* Parses one instruction (the current token starts it). */
@@ -447,23 +474,33 @@ static bool parse_instr(P *p, int fi, int bi) {
             } else if (is_ident(p, "nil") || is_ident(p, "true") || is_ident(p, "false")) {
                 in = ir_emit(f, bi, is_ident(p, "nil") ? IR_CONST_NIL : is_ident(p, "true") ? IR_CONST_TRUE : IR_CONST_FALSE);
                 next(p);
+            } else if (is_ident(p, "f64")) {
+                double v;
+                if (!take_double(p, &v)) return false;
+                in = ir_emit(f, bi, IR_CONST_F64);
+                memcpy(&in->imm, &v, 8);
             } else if (p->tok.kind == T_GLOBAL) {
                 in = ir_emit(f, bi, IR_CONST_DATA);
                 in->dst = dst;
                 in->line = line;
                 return take_global_ref(p, fi, bi, f->blocks[bi].n - 1);
             } else {
-                perr(p, p->tok.line, "expected integer, nil, true, false or @data after 'const'");
+                perr(p, p->tok.line, "expected integer, nil, true, false, f64 NUMBER or @data after 'const'");
                 return false;
             }
             in->dst = dst;
             in->line = line;
             return true;
         }
-        if (strcmp(op, "mov") == 0 || strcmp(op, "neg") == 0 || strcmp(op, "not") == 0) {
+        static const struct { const char *name; IrOp op; } UNOPS[] = {
+            {"mov", IR_MOV}, {"neg", IR_NEG}, {"not", IR_NOT}, {"fneg", IR_FNEG}, {"box", IR_BOX}, {"unbox", IR_UNBOX}};
+        int unop = -1;
+        for (size_t i = 0; i < sizeof UNOPS / sizeof *UNOPS; i++)
+            if (strcmp(op, UNOPS[i].name) == 0) unop = (int)i;
+        if (unop >= 0) {
             int a;
             if (!take_vreg(p, f, &a)) return false;
-            IrInstr *in = ir_emit(f, bi, op[0] == 'm' ? IR_MOV : op[0] == 'n' && op[1] == 'e' ? IR_NEG : IR_NOT);
+            IrInstr *in = ir_emit(f, bi, UNOPS[unop].op);
             in->dst = dst;
             in->a = a;
             in->line = line;
@@ -993,7 +1030,16 @@ bool ir_parse(const char *path, const char *src, size_t len, IrModule *out) {
             char name[256];
             snprintf(name, sizeof name, "%s", p.tok.text);
             next(&p);
-            if (!expect_punct(&p, '=') || !expect_ident(&p, "str")) goto fail;
+            if (!expect_punct(&p, '=')) goto fail;
+            if (is_ident(&p, "float")) {
+                double v;
+                if (!take_double(&p, &v)) goto fail;
+                int g = ir_add_fbox(out, name, v);
+                out->globals[g].line = line;
+                if (!expect_nl(&p)) goto fail;
+                continue;
+            }
+            if (!expect_ident(&p, "str")) goto fail;
             if (p.tok.kind != T_STRING) { perr(&p, p.tok.line, "expected string literal"); goto fail; }
             int g = ir_add_data(out, name, p.tok.str.data ? (char *)p.tok.str.data : "", p.tok.str.len);
             out->globals[g].line = line;

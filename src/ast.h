@@ -37,8 +37,8 @@
  *               | IDENTIFIER "{" ( init ( "," init )* ","? )? "}"         (struct literal)
  *   init        → IDENTIFIER ( ":" expression )?                          (`x` is short for `x: x`)
  *
- * Types are optional and gradual (see docs/DESIGN.md): Luma types are int, str,
- * bool, nil and any; `T?` means T or nil. Extern declarations use C types
+ * Types are optional and gradual (see docs/DESIGN.md): Luma types are int, float,
+ * str, bool, nil and any; `T?` means T or nil. Extern declarations use C types
  * (i8..i64, u8..u64, bool, cstr, cstr?, ptr; void as a return type).
  *
  * Functions are not first-class values yet: a call's callee must be the name
@@ -61,6 +61,7 @@
 
 typedef enum {
     EXPR_INT,
+    EXPR_FLOAT,   /* fval (v0.10) */
     EXPR_STRING,
     EXPR_NIL,
     EXPR_TRUE,
@@ -87,6 +88,7 @@ struct Expr {
     int line, col;
     TokenKind op;
     int64_t ival;   /* EXPR_INT */
+    double fval;    /* EXPR_FLOAT */
     char *str;      /* EXPR_STRING: decoded bytes (owned) */
     size_t str_len;
     char *name;     /* EXPR_VAR / EXPR_ASSIGN (owned) */

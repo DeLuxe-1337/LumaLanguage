@@ -1,0 +1,72 @@
+// Floats: typed (raw doubles in registers) and untyped (boxed values).
+var x: float = 1.5;
+var y: float = x * 2.0 + 1;          // ints convert where a float is wanted
+print(x, y, x / 4, -x, 1e10, 0.1 + 0.2, 2.5e-3, -0.0);
+
+fun hyp2(a: float, b: float): float { return a * a + b * b; }
+print(hyp2(3, 4.0), hyp2(x, y));
+
+// untyped: boxed floats, mixed with ints by the generic operations
+var u = 2.5;
+var w = u * 2;
+print(u, w, u + 1, 7 / 2, 7.0 / 2, 7 / 2.0, u < 3, 3 > u, u - 0.5 == 2);
+print(1 == 1.0, 1.5 == 1.5, u == "x", 1.0 != 1, 0.1 + 0.2 == 0.3);
+
+// loops on typed floats
+var g: float = 0.0;
+for (var i = 0; i < 10; i = i + 1) g = g + 0.5;
+print(g, g > 4.9, g >= 5.0, g != 5.0, g <= 5.0, g < 5.0);
+
+// struct fields of type float hold boxed floats
+struct V { x: float, y: float }
+impl V {
+  fun len2(self): float { return self.x * self.x + self.y * self.y; }
+  fun scaled(self, k: float): V { return V { x: self.x * k, y: self.y * k }; }
+}
+var v = V { x: 3, y: 4.0 };
+print(v, v.len2(), v.scaled(0.5), v.x + v.y);
+v.x = v.x * 3.0;
+print(v.x, Sys::type_of(v.x), Sys::type_of(1), Sys::type_of(x));
+
+// dynamic method calls convert too
+var dv: any = v;
+print(dv.scaled(2), dv.len2());
+
+// nil-able floats, any
+var m: float? = nil;
+print(m);
+m = 2;
+print(m, m + 0.25);
+var a: any = 1.25;
+var f: float = a;
+print(a, f * 4);
+
+// division by zero, nan, inf
+var z: float = 0.0;
+var inf = 1.0 / z;
+var nan: float = z / z;
+print(inf, -inf, nan, nan == nan, nan != nan, nan < 1.0, inf > 1e308);
+
+// truthiness: every float is truthy, 0.0 too
+if (z) print("0.0 is truthy");
+print(z or 1, nil or 2.5, !z);
+
+// returning floats through untyped code
+fun half(n) { return n / 2.0; }
+print(half(3), half(1.5), half(-1));
+
+// the standard library
+print(Math::sqrt(2.0), Math::floor(2.7), Math::ceil(2.1), Math::round(2.5), Math::trunc(-2.7));
+print(Math::to_int(2.9), Math::to_int(-2.9), Math::floor_int(-2.5), Math::round_int(2.5), Math::to_float(7));
+print(Math::abs(-2.5), Math::abs(-3), Math::min(1.5, 2), Math::max(1.5, 2), Math::clamp(5.5, 0, 3));
+print(Math::sin(0.0), Math::cos(0.0), Math::pow(2, 10), Math::fpow(2.0, 0.5), Math::atan2(1.0, 1.0) * 4);
+print(Math::pi(), Math::lerp(0.0, 10.0, 0.25), Math::is_nan(nan), Math::is_finite(inf), Math::exp(0.0), Math::log(1.0));
+print(Str::from_float(0.1), Str::to_float("2.5e3"), Str::to_float(" 7 "), Str::to_float("x"), Str::of(1.5) + "!");
+
+var l = List::new();
+l.push(3.5);
+l.push(1);
+l.push(-2.25);
+l.push(2);
+l.sort();
+print(l);

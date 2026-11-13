@@ -94,6 +94,46 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
         load(out, "rax", in->a);
         store(out, in->dst, "rax");
         break;
+    case IR_CONST_F64:
+        buf_printf(out, "    mov rax, %" PRId64 "    # raw double\n", in->imm);
+        store(out, in->dst, "rax");
+        break;
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE: {
+        /* raw doubles: through xmm0 / xmm1 */
+        load(out, "rax", in->a);
+        buf_printf(out, "    movq xmm0, rax\n");
+        load(out, "rax", in->b);
+        buf_printf(out, "    movq xmm1, rax\n");
+        if (ir_op_is_fbinary(in->op)) {
+            static const char *const OPS[] = {"addsd", "subsd", "mulsd", "divsd"};
+            buf_printf(out, "    %s xmm0, xmm1\n    movq rax, xmm0\n", OPS[in->op - IR_FADD]);
+        } else {
+            /* ucomisd: unordered (NaN) sets ZF, PF and CF, so every compare but ne is false */
+            switch (in->op) {
+            case IR_FLT: buf_printf(out, "    ucomisd xmm1, xmm0\n    seta al\n"); break;
+            case IR_FLE: buf_printf(out, "    ucomisd xmm1, xmm0\n    setae al\n"); break;
+            case IR_FGT: buf_printf(out, "    ucomisd xmm0, xmm1\n    seta al\n"); break;
+            case IR_FGE: buf_printf(out, "    ucomisd xmm0, xmm1\n    setae al\n"); break;
+            case IR_FEQ: buf_printf(out, "    ucomisd xmm0, xmm1\n    setnp al\n    sete cl\n    movzx eax, al\n    movzx ecx, cl\n    and eax, ecx\n"); break;
+            default: buf_printf(out, "    ucomisd xmm0, xmm1\n    setp al\n    setne cl\n    movzx eax, al\n    movzx ecx, cl\n    or eax, ecx\n"); break;
+            }
+            buf_printf(out, "    movzx eax, al\n    lea rax, [rax*8 + 2]    # false 2, true 10\n");
+        }
+        store(out, in->dst, "rax");
+        break;
+    }
+    case IR_FNEG:
+        load(out, "rax", in->a);
+        buf_printf(out, "    mov rcx, %" PRId64 "\n    xor rax, rcx    # flip the sign bit\n", INT64_MIN);
+        store(out, in->dst, "rax");
+        break;
+    case IR_BOX:
+    case IR_UNBOX:
+        load(out, "rdi", in->a);
+        buf_printf(out, "    call %s@PLT\n", in->op == IR_BOX ? "luma_box_f64" : "luma_unbox_f64");
+        store(out, in->dst, "rax");
+        break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
     case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE:
         load(out, "rdi", in->a);
@@ -115,17 +155,37 @@ static void emit_instr(const IrModule *m, const IrFunc *f, int b, const IrInstr 
              * past the vreg slots; then the raw values go to rdi..r9. */
             int scratch = f->nvregs;
             for (int i = 0; i < in->nargs; i++) {
+                if (g->cparams[i] == CT_F32 || g->cparams[i] == CT_F64) { /* already a raw double */
+                    load(out, "rax", in->args[i]);
+                    store(out, scratch + i, "rax");
+                    continue;
+                }
                 int c = ffi_context("argument %d ('%s') of %s", i + 1, g->cnames[i], g->name);
                 load(out, "rdi", in->args[i]);
                 buf_printf(out, "    lea rsi, [rip + .Lffi.%d]\n", c);
                 buf_printf(out, "    call luma_ffi_arg_%s@PLT\n", ctype_suffix(g->cparams[i]));
                 store(out, scratch + i, "rax");
             }
-            for (int i = 0; i < in->nargs; i++) load(out, ARG_REGS[i], scratch + i);
-            buf_printf(out, "    xor eax, eax    # no vector registers used (variadic-safe)\n");
+            /* System V: integers in rdi..r9, floating-point values in xmm0.. */
+            int ni = 0, nf = 0;
+            for (int i = 0; i < in->nargs; i++) {
+                if (g->cparams[i] == CT_F32 || g->cparams[i] == CT_F64) {
+                    load(out, "rax", scratch + i);
+                    buf_printf(out, "    movq xmm%d, rax\n", nf);
+                    if (g->cparams[i] == CT_F32) buf_printf(out, "    cvtsd2ss xmm%d, xmm%d\n", nf, nf);
+                    nf++;
+                } else {
+                    load(out, ARG_REGS[ni++], scratch + i);
+                }
+            }
+            if (nf) buf_printf(out, "    mov eax, %d    # vector registers used (variadic-safe)\n", nf);
+            else buf_printf(out, "    xor eax, eax    # no vector registers used (variadic-safe)\n");
             buf_printf(out, "    call %s@PLT\n", g->csym ? g->csym : g->name);
             if (g->cret == CT_VOID) {
                 buf_printf(out, "    mov rax, %" PRIu64 "    # void -> nil\n", (uint64_t)LUMA_NIL);
+            } else if (g->cret == CT_F32 || g->cret == CT_F64) { /* raw: the double's bits */
+                if (g->cret == CT_F32) buf_printf(out, "    cvtss2sd xmm0, xmm0\n");
+                buf_printf(out, "    movq rax, xmm0\n");
             } else if (g->cret == CT_CSRET) { /* a C struct by value: eightbytes in rax:rdx */
                 int c = ffi_context("return value of %s", 0, NULL, g->name);
                 buf_printf(out, "    mov rdi, rax\n    mov rsi, rdx\n");
@@ -441,6 +501,18 @@ void x86_emit_data(const IrModule *m, Buf *out) {
         if (!any_data) buf_printf(out, "\n    .section .rodata\n");
         any_data = true;
         buf_printf(out, "    .p2align 3\n");
+        if (g->fbox) { /* a static boxed float: header (count 0: never freed), then the double */
+            char num[40];
+            double v;
+            uint64_t bits;
+            memcpy(&v, g->data, 8);
+            memcpy(&bits, g->data, 8);
+            ir_format_f64(v, num, sizeof num);
+            buf_printf(out, ".Ldata.%s:    # %s\n", g->name, num);
+            buf_printf(out, "    .quad %d    # header: float\n", LUMA_TYPE_FLOAT);
+            buf_printf(out, "    .quad %" PRId64 "\n", (int64_t)bits);
+            continue;
+        }
         buf_printf(out, ".Ldata.%s:    # \"", g->name);
         emit_preview(out, g->data, g->data_len);
         buf_printf(out, "\"\n");

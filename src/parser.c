@@ -2,6 +2,7 @@
  * Stops at the first error. Nesting depth is bounded so malformed input
  * cannot overflow the C stack. */
 #include "parser.h"
+#include "ir.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -47,7 +48,7 @@ static void describe(const Token *t, char *buf, size_t n) {
     switch (t->kind) {
     case TOK_EOF: snprintf(buf, n, "end of file"); break;
     case TOK_STRING: snprintf(buf, n, "string literal"); break;
-    case TOK_NUMBER: snprintf(buf, n, "number"); break;
+    case TOK_NUMBER: case TOK_FLOAT: snprintf(buf, n, "number"); break;
     case TOK_IDENTIFIER: snprintf(buf, n, "identifier '%.*s'", (int)(t->lexeme_len > 40 ? 40 : t->lexeme_len), t->lexeme); break;
     default: snprintf(buf, n, "'%.*s'", (int)t->lexeme_len, t->lexeme); break;
     }
@@ -187,6 +188,11 @@ static Expr *primary(Parser *p) {
         advance(p);
         e = new_expr(EXPR_INT, t);
         e->ival = t->ival;
+        return e;
+    case TOK_FLOAT:
+        advance(p);
+        e = new_expr(EXPR_FLOAT, t);
+        e->fval = t->fval;
         return e;
     case TOK_STRING:
         advance(p);
@@ -1083,6 +1089,12 @@ static void dump_stmt(const Stmt *s, int indent);
 static void dump_expr(const Expr *e) {
     switch (e->kind) {
     case EXPR_INT: printf("%lld", (long long)e->ival); break;
+    case EXPR_FLOAT: {
+        char num[40];
+        ir_format_f64(e->fval, num, sizeof num);
+        printf("%s", num);
+        break;
+    }
     case EXPR_STRING: dump_string(e->str, e->str_len); break;
     case EXPR_NIL: printf("nil"); break;
     case EXPR_TRUE: printf("true"); break;

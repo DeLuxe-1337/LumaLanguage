@@ -1,18 +1,77 @@
-// Math: integer arithmetic (Luma has no floats yet). Associated functions:
-// Math::abs(-3), Math::pow(2, 10). Overflow is a runtime error, as for +.
+// Math: numbers. Associated functions: Math::abs(-3), Math::pow(2, 10),
+// Math::sqrt(2.0). Integer overflow is a runtime error, as for +. abs, min,
+// max, clamp and sign take ints or floats; the integer functions (pow, gcd,
+// ...) take ints; the float functions (sqrt, sin, floor, ...) take floats
+// (an int converts) and return floats.
+extern "sqrt" fun __sqrt(x: f64): f64;
+extern "sin" fun __sin(x: f64): f64;
+extern "cos" fun __cos(x: f64): f64;
+extern "tan" fun __tan(x: f64): f64;
+extern "asin" fun __asin(x: f64): f64;
+extern "acos" fun __acos(x: f64): f64;
+extern "atan" fun __atan(x: f64): f64;
+extern "atan2" fun __atan2(y: f64, x: f64): f64;
+extern "exp" fun __exp(x: f64): f64;
+extern "log" fun __log(x: f64): f64;
+extern "log10" fun __log10(x: f64): f64;
+extern "pow" fun __fpow(x: f64, y: f64): f64;
+extern "fmod" fun __fmod(x: f64, y: f64): f64;
+extern "floor" fun __floor(x: f64): f64;
+extern "ceil" fun __ceil(x: f64): f64;
+extern "round" fun __round(x: f64): f64;
+extern "trunc" fun __trunc(x: f64): f64;
+extern "luma_f64_to_int" fun __f2i(x: f64, mode: i64): i64;
 struct Math {}
 
 impl Math {
-  fun abs(x: int): int { if (x < 0) return -x; return x; }
-  fun min(a: int, b: int): int { if (a < b) return a; return b; }
-  fun max(a: int, b: int): int { if (a > b) return a; return b; }
-  fun clamp(x: int, lo: int, hi: int): int {
+  fun abs(x: number): number { if (x < 0) return -x; return x; }
+  fun min(a: number, b: number): number { if (a < b) return a; return b; }
+  fun max(a: number, b: number): number { if (a > b) return a; return b; }
+  fun clamp(x: number, lo: number, hi: number): number {
     if (lo > hi) return __fail("Math::clamp: lo > hi.");
     if (x < lo) return lo;
     if (x > hi) return hi;
     return x;
   }
-  fun sign(x: int): int { if (x < 0) return -1; if (x > 0) return 1; return 0; }
+  fun sign(x: number): int { if (x < 0) return -1; if (x > 0) return 1; return 0; }
+
+  // floats
+  fun sqrt(x: float): float { return __sqrt(x); }
+  fun sin(x: float): float { return __sin(x); }
+  fun cos(x: float): float { return __cos(x); }
+  fun tan(x: float): float { return __tan(x); }
+  fun asin(x: float): float { return __asin(x); }
+  fun acos(x: float): float { return __acos(x); }
+  fun atan(x: float): float { return __atan(x); }
+  fun atan2(y: float, x: float): float { return __atan2(y, x); }
+  fun exp(x: float): float { return __exp(x); }
+  fun log(x: float): float { return __log(x); }
+  fun log10(x: float): float { return __log10(x); }
+  fun fpow(x: float, y: float): float { return __fpow(x, y); }
+  // the remainder of x / y with the sign of y (as Math::mod for ints)
+  fun fmod(x: float, y: float): float {
+    var r: float = __fmod(x, y);
+    if (r != 0.0 and (r < 0.0) != (y < 0.0)) r = r + y;
+    return r;
+  }
+  fun floor(x: float): float { return __floor(x); }
+  fun ceil(x: float): float { return __ceil(x); }
+  fun round(x: float): float { return __round(x); } // halves away from zero
+  fun trunc(x: float): float { return __trunc(x); }
+  fun lerp(a: float, b: float, t: float): float { return a + (b - a) * t; }
+  fun is_nan(x: float): bool { return x != x; }
+  fun is_finite(x: float): bool { return x - x == 0.0; }
+  fun pi(): float { return 3.141592653589793; }
+  fun e(): float { return 2.718281828459045; }
+  fun inf(): float { return 1e308 * 10.0; }
+  fun nan(): float { var z: float = 0.0; return z / z; }
+
+  // float -> int (a runtime error when it does not fit, or for nan / inf)
+  fun to_int(x: float): int { return __f2i(x, 0); }      // toward zero
+  fun floor_int(x: float): int { return __f2i(x, 1); }
+  fun ceil_int(x: float): int { return __f2i(x, 2); }
+  fun round_int(x: float): int { return __f2i(x, 3); }
+  fun to_float(n: int): float { return n; }
   fun is_even(x: int): bool { return x / 2 * 2 == x; }
   fun is_odd(x: int): bool { return x / 2 * 2 != x; }
 

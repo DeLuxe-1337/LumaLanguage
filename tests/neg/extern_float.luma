@@ -1,1 +1,2 @@
 extern fun sqrt(x: f64): f64;
+print(sqrt("2"));

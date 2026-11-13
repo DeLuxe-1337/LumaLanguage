@@ -40,11 +40,13 @@ static bool vreg_ok(const IrFunc *f, int r) { return r >= 0 && r < f->nvregs; }
 static void for_each_use(const IrInstr *in, void (*fn)(void *, int), void *ctx) {
     switch (in->op) {
     case IR_MOV: case IR_NEG: case IR_NOT: case IR_BR: case IR_RET: case IR_STORE: case IR_CHECK:
-    case IR_RETAIN: case IR_RELEASE: case IR_KEEP:
+    case IR_RETAIN: case IR_RELEASE: case IR_KEEP: case IR_FNEG: case IR_BOX: case IR_UNBOX:
         fn(ctx, in->a);
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
     case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE:
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE:
         fn(ctx, in->a);
         fn(ctx, in->b);
         break;
@@ -74,7 +76,8 @@ static bool op_has_dst(IrOp op) {
 }
 
 static bool ty_valid(const IrModule *m, IrTy t) {
-    if (t == 0 || (t & 0xE0)) return false;
+    if (t == 0 || (t & 0x80)) return false;
+    if ((t & TY_F64) && t != TY_F64) return false; /* a raw double is never mixed with values */
     if (!(t & TY_STRUCT)) return (t >> TY_SID_SHIFT) == 0;
     return ty_sid(t) < m->nstructs;
 }
@@ -247,6 +250,57 @@ static void type_error(V *v, const IrFunc *f, int b, const IrInstr *in, const ch
     verr(v, f, b, in, "%s may be %s, but it is declared %s (add a 'check')", what, g, w);
 }
 
+/* Raw doubles (f64) only go to float instructions, box, typed calls and C;
+ * every other operand is a Luma value. */
+static void want_raw(V *v, const IrFunc *f, int b, const IrInstr *in, const IrTy *st, int r, bool raw) {
+    if (r < 0) return;
+    if (raw && st[r] != TY_F64) {
+        char g[300];
+        ir_ty_name(v->m, st[r], g, sizeof g);
+        verr(v, f, b, in, "'%s' needs a raw f64 operand, '%%%s' may be %s", ir_op_name(in->op), f->vregs[r], g);
+    } else if (!raw && (st[r] & TY_F64)) {
+        verr(v, f, b, in, "'%s' reads '%%%s', a raw f64 (box it first)", ir_op_name(in->op), f->vregs[r]);
+    }
+}
+
+static void check_raw(V *v, const IrFunc *f, int b, const IrInstr *in, const IrTy *st) {
+    const IrModule *m = v->m;
+    switch (in->op) {
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE:
+        want_raw(v, f, b, in, st, in->b, true);
+        /* fallthrough */
+    case IR_FNEG: case IR_BOX:
+        want_raw(v, f, b, in, st, in->a, true);
+        break;
+    case IR_UNBOX:
+        if (in->a >= 0 && !ir_ty_sub(st[in->a], TY_INT | TY_FLOAT)) {
+            char g[300];
+            ir_ty_name(m, st[in->a], g, sizeof g);
+            verr(v, f, b, in, "'unbox' needs an int or float, '%%%s' may be %s (add a 'check')", f->vregs[in->a], g);
+        }
+        break;
+    case IR_MOV: case IR_RET: case IR_PHI: case IR_KEEP: break; /* raw or not (ret: the declared type decides) */
+    case IR_BR: break; /* a raw double is truthy */
+    case IR_CALL: {
+        const IrGlobal *g = &m->globals[in->global];
+        if (g->kind == IRG_FUNC) break; /* parameter types are checked above */
+        for (int i = 0; i < in->nargs; i++) {
+            bool raw = g->kind == IRG_CEXTERN && i < g->arity && (g->cparams[i] == CT_F32 || g->cparams[i] == CT_F64);
+            want_raw(v, f, b, in, st, in->args[i], raw);
+        }
+        break;
+    }
+    default: {
+        int *ptrs[64];
+        IrInstr copy = *in;
+        if (copy.nargs + 2 > 64) break;
+        int n = ir_instr_uses(&copy, ptrs);
+        for (int i = 0; i < n; i++) want_raw(v, f, b, in, st, *ptrs[i], false);
+    }
+    }
+}
+
 static void verify_types(V *v, const IrFunc *f) {
     const IrModule *m = v->m;
     IrTypes t;
@@ -291,7 +345,10 @@ static void verify_types(V *v, const IrFunc *f) {
                     type_error(v, f, b, in, what, st[in->b], sd->ftys[in->field]);
                 }
             }
+            check_raw(v, f, b, in, st);
             ir_types_step(m, in, st);
+            if (in->dst >= 0 && (st[in->dst] & TY_F64) && st[in->dst] != TY_F64)
+                verr(v, f, b, in, "'%%%s' mixes a raw f64 with Luma values", f->vregs[in->dst]);
         }
     }
     free(st);

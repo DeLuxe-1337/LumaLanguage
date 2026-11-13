@@ -494,6 +494,10 @@ static void emit_goto(G *g, int b, int t) {
  * the statically known truthiness. */
 static const char *truth_test(G *g, int v, IrTy ty, int *always) {
     Loc L = g->loc[v];
+    if (ty == TY_F64) { /* a raw double (any bits): floats are truthy */
+        *always = 1;
+        return NULL;
+    }
     if (L.kind == LOC_IMM) {
         *always = ((uint64_t)L.imm & LUMA_FALSY_MASK) != 2;
         return NULL;
@@ -540,6 +544,96 @@ static void epilogue(G *g) {
 
 static const char *ctype_suffix(CType t) { return t == CT_CSTR_OPT ? "cstr_opt" : ctype_name(t); }
 
+/* ---- floats: raw doubles live in general registers (their 64 bits); each
+ * operation moves them through xmm0/xmm1, which are never allocated. */
+
+static void fload(G *g, int x, int v) {
+    E(g, "    movq xmm%d, %s", x, R64[use_r(g, v, R11)]);
+}
+
+static void fstore(G *g, int d, int x) {
+    int T = dst_reg(g, d, -1);
+    E(g, "    movq %s, xmm%d", R64[T], x);
+    store_reg(g, d, T);
+}
+
+/* ucomisd for a raw compare; returns the condition that holds when `a op b`
+ * (unordered, i.e. NaN, makes every one of them false). */
+static const char *emit_fcmp(G *g, const IrInstr *in) {
+    fload(g, 0, in->a);
+    fload(g, 1, in->b);
+    switch (in->op) {
+    case IR_FLT: E(g, "    ucomisd xmm1, xmm0"); return "a";  /* b > a */
+    case IR_FLE: E(g, "    ucomisd xmm1, xmm0"); return "ae";
+    case IR_FGT: E(g, "    ucomisd xmm0, xmm1"); return "a";
+    case IR_FGE: E(g, "    ucomisd xmm0, xmm1"); return "ae";
+    default: E(g, "    ucomisd xmm0, xmm1"); return NULL; /* feq / fne: two flags */
+    }
+}
+
+static void emit_fcompare(G *g, const IrInstr *in) {
+    const char *cc = emit_fcmp(g, in);
+    if (cc) {
+        set_bool(g, cc, in->dst);
+        return;
+    }
+    int T = dst_reg(g, in->dst, -1);
+    if (in->op == IR_FEQ) { /* ZF and not PF */
+        E(g, "    setnp r11b");
+        E(g, "    sete r10b");
+        E(g, "    movzx r11d, r11b");
+        E(g, "    movzx r10d, r10b");
+        E(g, "    and r11d, r10d");
+    } else { /* not ZF, or PF */
+        E(g, "    setp r11b");
+        E(g, "    setne r10b");
+        E(g, "    movzx r11d, r11b");
+        E(g, "    movzx r10d, r10b");
+        E(g, "    or r11d, r10d");
+    }
+    E(g, "    lea %s, [r11*8 + 2]", R64[T]);
+    store_reg(g, in->dst, T);
+}
+
+/* d = raw double of a (an int or a boxed float). */
+static void emit_unbox(G *g, int idx, const IrInstr *in) {
+    IrTy ta = g->tya[idx];
+    int d = in->dst;
+    if (ta != 0 && ir_ty_sub(ta, TY_FLOAT)) {
+        int r = use_r(g, in->a, R11), T = dst_reg(g, d, -1);
+        E(g, "    mov %s, qword ptr [%s + %d]", R64[T], R64[r], LUMA_FLOAT_VALUE_OFFSET);
+        store_reg(g, d, T);
+        return;
+    }
+    if (ta != 0 && ir_ty_sub(ta, TY_INT)) {
+        load_loc(g, R11, g->loc[in->a]);
+        E(g, "    sar r11, 1");
+        E(g, "    cvtsi2sd xmm0, r11");
+        fstore(g, d, 0);
+        return;
+    }
+    if (ta != 0 && ir_ty_sub(ta, TY_INT | TY_FLOAT)) {
+        int fl = new_label(), done = new_label();
+        int r = use_r(g, in->a, R11), T = dst_reg(g, d, -1);
+        E(g, "    test %s, 1", R8B[r]);
+        E(g, "    jz .Lk%d", fl);
+        E(g, "    mov r11, %s", R64[r]);
+        E(g, "    sar r11, 1");
+        E(g, "    cvtsi2sd xmm0, r11");
+        E(g, "    movq %s, xmm0", R64[T]);
+        E(g, "    jmp .Lk%d", done);
+        E(g, ".Lk%d:", fl);
+        E(g, "    mov %s, qword ptr [%s + %d]", R64[T], R64[r], LUMA_FLOAT_VALUE_OFFSET);
+        E(g, ".Lk%d:", done);
+        store_reg(g, d, T);
+        return;
+    }
+    int saved[NREGS];
+    int ns = live_caller(g, 2 * idx, 2 * idx + 2, d, saved);
+    Loc arg = g->loc[in->a];
+    store_reg(g, d, preserving_call(g, saved, ns, "luma_unbox_f64", &arg, 1));
+}
+
 static int ffi_context(const char *text) {
     int n = ffi_labels++;
     buf_printf(&ffi_data, ".Lffi.%d:\n", n);
@@ -548,12 +642,15 @@ static int ffi_context(const char *text) {
     return n;
 }
 
+static bool ctype_float(CType c) { return c == CT_F32 || c == CT_F64; }
+
 static void emit_ffi_call(G *g, const IrInstr *in) {
     const IrGlobal *gl = &g->m->globals[in->global];
     int base = g->nslots;
     /* raw values go through scratch slots: the converters clobber caller-saved registers */
     for (int i = 0; i < in->nargs; i++) move_loc(g, (Loc){.kind = LOC_STACK, .slot = base + i}, g->loc[in->args[i]]);
     for (int i = 0; i < in->nargs; i++) {
+        if (ctype_float(gl->cparams[i])) continue; /* already a raw double */
         char text[600];
         snprintf(text, sizeof text, "argument %d ('%s') of %s", i + 1, gl->cnames[i], gl->name);
         int c = ffi_context(text);
@@ -562,11 +659,26 @@ static void emit_ffi_call(G *g, const IrInstr *in) {
         E(g, "    call luma_ffi_arg_%s@PLT", ctype_suffix(gl->cparams[i]));
         E(g, "    mov %s, rax", mem_text(g, base + i, "qword"));
     }
-    for (int i = 0; i < in->nargs; i++) E(g, "    mov %s, %s", R64[ARGREG[i]], mem_text(g, base + i, "qword"));
-    E(g, "    xor eax, eax    # no vector registers used (variadic-safe)");
+    /* System V: integer arguments in rdi.., floating-point ones in xmm0.. */
+    int ni = 0, nf = 0;
+    for (int i = 0; i < in->nargs; i++) {
+        if (ctype_float(gl->cparams[i])) {
+            E(g, "    mov r11, %s", mem_text(g, base + i, "qword"));
+            E(g, "    movq xmm%d, r11", nf);
+            if (gl->cparams[i] == CT_F32) E(g, "    cvtsd2ss xmm%d, xmm%d", nf, nf);
+            nf++;
+        } else {
+            E(g, "    mov %s, %s", R64[ARGREG[ni++]], mem_text(g, base + i, "qword"));
+        }
+    }
+    if (nf) E(g, "    mov eax, %d    # vector registers used (variadic-safe)", nf);
+    else E(g, "    xor eax, eax    # no vector registers used (variadic-safe)");
     E(g, "    call %s@PLT", gl->csym ? gl->csym : gl->name);
     if (gl->cret == CT_VOID) {
         emit_imm(g, RAX, (int64_t)LUMA_NIL);
+    } else if (ctype_float(gl->cret)) { /* raw: the double's bits */
+        if (gl->cret == CT_F32) E(g, "    cvtss2sd xmm0, xmm0");
+        E(g, "    movq rax, xmm0");
     } else if (gl->cret == CT_CSRET) { /* a C struct by value: eightbytes in rax:rdx */
         char text[600];
         snprintf(text, sizeof text, "return value of %s", gl->name);
@@ -791,10 +903,21 @@ static void emit_divmod(G *g, int idx, const IrInstr *in) {
     }
 }
 
+/* May == compare two different words that are equal numbers (an int and a
+ * float, or two boxed floats)? Then only the runtime can tell. */
+static bool numeric_eq(IrTy ta, IrTy tb) {
+    if (ta == 0 || tb == 0) return true;
+    return ((ta & TY_FLOAT) && (tb & (TY_INT | TY_FLOAT))) || ((tb & TY_FLOAT) && (ta & TY_INT));
+}
+
 static void emit_compare(G *g, int idx, const IrInstr *in) {
     IrTy ta = g->tya[idx], tb = g->tyb[idx];
     int d = in->dst;
     if (in->op == IR_EQ || in->op == IR_NE) {
+        if (numeric_eq(ta, tb)) { /* 1 == 1.0, and floats compare by value */
+            call_runtime(g, idx, in);
+            return;
+        }
         if (!(ta & TY_STR) || !(tb & TY_STR)) {
             /* equal <=> same word unless both may be strings */
             set_bool(g, emit_cmp(g, in->a, in->b, in->op), d);
@@ -854,6 +977,10 @@ static void emit_fused_br(G *g, int b, int idx, const IrInstr *br) {
         branch_truthy(g, b, c->a, g->tya[ci], f, t);
         return;
     }
+    if (ir_op_is_fcompare(c->op)) {
+        emit_branch(g, b, emit_fcmp(g, c), t, f);
+        return;
+    }
     IrTy ta = g->tya[ci], tb = g->tyb[ci];
     bool ordered = c->op != IR_EQ && c->op != IR_NE;
     bool na = ordered && !ty_int_only(ta), nb = ordered && !ty_int_only(tb);
@@ -887,7 +1014,7 @@ static bool may_be_immediate(IrTy t) { return t == 0 || (t & (TY_INT | TY_BOOL |
 
 /* Can a value of type t be an object at all? (Flow-sensitive: after `n < 2`
  * succeeds, n is an int.) */
-static bool may_be_object(IrTy t) { return t == 0 || (t & (TY_STR | TY_STRUCT)); }
+static bool may_be_object(IrTy t) { return t == 0 || (t & (TY_STR | TY_STRUCT | TY_FLOAT)); }
 
 static void emit_retain(G *g, int idx, const IrInstr *in) {
     Loc L = g->loc[in->a];
@@ -998,6 +1125,7 @@ static void emit_check(G *g, int idx, const IrInstr *in) {
 
 static Loc const_loc(const IrInstr *in) {
     switch (in->op) {
+    case IR_CONST_F64: return loc_imm(in->imm); /* the raw bits */
     case IR_CONST_INT: return loc_imm((int64_t)luma_fixnum(in->imm));
     case IR_CONST_NIL: return loc_imm((int64_t)LUMA_NIL);
     case IR_CONST_TRUE: return loc_imm((int64_t)LUMA_TRUE);
@@ -1016,6 +1144,36 @@ static void emit_instr(G *g, int b, int idx, const IrInstr *in) {
         break;
     }
     case IR_MOV: move_v(g, d, in->a); break;
+    case IR_CONST_F64: {
+        LocKind k = g->loc[d].kind;
+        if (k == LOC_REG || k == LOC_STACK) move_loc(g, g->loc[d], loc_imm(in->imm));
+        break;
+    }
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV: {
+        static const char *const OPS[] = {"addsd", "subsd", "mulsd", "divsd"};
+        fload(g, 0, in->a);
+        fload(g, 1, in->b);
+        E(g, "    %s xmm0, xmm1", OPS[in->op - IR_FADD]);
+        fstore(g, d, 0);
+        break;
+    }
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE: emit_fcompare(g, in); break;
+    case IR_FNEG: {
+        int T = dst_reg(g, d, -1);
+        load_loc(g, T, g->loc[in->a]);
+        emit_imm(g, R11, INT64_MIN); /* flip the sign bit */
+        E(g, "    xor %s, r11", R64[T]);
+        store_reg(g, d, T);
+        break;
+    }
+    case IR_BOX: {
+        int saved[NREGS];
+        int ns = live_caller(g, 2 * idx, 2 * idx + 2, d, saved);
+        Loc arg = g->loc[in->a];
+        store_reg(g, d, preserving_call(g, saved, ns, "luma_box_f64", &arg, 1));
+        break;
+    }
+    case IR_UNBOX: emit_unbox(g, idx, in); break;
     case IR_ADD: case IR_SUB: case IR_MUL: emit_arith(g, idx, in); break;
     case IR_DIV: case IR_MOD: emit_divmod(g, idx, in); break;
     case IR_EQ: case IR_NE: case IR_LT: case IR_LE: case IR_GT: case IR_GE: emit_compare(g, idx, in); break;
@@ -1205,7 +1363,8 @@ static void emit_instr(G *g, int b, int idx, const IrInstr *in) {
 /* Analysis and register allocation                                         */
 
 static bool is_const_op(IrOp op) {
-    return op == IR_CONST_INT || op == IR_CONST_NIL || op == IR_CONST_TRUE || op == IR_CONST_FALSE || op == IR_CONST_DATA;
+    return op == IR_CONST_INT || op == IR_CONST_NIL || op == IR_CONST_TRUE || op == IR_CONST_FALSE || op == IR_CONST_DATA ||
+           op == IR_CONST_F64;
 }
 
 static void ext(G *g, int v, int pos) {
@@ -1341,8 +1500,9 @@ static void analyze(G *g) {
         bool ok = false;
         switch (in->op) {
         case IR_LT: case IR_LE: case IR_GT: case IR_GE: ok = (ta & TY_INT) && (tb & TY_INT); break;
-        case IR_EQ: case IR_NE: ok = !(ta & TY_STR) || !(tb & TY_STR); break;
+        case IR_EQ: case IR_NE: ok = (!(ta & TY_STR) || !(tb & TY_STR)) && !numeric_eq(ta, tb); break;
         case IR_NOT: ok = true; break;
+        case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE: ok = true; break;
         default: break;
         }
         if (!ok) continue;

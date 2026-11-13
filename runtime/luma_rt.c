@@ -18,6 +18,7 @@
  * use-after-free / double-free detection. */
 #define _XOPEN_SOURCE 700 /* sigaction, sigaltstack, SA_ONSTACK, SA_SIGINFO (XSI) */
 #include <inttypes.h>
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -225,6 +226,8 @@ static void pool_put(LumaStruct *o, int64_t nfields) {
     pool[nfields] = o;
 }
 
+static void *float_pool; /* freed boxed floats, linked through their value word */
+
 /* Marks o freed. Under memcheck the memory is kept (quarantined), poisoned,
  * and leaves the live set; otherwise it goes back to malloc or the pool. */
 static void free_object(void *o, bool to_pool, int64_t nfields) {
@@ -240,6 +243,12 @@ static void free_object(void *o, bool to_pool, int64_t nfields) {
         if ((*h & 0xff) == LUMA_TYPE_STRUCT)
             for (int64_t k = 0; k < nfields; k++) ((LumaStruct *)o)->fields[k] = LUMA_POISON;
         *h = LUMA_TYPE_FREED;
+        return;
+    }
+    if ((*h & 0xff) == LUMA_TYPE_FLOAT) { /* boxed floats are recycled: they come and go in arithmetic */
+        *h = LUMA_TYPE_FREED;
+        ((void **)o)[1] = float_pool;
+        float_pool = o;
         return;
     }
     *h = LUMA_TYPE_FREED; /* count 0 */
@@ -474,10 +483,147 @@ static LumaValue make_fixnum_checked(int64_t n) {
 
 static LumaValue make_bool(bool b) { return b ? LUMA_TRUE : LUMA_FALSE; }
 
+/* ---- floats (v0.10) -------------------------------------------------------
+ * A float that is not in a typed (raw f64) slot is a boxed float: an
+ * immutable object of type LUMA_TYPE_FLOAT holding the double, counted like a
+ * string (static literals have count 0). Arithmetic on an int and a float
+ * gives a float; / of two ints stays floor division. */
+typedef struct {
+    uint64_t header;
+    double value;
+} LumaFloat;
+
+static bool is_float(LumaValue v) { return is_object(v) && (header_of(v) & 0xff) == LUMA_TYPE_FLOAT; }
+static double float_val(LumaValue v) { return ((const LumaFloat *)(uintptr_t)v)->value; }
+
+static LumaValue make_float(double d) {
+    LumaFloat *f;
+    if (float_pool && !memcheck) {
+        f = float_pool;
+        float_pool = ((void **)f)[1];
+        n_allocated++;
+    } else {
+        f = alloc_object(sizeof *f);
+    }
+    f->header = LUMA_TYPE_FLOAT | ((uint64_t)(luma_mm != LUMA_MM_NONE) << 32);
+    f->value = d;
+    return (LumaValue)(uintptr_t)f;
+}
+
+static double bits_double(uint64_t b) {
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+
+static uint64_t double_bits(double d) {
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return b;
+}
+
+/* box: a raw double (from typed code) becomes a value */
+LumaValue luma_box_f64(uint64_t bits) { return make_float(bits_double(bits)); }
+
+/* The shortest decimal form that reads back exactly, always with a '.' or an
+ * exponent so a float never prints like an int: 1.0, 0.1, 1e+100, nan, inf. */
+static void format_double(double v, char *buf, size_t n) {
+    if (isnan(v)) { snprintf(buf, n, "nan"); return; }
+    if (isinf(v)) { snprintf(buf, n, v > 0 ? "inf" : "-inf"); return; }
+    int prec = 1;
+    for (; prec < 17; prec++) { /* the fewest significant digits that read back exactly */
+        snprintf(buf, n, "%.*e", prec - 1, v);
+        if (strtod(buf, NULL) == v) break;
+    }
+    /* plain notation for 1e-4 <= |v| < 1e16 (as Python): 2500.0, 0.001 */
+    int x = v == 0 ? 0 : atoi(strchr(buf, 'e') + 1);
+    if (x >= -4 && x < 16) {
+        int decimals = prec - 1 - x;
+        snprintf(buf, n, "%.*f", decimals > 0 ? decimals : 0, v);
+    } else {
+        snprintf(buf, n, "%.*e", prec - 1, v);
+    }
+    if (!strpbrk(buf, ".e")) strncat(buf, ".0", n - strlen(buf) - 1);
+}
+
 __attribute__((noinline, cold, noreturn)) static void not_numbers(LumaValue a, LumaValue b) {
     check_valid(a);
     check_valid(b);
     luma_panic("Operands must be numbers.");
+}
+
+static bool is_number(LumaValue v) { return is_fixnum(v) || is_float(v); }
+static double num_val(LumaValue v) { return is_fixnum(v) ? (double)fixnum_val(v) : float_val(v); }
+
+/* unbox: an int or a boxed float as a raw double (typed float code) */
+uint64_t luma_unbox_f64(LumaValue v) {
+    check_valid(v);
+    if (!is_number(v)) luma_panic("Operand must be a number.");
+    return double_bits(num_val(v));
+}
+
+/* An int where a float is wanted becomes a float; anything else is kept
+ * (returned as a new reference, like every runtime result). */
+LumaValue luma_coerce_float(LumaValue v) {
+    check_valid(v);
+    if (is_fixnum(v)) return make_float((double)fixnum_val(v));
+    luma_retain(v);
+    return v;
+}
+
+/* For the std library (Math, Str), called through the FFI with raw doubles. */
+int64_t luma_f64_to_int(double x, int64_t mode) { /* mode: 0 trunc, 1 floor, 2 ceil, 3 round */
+    double r = mode == 1 ? floor(x) : mode == 2 ? ceil(x) : mode == 3 ? round(x) : trunc(x);
+    if (!(r >= (double)LUMA_FIXNUM_MIN && r <= (double)LUMA_FIXNUM_MAX)) {
+        char buf[40];
+        format_double(x, buf, sizeof buf);
+        panicf("%s does not fit in an int.", buf);
+    }
+    return (int64_t)r;
+}
+
+const char *luma_f64_text(double x) {
+    static char buf[40];
+    format_double(x, buf, sizeof buf);
+    return buf;
+}
+
+/* __str_to_float(s): the float s spells (as Luma float literals, plus inf
+ * and nan, surrounding spaces allowed), or nil. */
+LumaValue luma_str_to_float(LumaValue v) {
+    check_valid(v);
+    if (!is_string(v)) luma_panic("Str::to_float expects a str.");
+    const char *p = as_string(v)->bytes;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!*p || strpbrk(p, "xXpP")) return LUMA_NIL; /* (no hex floats) */
+    char *end;
+    double d = strtod(p, &end);
+    if (end == p) return LUMA_NIL;
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+    if (*end || (size_t)(end - as_string(v)->bytes) != as_string(v)->len) return LUMA_NIL;
+    return make_float(d);
+}
+
+/* + - * / where an operand is not a fixnum: floats, or a runtime error. */
+__attribute__((noinline)) static LumaValue float_arith(char op, LumaValue a, LumaValue b) {
+    if (!is_number(a) || !is_number(b)) not_numbers(a, b);
+    double x = num_val(a), y = num_val(b);
+    switch (op) {
+    case '+': return make_float(x + y);
+    case '-': return make_float(x - y);
+    case '*': return make_float(x * y);
+    default: return make_float(x / y); /* IEEE: x / 0.0 is inf or nan, not an error */
+    }
+}
+
+/* Compares two numbers exactly (an int beyond 2^53 against a float too):
+ * -1, 0, 1, or 2 when unordered (nan). */
+static int compare_numbers(LumaValue a, LumaValue b) {
+    if (is_fixnum(a) && is_fixnum(b)) return fixnum_val(a) < fixnum_val(b) ? -1 : fixnum_val(a) > fixnum_val(b);
+    long double x = is_fixnum(a) ? (long double)fixnum_val(a) : (long double)float_val(a);
+    long double y = is_fixnum(b) ? (long double)fixnum_val(b) : (long double)float_val(b);
+    if (x != x || y != y) return 2;
+    return x < y ? -1 : x > y;
 }
 
 /* Both operands fixnums, or a runtime error (the check stays small inline). */
@@ -486,12 +632,13 @@ static inline void need_numbers(LumaValue a, LumaValue b) {
 }
 
 /* ---- typed boundaries (gradual typing) ---------------------------------
- * Static type masks used by the compiler: int = 1, str = 2, bool = 4, nil = 8.
+ * Static type masks used by the compiler: int = 1, str = 2, bool = 4, nil = 8,
+ * struct = 16 (with the struct's id above bit 8), float = 32.
  * The compiler inserts luma_check_type(v, mask, context) wherever a value it
  * cannot type statically ("any") flows into an annotated variable, parameter
  * or return value. */
 
-enum { MASK_INT = 1, MASK_STR = 2, MASK_BOOL = 4, MASK_NIL = 8, MASK_STRUCT = 16 };
+enum { MASK_INT = 1, MASK_STR = 2, MASK_BOOL = 4, MASK_NIL = 8, MASK_STRUCT = 16, MASK_FLOAT = 32 };
 #define MASK_SID_SHIFT 8 /* a mask's struct bits: 0 = any struct, k = struct with id k */
 
 static _Noreturn void panicf(const char *fmt, ...) {
@@ -510,6 +657,7 @@ static unsigned value_mask(LumaValue v) {
     if (v == LUMA_NIL) return MASK_NIL;
     if (v == LUMA_TRUE || v == LUMA_FALSE) return MASK_BOOL;
     if (is_string(v)) return MASK_STR;
+    if (is_float(v)) return MASK_FLOAT;
     if (is_struct(v)) return MASK_STRUCT | (unsigned)(desc_of(as_struct(v))->id << MASK_SID_SHIFT);
     return 0;
 }
@@ -520,7 +668,7 @@ static bool mask_accepts(unsigned m, unsigned vm) {
         unsigned want = m >> MASK_SID_SHIFT;
         return (m & MASK_STRUCT) && (want == 0 || want == vm >> MASK_SID_SHIFT);
     }
-    return (vm & m & 15) != 0;
+    return (vm & m & (MASK_INT | MASK_STR | MASK_BOOL | MASK_NIL | MASK_FLOAT)) != 0;
 }
 
 /* Name of the struct with id k (index + 1). */
@@ -539,6 +687,7 @@ static const char *value_type_name(LumaValue v) {
     case MASK_STR: return "str";
     case MASK_BOOL: return "bool";
     case MASK_NIL: return "nil";
+    case MASK_FLOAT: return "float";
     default: return "unknown";
     }
 }
@@ -546,22 +695,25 @@ static const char *value_type_name(LumaValue v) {
 /* "int", "str?", "int or str", "Point?", ... (the same spelling the compiler uses) */
 static void describe_mask(unsigned mask, char *buf, size_t n) {
     static const struct { unsigned bit; const char *name; } T[] = {
-        {MASK_INT, "int"}, {MASK_STR, "str"}, {MASK_BOOL, "bool"}, {MASK_NIL, "nil"}};
+        {MASK_INT, "int"}, {MASK_STR, "str"}, {MASK_BOOL, "bool"}, {MASK_FLOAT, "float"}, {MASK_NIL, "nil"}};
     unsigned sid = mask >> MASK_SID_SHIFT;
     const char *sname = (mask & MASK_STRUCT) ? (sid ? struct_name(sid) : "struct") : NULL;
-    if ((mask & 31) == 31 && sid == 0) { snprintf(buf, n, "any"); return; }
-    unsigned rest = mask & (MASK_INT | MASK_STR | MASK_BOOL);
-    int members = __builtin_popcount(rest) + (sname ? 1 : 0);
+    if ((mask & 63) == 63 && sid == 0) { snprintf(buf, n, "any"); return; }
+    bool number = (mask & MASK_INT) && (mask & MASK_FLOAT); /* said "number" */
+    unsigned rest = mask & (MASK_INT | MASK_STR | MASK_BOOL | MASK_FLOAT);
+    int members = __builtin_popcount(rest) + (sname ? 1 : 0) - (number ? 1 : 0);
     if ((mask & MASK_NIL) && members == 1) { /* exactly one type plus nil: T? */
-        const char *one = sname;
-        for (int i = 0; i < 3 && !one; i++)
+        const char *one = number ? "number" : sname;
+        for (int i = 0; i < 4 && !one; i++)
             if (T[i].bit == rest) one = T[i].name;
         snprintf(buf, n, "%s?", one);
         return;
     }
     buf[0] = '\0';
-    for (int i = 0; i < 5; i++) {
-        const char *name = i < 4 ? ((mask & T[i].bit) ? T[i].name : NULL) : sname;
+    for (int i = 0; i < 6; i++) {
+        const char *name = i < 5 ? ((mask & T[i].bit) ? T[i].name : NULL) : sname;
+        if (number && i < 5 && T[i].bit == MASK_FLOAT) continue;
+        if (number && i < 5 && T[i].bit == MASK_INT) name = "number";
         if (!name) continue;
         if (buf[0]) strncat(buf, " or ", n - strlen(buf) - 1);
         strncat(buf, name, n - strlen(buf) - 1);
@@ -698,6 +850,8 @@ static LumaValue cfield_get(const LumaStruct *o, int64_t k) {
     case LUMA_CT_U16: { uint16_t v; memcpy(&v, p, 2); return luma_fixnum(v); }
     case LUMA_CT_U32: { uint32_t v; memcpy(&v, p, 4); return luma_fixnum(v); }
     case LUMA_CT_BOOL: return make_bool(*p != 0);
+    case LUMA_CT_F32: { float v; memcpy(&v, p, 4); return make_float(v); }
+    case LUMA_CT_F64: { double v; memcpy(&v, p, 8); return make_float(v); }
     default: break;
     }
     uint64_t w;
@@ -730,6 +884,19 @@ static void cfield_set(LumaStruct *o, int64_t k, LumaValue v) {
     case LUMA_CT_U64: w = luma_ffi_arg_u64(v, ctx); break;
     case LUMA_CT_BOOL: w = luma_ffi_arg_bool(v, ctx); break;
     case LUMA_CT_PTR: w = luma_ffi_arg_ptr(v, ctx); break;
+    case LUMA_CT_F32:
+    case LUMA_CT_F64: {
+        check_valid(v);
+        if (!is_number(v)) panicf("%s expects float, got %s.", ctx, value_type_name(v));
+        if (c->ctypes[k] == LUMA_CT_F32) {
+            float f = (float)num_val(v);
+            memcpy(p, &f, 4);
+        } else {
+            double d = num_val(v);
+            memcpy(p, &d, 8);
+        }
+        return;
+    }
     default: panicf("%s is a C string: it can be read, not written (its memory belongs to C).", ctx);
     }
     int size = c->ctypes[k] == LUMA_CT_I8 || c->ctypes[k] == LUMA_CT_U8 || c->ctypes[k] == LUMA_CT_BOOL ? 1
@@ -828,7 +995,11 @@ static int nprinting;
 static void write_value(FILE *out, LumaValue v, bool quoted) {
     check_valid(v);
     if (is_fixnum(v)) fprintf(out, "%" PRId64, fixnum_val(v));
-    else if (v == LUMA_NIL) fputs("nil", out);
+    else if (is_float(v)) {
+        char buf[40];
+        format_double(float_val(v), buf, sizeof buf);
+        fputs(buf, out);
+    } else if (v == LUMA_NIL) fputs("nil", out);
     else if (v == LUMA_TRUE) fputs("true", out);
     else if (v == LUMA_FALSE) fputs("false", out);
     else if (is_string(v)) {
@@ -1315,7 +1486,10 @@ LumaValue luma_fail(LumaValue msg) {
 /* __array_sort(a, n): sorts the first n items, all ints or all strs. */
 static int compare_items(const void *x, const void *y) {
     LumaValue a = *(const LumaValue *)x, b = *(const LumaValue *)y;
-    if (is_fixnum(a)) return fixnum_val(a) < fixnum_val(b) ? -1 : fixnum_val(a) > fixnum_val(b);
+    if (is_number(a)) {
+        int c = compare_numbers(a, b);
+        return c == 2 ? (num_val(a) != num_val(a)) - (num_val(b) != num_val(b)) : c; /* nan sorts last */
+    }
     return (int)fixnum_val(luma_str_cmp(a, b));
 }
 
@@ -1324,11 +1498,11 @@ LumaValue luma_array_sort(LumaValue a, LumaValue n) {
     int64_t k = need_int(n, "List::sort");
     if (k < 0 || (uint64_t)k > arr->len) k = (int64_t)arr->len;
     if (k == 0) return LUMA_NIL;
-    bool ints = is_fixnum(arr->items[0]);
+    bool nums = is_number(arr->items[0]);
     for (int64_t i = 0; i < k; i++) {
         check_valid(arr->items[i]);
-        if (ints ? !is_fixnum(arr->items[i]) : !is_string(arr->items[i]))
-            panicf("List::sort sorts a list of ints or a list of strs, got %s and %s.", value_type_name(arr->items[0]),
+        if (nums ? !is_number(arr->items[i]) : !is_string(arr->items[i]))
+            panicf("List::sort sorts a list of numbers or a list of strs, got %s and %s.", value_type_name(arr->items[0]),
                    value_type_name(arr->items[i]));
     }
     qsort(arr->items, (size_t)k, sizeof *arr->items, compare_items);
@@ -1476,26 +1650,28 @@ __attribute__((noinline)) static LumaValue add_slow(LumaValue a, LumaValue b) {
         memcpy(s->bytes + x->len, y->bytes, y->len);
         return (LumaValue)(uintptr_t)s;
     }
+    if (is_number(a) && is_number(b)) return float_arith('+', a, b);
     luma_panic("Operands must be two numbers or two strings.");
 }
 
 LumaValue luma_sub(LumaValue a, LumaValue b) {
-    need_numbers(a, b);
+    if (!(a & b & 1)) return float_arith('-', a, b);
     int64_t r;
     if (__builtin_sub_overflow(fixnum_val(a), fixnum_val(b), &r)) luma_panic("Integer overflow.");
     return make_fixnum_checked(r);
 }
 
 LumaValue luma_mul(LumaValue a, LumaValue b) {
-    need_numbers(a, b);
+    if (!(a & b & 1)) return float_arith('*', a, b);
     int64_t r;
     if (__builtin_mul_overflow(fixnum_val(a), fixnum_val(b), &r)) luma_panic("Integer overflow.");
     return make_fixnum_checked(r);
 }
 
-/* Floor division: rounds toward negative infinity. */
+/* Floor division of ints: rounds toward negative infinity. With a float
+ * operand it is true division. */
 LumaValue luma_div(LumaValue a, LumaValue b) {
-    need_numbers(a, b);
+    if (!(a & b & 1)) return float_arith('/', a, b);
     int64_t x = fixnum_val(a), y = fixnum_val(b);
     if (y == 0) luma_panic("Division by zero.");
     int64_t q = x / y; /* no overflow: |x| <= 2^62 */
@@ -1519,6 +1695,7 @@ __attribute__((noinline, cold, noreturn)) static void not_number(LumaValue a) {
 }
 
 LumaValue luma_neg(LumaValue a) {
+    if (is_float(a)) return make_float(-float_val(a));
     if (!is_fixnum(a)) not_number(a);
     return make_fixnum_checked(-fixnum_val(a));
 }
@@ -1533,6 +1710,7 @@ LumaValue luma_not(LumaValue a) {
 __attribute__((noinline)) static bool values_equal_slow(LumaValue a, LumaValue b) {
     check_valid(a);
     check_valid(b);
+    if (is_float(a) || is_float(b)) return is_number(a) && is_number(b) && compare_numbers(a, b) == 0; /* 1 == 1.0; nan != nan */
     if (a == b) return true;
     if (is_string(a) && is_string(b)) {
         const LumaString *x = as_string(a), *y = as_string(b);
@@ -1549,10 +1727,16 @@ static inline bool values_equal(LumaValue a, LumaValue b) {
 LumaValue luma_eq(LumaValue a, LumaValue b) { return make_bool(values_equal(a, b)); }
 LumaValue luma_ne(LumaValue a, LumaValue b) { return make_bool(!values_equal(a, b)); }
 
-LumaValue luma_lt(LumaValue a, LumaValue b) { need_numbers(a, b); return make_bool(fixnum_val(a) < fixnum_val(b)); }
-LumaValue luma_le(LumaValue a, LumaValue b) { need_numbers(a, b); return make_bool(fixnum_val(a) <= fixnum_val(b)); }
-LumaValue luma_gt(LumaValue a, LumaValue b) { need_numbers(a, b); return make_bool(fixnum_val(a) > fixnum_val(b)); }
-LumaValue luma_ge(LumaValue a, LumaValue b) { need_numbers(a, b); return make_bool(fixnum_val(a) >= fixnum_val(b)); }
+/* Ordered compares of numbers (unordered, with a nan, is false). */
+static int ordered(LumaValue a, LumaValue b) {
+    if (!is_number(a) || !is_number(b)) not_numbers(a, b);
+    return compare_numbers(a, b);
+}
+
+LumaValue luma_lt(LumaValue a, LumaValue b) { int c = ordered(a, b); return make_bool(c == -1); }
+LumaValue luma_le(LumaValue a, LumaValue b) { int c = ordered(a, b); return make_bool(c == -1 || c == 0); }
+LumaValue luma_gt(LumaValue a, LumaValue b) { int c = ordered(a, b); return make_bool(c == 1); }
+LumaValue luma_ge(LumaValue a, LumaValue b) { int c = ordered(a, b); return make_bool(c == 1 || c == 0); }
 
 /* ---- process entry ----------------------------------------------------- */
 
@@ -1629,21 +1813,22 @@ static void mark_from(LumaValue v, unsigned char *marked, PtrVec *stack) {
 /* "2 Node, 1 str" for the live objects whose mark equals `which`. */
 static void describe_objects(const unsigned char *marked, unsigned char which, char *buf, size_t n) {
     uint64_t nstructs = luma_structs[0];
-    uint64_t *counts = calloc(nstructs + 3, sizeof *counts);
+    uint64_t *counts = calloc(nstructs + 4, sizeof *counts);
     if (!counts) luma_panic("Out of memory.");
     for (size_t i = 0; i < live.n; i++) {
         if (marked[i] != which) continue;
         const uint64_t *h = live.items[i];
         if ((*h & 0xff) == LUMA_TYPE_STRUCT) counts[desc_of((const LumaStruct *)h)->id]++;
         else if ((*h & 0xff) == LUMA_TYPE_ARRAY) counts[nstructs + 2]++;
+        else if ((*h & 0xff) == LUMA_TYPE_FLOAT) counts[nstructs + 3]++;
         else counts[nstructs + 1]++;
     }
     buf[0] = '\0';
-    for (uint64_t id = 1; id <= nstructs + 2; id++) {
+    for (uint64_t id = 1; id <= nstructs + 3; id++) {
         if (!counts[id]) continue;
         size_t len = strlen(buf);
         snprintf(buf + len, n - len, "%s%" PRIu64 " %s", len ? ", " : "", counts[id],
-                 id <= nstructs ? struct_name((unsigned)id) : id == nstructs + 1 ? "str" : "array");
+                 id <= nstructs ? struct_name((unsigned)id) : id == nstructs + 1 ? "str" : id == nstructs + 2 ? "array" : "float");
     }
     free(counts);
 }

@@ -77,6 +77,19 @@ for i in range(16):
     print("    mov %s, %s" % (r8[i], r8[(i + 5) % 16]))
     print("    mov %s, [rbp-16]" % r8[i])
     print("    mov [rax+1], %s" % r8[i])
+# scalar SSE2 (floats): every xmm register with every general register
+for i in range(16):
+    x, y = "xmm%d" % i, "xmm%d" % ((i * 7 + 3) % 16)
+    print("    movq %s, %s" % (x, regs[i]))
+    print("    movq %s, %s" % (regs[(i + 5) % 16], x))
+    for op in ["addsd", "subsd", "mulsd", "divsd", "sqrtsd", "ucomisd", "cvtsd2ss", "cvtss2sd"]:
+        print("    %s %s, %s" % (op, x, y))
+    print("    cvtsi2sd %s, %s" % (x, regs[(i + 9) % 16]))
+    print("    cvttsd2si %s, %s" % (regs[(i + 2) % 16], x))
+    print("    addsd %s, qword ptr [rbp-16]" % x)
+    print("    ucomisd %s, qword ptr [%s+8]" % (x, regs[i] if regs[i] != "rsp" else "rax"))
+for cc in ["p", "np", "ae", "be"]:
+    print("    set%s r11b" % cc)
 print("    cqo")
 print("    mov eax, [rbp-4]")
 print("    mov [rsp+8], r9d")

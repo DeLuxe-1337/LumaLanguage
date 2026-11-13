@@ -14,6 +14,13 @@
 
 static IrTy ty_of(const IrTy *state, int v) { return v >= 0 ? state[v] : 0; }
 
+/* + - * / on numbers: int op int is an int, anything with a float a float. */
+static IrTy num_result(IrTy a, IrTy b) {
+    IrTy r = (a & TY_INT) && (b & TY_INT) ? TY_INT : 0;
+    if (((a & TY_FLOAT) && (b & (TY_INT | TY_FLOAT))) || ((b & TY_FLOAT) && (a & TY_INT))) r |= TY_FLOAT;
+    return r;
+}
+
 IrTy ir_types_result(const IrModule *m, const IrInstr *in, const IrTy *st) {
     IrTy a = ty_of(st, in->a), b = ty_of(st, in->b);
     switch (in->op) {
@@ -21,18 +28,24 @@ IrTy ir_types_result(const IrModule *m, const IrInstr *in, const IrTy *st) {
     case IR_CONST_NIL: return TY_NIL;
     case IR_CONST_TRUE:
     case IR_CONST_FALSE: return TY_BOOL;
-    case IR_CONST_DATA: return TY_STR;
+    case IR_CONST_DATA: return in->global >= 0 && in->global < m->nglobals && m->globals[in->global].fbox ? TY_FLOAT : TY_STR;
     case IR_MOV: return a;
-    case IR_ADD: return ((a & TY_INT) && (b & TY_INT) ? TY_INT : 0) | ((a & TY_STR) && (b & TY_STR) ? TY_STR : 0);
+    case IR_ADD: return num_result(a, b) | ((a & TY_STR) && (b & TY_STR) ? TY_STR : 0);
     case IR_SUB:
     case IR_MUL:
-    case IR_DIV:
+    case IR_DIV: return num_result(a, b);
     case IR_MOD: return (a & TY_INT) && (b & TY_INT) ? TY_INT : 0;
-    case IR_NEG: return (a & TY_INT) ? TY_INT : 0;
+    case IR_NEG: return a & (TY_INT | TY_FLOAT);
     case IR_LT:
     case IR_LE:
     case IR_GT:
-    case IR_GE: return (a & TY_INT) && (b & TY_INT) ? TY_BOOL : 0;
+    case IR_GE: return (a & (TY_INT | TY_FLOAT)) && (b & (TY_INT | TY_FLOAT)) ? TY_BOOL : 0;
+    case IR_CONST_F64:
+    case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV:
+    case IR_FNEG:
+    case IR_UNBOX: return TY_F64;
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE: return TY_BOOL;
+    case IR_BOX: return TY_FLOAT;
     case IR_EQ:
     case IR_NE:
     case IR_NOT: return TY_BOOL;
@@ -63,17 +76,26 @@ void ir_types_step(const IrModule *m, const IrInstr *in, IrTy *state) {
     if (in->dst >= 0) state[in->dst] = ir_types_result(m, in, state);
 }
 
-/* After an instruction that raises a runtime error unless an operand is an
- * int, that operand is an int (if it may be one at all). Operands the
- * instruction redefines keep the result type. */
+/* After an instruction that raises a runtime error unless an operand is a
+ * number (an int for mod), that operand is one (if it may be one at all).
+ * Operands the instruction redefines keep the result type. */
+static void refine_to(IrTy *state, int v, int dst, IrTy t) {
+    if (v >= 0 && v != dst && (state[v] & t)) state[v] = ir_ty_inter(state[v], t);
+}
+
 void ir_types_refine(const IrInstr *in, IrTy *state) {
     switch (in->op) {
-    case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+    case IR_MOD:
+        refine_to(state, in->a, in->dst, TY_INT);
+        refine_to(state, in->b, in->dst, TY_INT);
+        break;
+    case IR_SUB: case IR_MUL: case IR_DIV:
     case IR_LT: case IR_LE: case IR_GT: case IR_GE:
-        if (in->b >= 0 && in->b != in->dst && (state[in->b] & TY_INT)) state[in->b] = TY_INT;
+        refine_to(state, in->b, in->dst, TY_INT | TY_FLOAT);
         /* fallthrough */
     case IR_NEG:
-        if (in->a >= 0 && in->a != in->dst && (state[in->a] & TY_INT)) state[in->a] = TY_INT;
+    case IR_UNBOX:
+        refine_to(state, in->a, in->dst, TY_INT | TY_FLOAT);
         break;
     case IR_CHECK:
         if (in->a >= 0 && in->a != in->dst && ir_ty_inter(state[in->a], in->ty)) state[in->a] = ir_ty_inter(state[in->a], in->ty);

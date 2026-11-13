@@ -171,6 +171,10 @@ sed -n '/^fn.run:/,/\.size fn.run/p' "$OUT/cg_loop.s" | grep -v '^ *#' >"$OUT/cg
 check "loop_sum: leaf function needs no frame and calls nothing" sh -c \
     "! grep -q 'push rbp' $OUT/cg_loop.body && ! grep -Eq 'call (luma_add|luma_sub|luma_mul|luma_div|luma_lt)' $OUT/cg_loop.body"
 check "loop_sum: division by 4 is a shift" grep -q 'sar ' "$OUT/cg_loop.body"
+"$LUMA" bench/float_loop.luma -S -o "$OUT/cg_float" >/dev/null 2>&1
+sed -n '/^fn.integrate:/,/\.size fn.integrate/p' "$OUT/cg_float.s" | grep -v '^ *#' >"$OUT/cg_float.body"
+check "typed float loop: raw doubles (SSE), no boxing and no runtime calls but the overflow stub" sh -c \
+    "grep -q 'mulsd ' $OUT/cg_float.body && grep -q 'addsd ' $OUT/cg_float.body && test -z \"\$(grep 'call ' $OUT/cg_float.body | grep -v luma_int_overflow)\""
 "$LUMA" tests/pos/tail_calls.luma -S -o "$OUT/cg_tail" >/dev/null 2>&1
 check "tail calls become jumps" sh -c "grep -q 'jmp fn.count    # tail call' $OUT/cg_tail.s && grep -q 'jmp fn.is_odd    # tail call' $OUT/cg_tail.s"
 "$LUMA" -O1 bench/fib.luma -S -o "$OUT/cg_o1" >/dev/null 2>&1

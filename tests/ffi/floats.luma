@@ -1,0 +1,24 @@
+// Floats over the FFI: f64 / f32 arguments go in xmm registers (counted
+// apart from integer ones), results come back raw; C structs with float
+// fields read and write boxed floats.
+extern fun fmix(a: i64, b: f64, c: i32, d: f32, e: f64, f: i64): f64;
+extern fun fhalf(x: f32): f32;
+extern fun fsum3(a: f64, b: f64, c: f64): f64;
+extern fun ftrunc(x: f64): i64;
+extern struct FVec { x: f64, y: f32, tag: i32 }
+extern fun fvec_scale(v: *FVec, k: f64): void;
+extern fun fvec_len2(v: *FVec): f64;
+
+print(fmix(1, 2.0, 3, 4.5, 0.25, 7));
+print(fhalf(3), fhalf(0.1), fsum3(1, 2.5, 0.25), ftrunc(-7.9));
+var x: float = fsum3(0.5, 0.25, 0.125);
+print(x * 8, fsum3(x, x, x));
+var untyped = fhalf(5);
+print(untyped, Sys::type_of(untyped));
+
+var v = FVec { x: 3, y: 4.0, tag: 1 };
+print(v, fvec_len2(v));
+fvec_scale(v, 0.5);
+print(v.x, v.y, v.tag, FVec::size());
+v.y = 2.25;
+print(v);

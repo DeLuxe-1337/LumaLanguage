@@ -22,6 +22,12 @@ typedef IrTy Ty; /* the IR's types: struct types carry the struct's index (ir.h)
 #define T_BOOL TY_BOOL
 #define T_NIL TY_NIL
 #define T_ANY TY_ANY
+#define T_FLOAT TY_FLOAT /* a boxed float (a value: stored in variables of other types, fields, globals) */
+#define T_F64 TY_F64     /* a raw double: the type of typed float code (`x: float` locals, params, results) */
+
+/* Where a value is stored as a Luma value (struct fields, globals, type
+ * arguments), `float` is a boxed float. */
+static Ty stored(Ty t) { return t == T_F64 ? T_FLOAT : t; }
 
 /* The Luma type a C type converts to/from at an FFI boundary. */
 static Ty ctype_luma(CType c) {
@@ -30,9 +36,13 @@ static Ty ctype_luma(CType c) {
     case CT_CSTR: return T_STR;
     case CT_CSTR_OPT: return T_STR | T_NIL;
     case CT_VOID: return T_NIL;
+    case CT_F32: case CT_F64: return T_F64; /* raw at the call */
     default: return T_INT; /* all integer types and ptr */
     }
 }
+
+/* The Luma type a C struct field reads as (runtime-converted: floats boxed). */
+static Ty cfield_luma(CType c) { return stored(ctype_luma(c)); }
 
 /* ---- lowering state ---- */
 
@@ -146,7 +156,7 @@ typedef struct {
     Ty expect;        /* the type the expression being lowered flows into, or 0 */
     int nstrings;
     int write_fn, space_fn, newline_fn, free_fn; /* runtime externs, created on first use */
-    int dispose_fn, refcount_fn;
+    int dispose_fn, refcount_fn, coerce_fn;
     int intrinsic_fn[64]; /* runtime externs of the prelude's intrinsics (INTRINSICS) */
     int cs_fn[5];         /* luma_cs_init, _get, _set, _addr, _view (C structs) */
     Fn *f;
@@ -290,7 +300,7 @@ static void emit_call(L *l, int dst, int global, const int *args, int nargs, int
 static int string_data(L *l, const char *s, size_t n) {
     for (int g = 0; g < l->m->nglobals; g++) {
         const IrGlobal *gl = &l->m->globals[g];
-        if (gl->kind == IRG_DATA && gl->data_len == n && memcmp(gl->data, s, n) == 0) return g;
+        if (gl->kind == IRG_DATA && !gl->fbox && gl->data_len == n && memcmp(gl->data, s, n) == 0) return g;
     }
     char name[32];
     snprintf(name, sizeof name, "s%d", l->nstrings++);
@@ -309,14 +319,77 @@ static int runtime_extern(L *l, int *slot, const char *name, int arity) {
  * value's static type fits, nothing is emitted; if it cannot possibly fit,
  * that is a compile error; otherwise a runtime guard is inserted. Returns
  * the value's static type after the boundary. */
-static Ty flow(L *l, Val v, Ty slot, const char *what, int line, int col) {
-    if (v.v < 0 || ir_ty_sub(v.ty, slot)) return v.ty;
+static Val flow(L *l, Val v, Ty slot, const char *what, int line, int col) {
+    if (v.v < 0) return v;
     char want[300], got[300];
+    if (slot == T_F64) { /* into typed float code: a raw double */
+        if (v.ty == T_F64) return v;
+        if (!ir_ty_inter(v.ty, T_INT | T_FLOAT)) {
+            ty_name(l, v.ty, got, sizeof got);
+            lerr(l, line, col, "%s expects float, got %s", what, got);
+            return (Val){v.v, slot};
+        }
+        if (!ir_ty_sub(v.ty, T_INT | T_FLOAT)) { /* ints convert, anything else is a runtime error */
+            IrInstr *in = emit(l, IR_CHECK, line);
+            in->dst = v.v;
+            in->a = v.v;
+            in->ty = T_INT | T_FLOAT;
+            in->global = string_data(l, what, strlen(what));
+        }
+        if (fn(l)->blocks[l->f->cur].n > 0) {
+            IrInstr *last = &fn(l)->blocks[l->f->cur].instrs[fn(l)->blocks[l->f->cur].n - 1];
+            if (last->op == IR_CONST_INT && last->dst == v.v && !is_var_vreg(l, v.v)) { /* 3 where a float is wanted */
+                double d = (double)last->imm;
+                last->op = IR_CONST_F64;
+                memcpy(&last->imm, &d, 8);
+                return (Val){v.v, T_F64};
+            }
+        }
+        int t = temp(l);
+        IrInstr *in = emit(l, IR_UNBOX, line);
+        in->dst = t;
+        in->a = v.v;
+        return (Val){t, T_F64};
+    }
+    if (v.ty == T_F64) { /* a raw double into a slot for values: box it */
+        if (!(slot & T_FLOAT)) {
+            ty_name(l, slot, want, sizeof want);
+            lerr(l, line, col, "%s expects %s, got float", what, want);
+            return (Val){v.v, slot};
+        }
+        if (fn(l)->blocks[l->f->cur].n > 0) {
+            IrInstr *last = &fn(l)->blocks[l->f->cur].instrs[fn(l)->blocks[l->f->cur].n - 1];
+            if (last->op == IR_CONST_F64 && last->dst == v.v && !is_var_vreg(l, v.v)) { /* a literal: a static box */
+                double d;
+                memcpy(&d, &last->imm, 8);
+                last->op = IR_CONST_DATA;
+                last->imm = 0;
+                last->global = ir_fbox_for(l->m, d);
+                return (Val){v.v, T_FLOAT};
+            }
+        }
+        int t = temp(l);
+        IrInstr *in = emit(l, IR_BOX, line);
+        in->dst = t;
+        in->a = v.v;
+        return (Val){t, T_FLOAT};
+    }
+    if ((slot & T_FLOAT) && !(slot & T_INT) && (v.ty & T_INT)) { /* an int where a (boxed) float is wanted */
+        if (ir_ty_sub(v.ty, T_INT)) {
+            Val r = flow(l, v, T_F64, what, line, col);
+            return flow(l, r, slot, what, line, col);
+        }
+        int t = temp(l);
+        int g = runtime_extern(l, &l->coerce_fn, "luma_coerce_float", 1);
+        emit_call(l, t, g, &v.v, 1, line);
+        v = (Val){t, (v.ty & ~(Ty)T_INT) | T_FLOAT};
+    }
+    if (ir_ty_sub(v.ty, slot)) return v;
     ty_name(l, slot, want, sizeof want);
     ty_name(l, v.ty, got, sizeof got);
     if (!ir_ty_inter(v.ty, slot)) {
         lerr(l, line, col, "%s expects %s, got %s", what, want, got);
-        return slot;
+        return (Val){v.v, slot};
     }
     /* gradual boundary: `%v = check %v, SLOT, @context` narrows the value in
      * place (the runtime message uses the same wording) */
@@ -325,9 +398,12 @@ static Ty flow(L *l, Val v, Ty slot, const char *what, int line, int col) {
     in->a = v.v;
     in->ty = slot;
     in->global = string_data(l, what, strlen(what));
-    return ir_ty_inter(v.ty, slot);
+    return (Val){v.v, ir_ty_inter(v.ty, slot)};
 }
 
+/* A value as a Luma value (a raw double is boxed): for operands of generic
+ * operations, print, conditions, ... */
+static Val as_value(L *l, Val v, int line) { return v.v >= 0 && v.ty == T_F64 ? flow(l, v, T_ANY, "a value", line, 0) : v; }
 
 static int instantiate(L *l, int gi, const Ty *targs, int line, int col);
 
@@ -344,10 +420,11 @@ static int static_struct_of(L *l, Ty t) {
  * written (int, Point?, nil, any, ...); anything else (int|str, any struct)
  * becomes any. */
 static Ty targ_norm(Ty t) {
+    t = stored(t);
     if (t == 0 || t == T_ANY) return T_ANY;
     int sid = ty_sid(t);
     if ((t & TY_STRUCT) && sid < 0) return T_ANY;
-    int members = __builtin_popcount(t & (T_INT | T_STR | T_BOOL)) + ((t & TY_STRUCT) ? 1 : 0);
+    int members = __builtin_popcount(t & (T_INT | T_STR | T_BOOL | T_FLOAT)) + ((t & TY_STRUCT) ? 1 : 0);
     if (members == 1 || (members == 0 && (t & T_NIL))) return t;
     return T_ANY;
 }
@@ -373,7 +450,7 @@ static Ty resolve_type(L *l, const TypeRef *t) {
             lerr(l, t->line, t->col, "type parameter '%s' takes no type arguments", t->name);
             return T_ANY;
         }
-        return ta->ty == T_ANY ? T_ANY : ir_ty_union(ta->ty, nil);
+        return ta->ty == T_ANY ? T_ANY : ir_ty_union(stored(ta->ty), nil);
     }
     int gi = find_generic(l, t->name);
     if (gi >= 0) {
@@ -397,13 +474,15 @@ static Ty resolve_type(L *l, const TypeRef *t) {
         {"int", T_INT}, {"str", T_STR}, {"bool", T_BOOL}, {"nil", T_NIL}, {"any", T_ANY}};
     for (size_t i = 0; i < sizeof N / sizeof *N; i++)
         if (strcmp(t->name, N[i].name) == 0) return N[i].ty | nil;
+    if (strcmp(t->name, "float") == 0) return nil ? T_FLOAT | T_NIL : T_F64; /* float? is a value: boxed */
+    if (strcmp(t->name, "number") == 0) return T_INT | T_FLOAT | nil;     /* an int or a (boxed) float */
     int si = find_struct(l, t->name);
     if (si >= 0) return ty_struct_of(l->structs[si].sid) | nil;
     CType c;
     if (ctype_from_name(t->name, false, &c) || strcmp(t->name, "f32") == 0 || strcmp(t->name, "f64") == 0)
-        lerr(l, t->line, t->col, "'%s' is a C type; it can only be used in extern declarations (Luma types: int, str, bool, nil, any, or a struct)", t->name);
+        lerr(l, t->line, t->col, "'%s' is a C type; it can only be used in extern declarations (Luma types: int, float, number, str, bool, nil, any, or a struct)", t->name);
     else
-        lerr(l, t->line, t->col, "unknown type '%s' (Luma types: int, str, bool, nil, any, or a struct)", t->name);
+        lerr(l, t->line, t->col, "unknown type '%s' (Luma types: int, float, number, str, bool, nil, any, or a struct)", t->name);
     return T_ANY;
 }
 
@@ -451,6 +530,11 @@ static int extern_struct_type(L *l, const TypeRef *t, bool is_return, CType *ct,
         lerr(l, t->line, t->col, "a C struct passed by value cannot be nil; use *%s? for a pointer that may be NULL", t->name);
         return -1;
     }
+    for (int k = 0; k < l->m->structs[sid].ncf; k++)
+        if (l->m->structs[sid].cftys[k] == CT_F32 || l->m->structs[sid].cftys[k] == CT_F64) {
+            lerr(l, t->line, t->col, "C struct '%s' has floating-point fields: pass it by pointer (*%s)", t->name, t->name);
+            return -1;
+        }
     if (l->m->structs[sid].csize > 16) {
         lerr(l, t->line, t->col, "C struct '%s' is %d bytes: structs larger than 16 bytes are passed by pointer here (*%s)",
              t->name, l->m->structs[sid].csize, t->name);
@@ -466,19 +550,16 @@ static int cstruct_of(L *l, Ty t);
 /* Resolves a C type in an extern declaration. */
 static CType resolve_ctype(L *l, const TypeRef *t, bool is_return) {
     CType c = CT_I64;
-    if (strcmp(t->name, "f32") == 0 || strcmp(t->name, "f64") == 0) {
-        lerr(l, t->line, t->col, "floating-point C types are not supported yet");
-        return c;
-    }
     if (!ctype_from_name(t->name, t->nullable, &c)) {
         if (t->nullable && ctype_from_name(t->name, false, &c))
             lerr(l, t->line, t->col, "only cstr has a nullable form (cstr?); '%s?' is not a C type", t->name);
         else if (strcmp(t->name, "int") == 0 || strcmp(t->name, "str") == 0 || strcmp(t->name, "bool") == 0 ||
-                 strcmp(t->name, "nil") == 0 || strcmp(t->name, "any") == 0)
+                 strcmp(t->name, "nil") == 0 || strcmp(t->name, "any") == 0 || strcmp(t->name, "float") == 0 ||
+                 strcmp(t->name, "number") == 0)
             lerr(l, t->line, t->col, "'%s' is a Luma type; extern declarations use C types "
-                 "(i8..i64, u8..u64, bool, cstr, cstr?, ptr, void)", t->name);
+                 "(i8..i64, u8..u64, f32, f64, bool, cstr, cstr?, ptr, void)", t->name);
         else
-            lerr(l, t->line, t->col, "unknown C type '%s' (i8..i64, u8..u64, bool, cstr, cstr?, ptr, void)", t->name);
+            lerr(l, t->line, t->col, "unknown C type '%s' (i8..i64, u8..u64, f32, f64, bool, cstr, cstr?, ptr, void)", t->name);
         return CT_I64;
     }
     if (c == CT_VOID && !is_return) lerr(l, t->line, t->col, "'void' is only allowed as a return type");
@@ -626,28 +707,58 @@ static const char *op_text(TokenKind k) {
     }
 }
 
-/* Static result type of a binary operator, or 0 (with an error) when the
- * operand types make it fail on every execution. */
+/* + - * / of numbers: int op int is an int, anything with a float a float
+ * (the IR's rule, ir_types.c). */
+static Ty num_result(Ty a, Ty b) {
+    Ty r = (a & T_INT) && (b & T_INT) ? T_INT : 0;
+    if (((a & T_FLOAT) && (b & (T_INT | T_FLOAT))) || ((b & T_FLOAT) && (a & T_INT))) r |= T_FLOAT;
+    return r;
+}
+
+/* Static result type of a generic binary operator (operands are values, not
+ * raw doubles), or 0 (with an error) when the operand types make it fail on
+ * every execution. */
 static Ty binary_type(L *l, const Expr *e, Ty a, Ty b) {
     char ta[300], tb[300];
     switch (e->op) {
     case TOK_EQUAL_EQUAL:
     case TOK_BANG_EQUAL: return T_BOOL;
     case TOK_PLUS: {
-        Ty r = ((a & T_INT) && (b & T_INT) ? T_INT : 0) | ((a & T_STR) && (b & T_STR) ? T_STR : 0);
+        Ty r = num_result(a, b) | ((a & T_STR) && (b & T_STR) ? T_STR : 0);
         if (r) return r;
         ty_name(l, a, ta, sizeof ta);
         ty_name(l, b, tb, sizeof tb);
-        lerr(l, e->line, e->col, "operands of '+' must be two ints or two strs, got %s and %s", ta, tb);
+        lerr(l, e->line, e->col, "operands of '+' must be two numbers or two strs, got %s and %s", ta, tb);
         return 0;
     }
     default: {
-        if ((a & T_INT) && (b & T_INT)) return (e->op == TOK_MINUS || e->op == TOK_STAR || e->op == TOK_SLASH) ? T_INT : T_BOOL;
+        bool arith = e->op == TOK_MINUS || e->op == TOK_STAR || e->op == TOK_SLASH;
+        if ((a & (T_INT | T_FLOAT)) && (b & (T_INT | T_FLOAT))) return arith ? num_result(a, b) : T_BOOL;
         ty_name(l, a, ta, sizeof ta);
         ty_name(l, b, tb, sizeof tb);
-        lerr(l, e->line, e->col, "operands of '%s' must be ints, got %s and %s", op_text(e->op), ta, tb);
+        lerr(l, e->line, e->col, "operands of '%s' must be numbers, got %s and %s", op_text(e->op), ta, tb);
         return 0;
     }
+    }
+}
+
+/* Is a value of type t statically a float (raw or boxed)? */
+static bool is_floaty(Ty t) { return t == T_F64 || (t && ir_ty_sub(t, T_FLOAT)); }
+/* ... statically a number of either kind? */
+static bool is_numeric(Ty t) { return t == T_F64 || (t && ir_ty_sub(t, T_INT | T_FLOAT)); }
+
+static IrOp float_op(TokenKind k) {
+    switch (k) {
+    case TOK_PLUS: return IR_FADD;
+    case TOK_MINUS: return IR_FSUB;
+    case TOK_STAR: return IR_FMUL;
+    case TOK_SLASH: return IR_FDIV;
+    case TOK_EQUAL_EQUAL: return IR_FEQ;
+    case TOK_BANG_EQUAL: return IR_FNE;
+    case TOK_LESS: return IR_FLT;
+    case TOK_LESS_EQUAL: return IR_FLE;
+    case TOK_GREATER: return IR_FGT;
+    default: return IR_FGE;
     }
 }
 
@@ -678,11 +789,6 @@ static void release_held(L *l, int mark, int line) {
     f->nheld = mark;
 }
 
-static Val lower_into(L *l, const Expr *e, int dst) {
-    Val v = lower_expr(l, e, dst);
-    if (v.v >= 0) emit_mov(l, dst, v.v, e->line);
-    return v.v >= 0 ? (Val){dst, v.ty} : NO_VAL;
-}
 
 /* Lowers a list of operands left to right. If a later operand assigns to a
  * local variable that an earlier operand merely named, the earlier value is
@@ -743,6 +849,7 @@ static const struct {
     {"__argv", "luma_argv", 1, T_ANY},
     {"__mem_string", "luma_mem_string", 2, T_ANY},
     {"__mem_write", "luma_mem_write", 2, T_ANY},
+    {"__str_to_float", "luma_str_to_float", 1, T_ANY},
 };
 
 static bool in_prelude(L *l) {
@@ -765,6 +872,7 @@ static Val lower_intrinsic(L *l, const Expr *e, int hint) {
     }
     Val v[4];
     if (!lower_operands(l, e->args, e->nargs, v)) return NO_VAL;
+    for (size_t i = 0; i < e->nargs; i++) v[i] = as_value(l, v[i], e->args[i]->line);
     int d = hint >= 0 ? hint : -1;
     Val r = result(l, hint, &d);
     int g = runtime_extern(l, &l->intrinsic_fn[k], INTRINSICS[k].symbol, INTRINSICS[k].arity);
@@ -806,6 +914,8 @@ static Val lower_call(L *l, const Expr *e, int hint) {
     int *args = xmalloc((e->nargs ? e->nargs : 1) * sizeof *args);
     Val r = NO_VAL;
     if (!lower_operands(l, e->args, e->nargs, vals)) goto done;
+    if (n.kind == NAME_BUILTIN) /* print, free, ...: values */
+        for (size_t i = 0; i < e->nargs; i++) vals[i] = as_value(l, vals[i], e->args[i]->line);
     for (size_t i = 0; i < e->nargs; i++) args[i] = vals[i].v;
     int d = hint >= 0 ? hint : -1;
     if (n.kind == NAME_FUNCTION)
@@ -888,7 +998,7 @@ static Val lower_call(L *l, const Expr *e, int hint) {
                 char what[300];
                 snprintf(what, sizeof what, "argument '%s' of '%s'", x->decl->params[i], x->name);
                 Ty want = ty_struct_of(x->psid[i]) | (x->pnull[i] ? T_NIL : 0);
-                vals[i].ty = flow(l, vals[i], want, what, e->args[i]->line, e->args[i]->col);
+                vals[i] = flow(l, vals[i], want, what, e->args[i]->line, e->args[i]->col);
                 if (l->failed) goto done;
                 if (x->ctypes[i] == CT_PTR) {
                     int a = temp(l);
@@ -899,6 +1009,14 @@ static Val lower_call(L *l, const Expr *e, int hint) {
                     cargs[nc++] = vals[i].v;
                     if (l->m->structs[x->psid[i]].csize > 8) cargs[nc++] = vals[i].v;
                 }
+                continue;
+            }
+            if (x->ctypes[i] == CT_F32 || x->ctypes[i] == CT_F64) { /* passed raw */
+                char what[300];
+                snprintf(what, sizeof what, "argument '%s' of '%s'", x->decl->params[i], x->name);
+                vals[i] = flow(l, vals[i], T_F64, what, e->args[i]->line, e->args[i]->col);
+                if (l->failed) goto done;
+                cargs[nc++] = vals[i].v;
                 continue;
             }
             cargs[nc++] = vals[i].v;
@@ -937,10 +1055,11 @@ static Val lower_call(L *l, const Expr *e, int hint) {
                 emit_call(l, d, runtime_extern(l, &l->cs_fn[4], "luma_cs_view", 3), vargs, 3, e->line);
                 Ty t = ty_struct_of(x->rsid) | (x->rnull ? T_NIL : 0);
                 r.ty = T_ANY;
-                r.ty = flow(l, r, t, what, e->line, e->col); /* (the view is exactly that) */
+                r = flow(l, r, t, what, e->line, e->col); /* (the view is exactly that) */
             }
             goto done;
         }
+        if ((x->cret == CT_F32 || x->cret == CT_F64) && hint >= 0) d = -1; /* a raw result: a fresh temp */
         r = result(l, hint, &d);
         emit_call(l, hint == DISCARD ? IR_NONE : d, x->global, cargs, nc, e->line);
         for (int i = 0; i < nkept; i++) emit(l, IR_KEEP, e->line)->a = kept[i];
@@ -949,7 +1068,7 @@ static Val lower_call(L *l, const Expr *e, int hint) {
             char what[300];
             snprintf(what, sizeof what, "the result of %s", x->name);
             r.ty = T_ANY;
-            r.ty = flow(l, r, ty_struct_of(x->rsid), what, e->line, e->col);
+            r = flow(l, r, ty_struct_of(x->rsid), what, e->line, e->col);
         }
         goto done;
     }
@@ -957,9 +1076,11 @@ static Val lower_call(L *l, const Expr *e, int hint) {
     for (size_t i = 0; i < e->nargs; i++) {
         char what[300];
         snprintf(what, sizeof what, "argument '%s' of '%s'", fi->decl->params[i], fi->name);
-        flow(l, vals[i], fi->ptypes[i], what, e->args[i]->line, e->args[i]->col);
+        vals[i] = flow(l, vals[i], fi->ptypes[i], what, e->args[i]->line, e->args[i]->col);
+        args[i] = vals[i].v;
     }
     if (l->failed) goto done;
+    if (fi->ret == T_F64 && hint >= 0) d = -1; /* a raw result: a fresh temp, not the hint */
     r = result(l, hint, &d);
     emit_call(l, hint == DISCARD ? IR_NONE : d, fi->global, args, (int)e->nargs, e->line);
     r.ty = fi->ret;
@@ -980,12 +1101,11 @@ static Val call_fn(L *l, const FnInfo *fi, const Val *vals, Expr *const *at, int
     for (int i = 0; i < n; i++) {
         char what[300];
         snprintf(what, sizeof what, "argument '%s' of '%s'", fi->decl->params[i], fi->name);
-        flow(l, vals[i], fi->ptypes[i], what, at && at[i] ? at[i]->line : line, at && at[i] ? at[i]->col : col);
-        args[i] = vals[i].v;
+        args[i] = flow(l, vals[i], fi->ptypes[i], what, at && at[i] ? at[i]->line : line, at && at[i] ? at[i]->col : col).v;
     }
     Val r = NO_VAL;
     if (!l->failed) {
-        int d = hint >= 0 ? hint : -1;
+        int d = hint >= 0 && fi->ret != T_F64 ? hint : -1; /* (a raw result: a fresh temp) */
         r = result(l, hint, &d);
         emit_call(l, hint == DISCARD ? IR_NONE : d, fi->global, args, n, line);
         r.ty = fi->ret;
@@ -1036,7 +1156,7 @@ static Val cstruct_field(L *l, int si, Val obj, const Expr *e, Val *set, int hin
             lerr(l, e->line, e->col, "%s is a C string: it can be read, not written (its memory belongs to C)", what);
             return NO_VAL;
         }
-        set->ty = flow(l, *set, ctype_luma(ct), what, e->right->line, e->right->col);
+        *set = flow(l, *set, cfield_luma(ct), what, e->right->line, e->right->col);
         int args[3] = {obj.v, ki, set->v};
         emit_call(l, IR_NONE, runtime_extern(l, &l->cs_fn[2], "luma_cs_set", 3), args, 3, e->line);
         if (hint >= 0) {
@@ -1049,7 +1169,7 @@ static Val cstruct_field(L *l, int si, Val obj, const Expr *e, Val *set, int hin
     int args[2] = {obj.v, ki};
     emit_call(l, d, runtime_extern(l, &l->cs_fn[1], "luma_cs_get", 2), args, 2, e->line);
     Val r = {d, T_ANY};
-    r.ty = flow(l, r, ctype_luma(ct), what, e->line, e->col); /* (the runtime converted it to exactly this) */
+    r = flow(l, r, cfield_luma(ct), what, e->line, e->col); /* (the runtime converted it to exactly this) */
     if (hint >= 0) {
         emit_mov(l, hint, d, e->line);
         r.v = hint;
@@ -1095,7 +1215,7 @@ static Val cstruct_literal(L *l, int si, const Expr *e, int hint) {
         int k = ir_cstruct_field(st, e->fields[i]);
         char what[600];
         snprintf(what, sizeof what, "field '%s' of %s", e->fields[i], st->name);
-        vals[i].ty = flow(l, vals[i], ctype_luma(st->cftys[k]), what, e->args[i]->line, e->args[i]->col);
+        vals[i] = flow(l, vals[i], cfield_luma(st->cftys[k]), what, e->args[i]->line, e->args[i]->col);
         int args[3] = {o, const_int(l, k, e->line), vals[i].v};
         emit_call(l, IR_NONE, runtime_extern(l, &l->cs_fn[2], "luma_cs_set", 3), args, 3, e->line);
     }
@@ -1136,15 +1256,15 @@ static bool cstruct_builtin(L *l, int si, const Expr *e, int hint, Val *out) {
     snprintf(what, sizeof what, "argument of %s::%s", st->name, e->str);
     int d = hint >= 0 ? hint : temp(l);
     if (addr) { /* the address of its C memory */
-        v.ty = flow(l, v, ty_struct_of(sid), what, e->args[0]->line, e->args[0]->col);
+        v = flow(l, v, ty_struct_of(sid), what, e->args[0]->line, e->args[0]->col);
         emit_call(l, d, runtime_extern(l, &l->cs_fn[3], "luma_cs_addr", 1), &v.v, 1, e->line);
         Val r = {d, T_ANY};
-        r.ty = flow(l, r, T_INT, what, e->line, e->col);
+        r = flow(l, r, T_INT, what, e->line, e->col);
         *out = r;
         return true;
     }
     /* at: a view of the C struct at that address (memory C owns) */
-    v.ty = flow(l, v, T_INT, what, e->args[0]->line, e->args[0]->col);
+    v = flow(l, v, T_INT, what, e->args[0]->line, e->args[0]->col);
     int z = const_int(l, 0, e->line), o = temp(l);
     IrInstr *in = emit(l, IR_NEW, e->line);
     in->dst = o;
@@ -1160,7 +1280,7 @@ static bool cstruct_builtin(L *l, int si, const Expr *e, int hint, Val *out) {
     c->global = string_data(l, what, strlen(what));
     emit_call(l, d, runtime_extern(l, &l->cs_fn[4], "luma_cs_view", 3), vargs, 3, e->line);
     Val r = {d, T_ANY};
-    r.ty = flow(l, r, ty_struct_of(sid), what, e->line, e->col);
+    r = flow(l, r, ty_struct_of(sid), what, e->line, e->col);
     *out = r;
     return true;
 }
@@ -1443,7 +1563,7 @@ static Val lower_struct_literal(L *l, const Expr *e, int hint, Ty expect) {
                 char what[700];
                 snprintf(what, sizeof what, "field '%s' of '%s'", ir->fields[k], disp);
                 const Expr *a = e->args[where[k]];
-                flow(l, vals[where[k]], l->m->structs[st->sid].ftys[k], what, a->line, a->col);
+                vals[where[k]] = flow(l, vals[where[k]], l->m->structs[st->sid].ftys[k], what, a->line, a->col);
                 args[k] = vals[where[k]].v;
             }
             if (!l->failed) {
@@ -1512,10 +1632,11 @@ static Val lower_field(L *l, const Expr *e, int hint) {
         if (set) {
             char what[700];
             snprintf(what, sizeof what, "field '%s' of '%s'", ir->fields[k], sn);
-            v[1].ty = flow(l, v[1], ir->ftys[k], what, e->right->line, e->right->col);
+            v[1] = flow(l, v[1], ir->ftys[k], what, e->right->line, e->right->col);
             if (l->failed) return NO_VAL;
         }
     }
+    if (set) v[1] = as_value(l, v[1], e->line); /* (a dynamic field holds a value) */
     IrInstr *in = emit(l, set ? IR_SETFIELD : IR_GETFIELD, e->line);
     in->a = v[0].v;
     in->sid = sid;
@@ -1596,6 +1717,7 @@ static Val lower_method_call(L *l, const Expr *e, int hint) {
         goto done;
     }
     {
+        for (size_t i = 1; i < n; i++) vals[i] = as_value(l, vals[i], e->line); /* (dynamic calls pass values) */
         int d = hint >= 0 ? hint : -1;
         r = result(l, hint, &d);
         IrInstr *in = emit(l, IR_CALLM, e->line);
@@ -1672,6 +1794,7 @@ static Val lower_assoc_call(L *l, const Expr *e, int hint, Ty expect) {
                 /* the receiver's instance is only known at run time: a method call */
                 free(pats);
                 free(tys);
+                for (size_t k = 1; k < e->nargs; k++) vals[k] = as_value(l, vals[k], e->line);
                 int d = hint >= 0 ? hint : -1;
                 r = result(l, hint, &d);
                 IrInstr *in = emit(l, IR_CALLM, e->line);
@@ -1725,9 +1848,16 @@ static Val assign_to(L *l, const Expr *e, Name n, int hint) {
     snprintf(what, sizeof what, "variable '%s'", e->name);
     if (n.kind == NAME_LOCAL) {
         l->expect = n.ty;
-        Val v = lower_into(l, e->right, n.index);
+        /* the value is written to the variable directly when no conversion
+         * is needed; a raw double (in a fresh temp) is unboxed / boxed first */
+        Val v = lower_expr(l, e->right, n.ty == T_F64 ? -1 : n.index);
         if (v.v < 0) return NO_VAL;
-        v.ty = flow(l, v, n.ty, what, e->right->line, e->right->col);
+        v = flow(l, v, n.ty, what, e->right->line, e->right->col);
+        if (v.v != n.index) {
+            emit_mov(l, n.index, v.v, e->line);
+            v.v = n.index;
+        }
+        if (n.ty == T_F64) return v; /* (not into the hint: it may hold values) */
         if (hint >= 0) {
             emit_mov(l, hint, n.index, e->line);
             v.v = hint;
@@ -1735,9 +1865,13 @@ static Val assign_to(L *l, const Expr *e, Name n, int hint) {
         return v;
     }
     l->expect = n.ty;
-    Val v = lower_expr(l, e->right, hint >= 0 ? hint : -1);
+    Val v = lower_expr(l, e->right, -1);
     if (v.v < 0) return NO_VAL;
-    v.ty = flow(l, v, n.ty, what, e->right->line, e->right->col);
+    v = flow(l, v, n.ty, what, e->right->line, e->right->col);
+    if (hint >= 0) {
+        emit_mov(l, hint, v.v, e->line);
+        v.v = hint;
+    }
     IrInstr *in = emit(l, IR_STORE, e->line);
     in->global = l->gvars[n.index].global;
     in->a = v.v;
@@ -1779,6 +1913,19 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
         in->dst = d;
         in->imm = e->ival;
         return (Val){d, T_INT};
+    case EXPR_FLOAT:
+        if ((expect & T_FLOAT) && expect != T_F64) { /* flows into a value: a static boxed float */
+            if (d < 0) d = temp(l);
+            in = emit(l, IR_CONST_DATA, e->line);
+            in->dst = d;
+            in->global = ir_fbox_for(l->m, e->fval);
+            return (Val){d, T_FLOAT};
+        }
+        d = temp(l); /* raw (never the hint: it may be a variable that holds values) */
+        in = emit(l, IR_CONST_F64, e->line);
+        in->dst = d;
+        memcpy(&in->imm, &e->fval, 8);
+        return (Val){d, T_F64};
     case EXPR_STRING: {
         int g = string_data(l, e->str, e->str_len);
         if (d < 0) d = temp(l);
@@ -1797,7 +1944,7 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
     case EXPR_VAR: {
         Name n = resolve_variable(l, e->name, e->line, e->col);
         if (n.kind == NAME_LOCAL) {
-            if (d >= 0) {
+            if (d >= 0 && n.ty != T_F64) { /* (a raw double never goes to a hint: it may hold values) */
                 emit_mov(l, d, n.index, e->line);
                 return (Val){d, n.ty};
             }
@@ -1821,17 +1968,33 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
         return assign_to(l, e, n, hint);
     }
     case EXPR_UNARY: {
+        if (e->op == TOK_MINUS && e->right->kind == EXPR_FLOAT) { /* -1.5: a literal */
+            Expr neg = *e->right;
+            neg.fval = -neg.fval;
+            neg.line = e->line;
+            neg.col = e->col;
+            return lower_expr_at(l, &neg, hint, expect);
+        }
         Val a = lower_expr(l, e->right, -1);
         if (a.v < 0) return NO_VAL;
         Ty t = T_BOOL;
+        if (e->op == TOK_MINUS && is_floaty(a.ty)) {
+            a = flow(l, a, T_F64, "operand of '-'", e->line, e->col);
+            int r = temp(l);
+            in = emit(l, IR_FNEG, e->line);
+            in->dst = r;
+            in->a = a.v;
+            return (Val){r, T_F64};
+        }
+        a = as_value(l, a, e->line);
         if (e->op == TOK_MINUS) {
-            if (!(a.ty & T_INT)) {
+            if (!(a.ty & (T_INT | T_FLOAT))) {
                 char ta[300];
                 ty_name(l, a.ty, ta, sizeof ta);
-                lerr(l, e->line, e->col, "operand of '-' must be int, got %s", ta);
+                lerr(l, e->line, e->col, "operand of '-' must be a number, got %s", ta);
                 return NO_VAL;
             }
-            t = T_INT;
+            t = a.ty & (T_INT | T_FLOAT);
         }
         if (d < 0) d = temp(l);
         in = emit(l, e->op == TOK_MINUS ? IR_NEG : IR_NOT, e->line);
@@ -1843,6 +2006,31 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
         Expr *ops[2] = {e->left, e->right};
         Val v[2];
         if (!lower_operands(l, ops, 2, v)) return NO_VAL;
+        bool eqop = e->op == TOK_EQUAL_EQUAL || e->op == TOK_BANG_EQUAL;
+        bool fl = is_floaty(v[0].ty) || is_floaty(v[1].ty);
+        if (fl && (eqop ? is_numeric(v[0].ty) && is_numeric(v[1].ty)
+                        : (v[0].ty == T_F64 || ir_ty_inter(v[0].ty, T_INT | T_FLOAT)) &&
+                              (v[1].ty == T_F64 || ir_ty_inter(v[1].ty, T_INT | T_FLOAT)))) {
+            /* float arithmetic / compares: on raw doubles */
+            char what[64];
+            snprintf(what, sizeof what, "operand of '%s'", eqop ? (e->op == TOK_EQUAL_EQUAL ? "==" : "!=") : op_text(e->op));
+            v[0] = flow(l, v[0], T_F64, what, e->left->line, e->left->col);
+            v[1] = flow(l, v[1], T_F64, what, e->right->line, e->right->col);
+            if (l->failed) return NO_VAL;
+            int r = temp(l);
+            in = emit(l, float_op(e->op), e->line);
+            in->dst = r;
+            in->a = v[0].v;
+            in->b = v[1].v;
+            bool arith = e->op == TOK_PLUS || e->op == TOK_MINUS || e->op == TOK_STAR || e->op == TOK_SLASH;
+            if (!arith && d >= 0) {
+                emit_mov(l, d, r, e->line);
+                r = d;
+            }
+            return (Val){r, arith ? T_F64 : T_BOOL};
+        }
+        v[0] = as_value(l, v[0], e->left->line);
+        v[1] = as_value(l, v[1], e->right->line);
         Ty t = binary_type(l, e, v[0].ty, v[1].ty);
         if (!t) return NO_VAL;
         if (d < 0) d = temp(l);
@@ -1858,8 +2046,9 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
          * r is always a fresh temp: writing a variable hint early would be
          * visible to the right operand. The result is one of the operands. */
         int r = temp(l);
-        Val a = lower_into(l, e->left, r);
-        if (l->failed) return NO_VAL;
+        Val a = as_value(l, lower_expr(l, e->left, -1), e->line);
+        if (l->failed || a.v < 0) return NO_VAL;
+        emit_mov(l, r, a.v, e->line);
         int n = l->f->nlabels++;
         bool is_or = e->op == TOK_OR;
         int rhs = new_block(l, is_or ? "or.rhs" : "and.rhs", n);
@@ -1868,7 +2057,8 @@ static Val lower_expr_at(L *l, const Expr *e, int hint, Ty expect) {
         else emit_br(l, r, rhs, end, e->line);
         set_block(l, rhs);
         int mark = l->f->nheld; /* the right operand's temporaries end in its own block */
-        Val b = lower_into(l, e->right, r);
+        Val b = as_value(l, lower_expr(l, e->right, -1), e->line);
+        if (b.v >= 0) emit_mov(l, r, b.v, e->line);
         release_held(l, mark, e->line);
         emit_jmp(l, end, e->line);
         set_block(l, end);
@@ -1927,7 +2117,7 @@ static void lower_var(L *l, const Stmt *s) {
             v = (Val){temp(l), T_NIL};
             emit(l, IR_CONST_NIL, s->line)->dst = v.v;
         }
-        flow(l, v, l->gvars[g].ty, what, s->expr ? s->expr->line : s->line, s->expr ? s->expr->col : s->col);
+        v = flow(l, v, l->gvars[g].ty, what, s->expr ? s->expr->line : s->line, s->expr ? s->expr->col : s->col);
         IrInstr *in = emit(l, IR_STORE, s->line);
         in->global = l->gvars[g].global;
         in->a = v.v;
@@ -1945,8 +2135,11 @@ static void lower_var(L *l, const Stmt *s) {
     int v = new_var_vreg(l, s->name);
     if (s->expr) {
         l->expect = ty;
-        Val iv = lower_into(l, s->expr, v);
-        if (iv.v >= 0) flow(l, iv, ty, what, s->expr->line, s->expr->col);
+        Val iv = lower_expr(l, s->expr, ty == T_F64 ? -1 : v); /* (see assign_to) */
+        if (iv.v >= 0) {
+            iv = flow(l, iv, ty, what, s->expr->line, s->expr->col);
+            if (iv.v != v) emit_mov(l, v, iv.v, s->line);
+        }
     } else {
         emit(l, IR_CONST_NIL, s->line)->dst = v;
     }
@@ -1992,7 +2185,9 @@ static void lower_stmt_at(L *l, const Stmt *s) {
         if (fi) {
             char what[300];
             snprintf(what, sizeof what, "return value of '%s'", fi->name);
-            flow(l, v, fi->ret, what, s->expr ? s->expr->line : s->line, s->expr ? s->expr->col : s->col);
+            v = flow(l, v, fi->ret, what, s->expr ? s->expr->line : s->line, s->expr ? s->expr->col : s->col);
+        } else {
+            v = as_value(l, v, s->line); /* top-level code returns a value */
         }
         leave_exits(l, 0, s->line); /* leave the arena and with blocks we are in */
         emit(l, IR_RET, s->line)->a = v.v;
@@ -2005,7 +2200,7 @@ static void lower_stmt_at(L *l, const Stmt *s) {
         pop_scope(l);
         return;
     case STMT_IF: {
-        Val c = lower_expr(l, s->expr, -1);
+        Val c = as_value(l, lower_expr(l, s->expr, -1), s->line);
         if (c.v < 0) return;
         int n = l->f->nlabels++;
         int then_b = new_block(l, "if.then", n);
@@ -2035,7 +2230,7 @@ static void lower_stmt_at(L *l, const Stmt *s) {
              * unreachable (it matters for "missing return" checks) */
             emit_jmp(l, body_b, s->line);
         } else {
-            Val c = lower_expr(l, s->expr, -1);
+            Val c = as_value(l, lower_expr(l, s->expr, -1), s->line);
             if (c.v < 0) return;
             emit_br(l, c.v, body_b, end_b, s->line);
         }
@@ -2195,7 +2390,7 @@ static bool name_taken(L *l, const Stmt *s) {
 }
 
 static bool is_type_name(const char *n) {
-    static const char *const T[] = {"int", "str", "bool", "nil", "any", "struct", "self"};
+    static const char *const T[] = {"int", "float", "number", "str", "bool", "nil", "any", "struct", "self"};
     for (size_t i = 0; i < sizeof T / sizeof *T; i++)
         if (strcmp(n, T[i]) == 0) return true;
     return false;
@@ -2269,7 +2464,7 @@ static void collect_structs(L *l, const Program *prog) {
                 const TypeRef *t = &s->param_types[k];
                 if (!t->name || t->pointer || t->nargs || !ctype_from_name(t->name, t->nullable, &ct[k]) || !ctype_is_field(ct[k]))
                     lerr(l, t->name ? t->line : s->param_line[k], t->name ? t->col : s->param_col[k],
-                         "field '%s' of C struct '%s' needs a C type: i8..i64, u8..u64, bool, ptr, cstr or cstr?",
+                         "field '%s' of C struct '%s' needs a C type: i8..i64, u8..u64, f32, f64, bool, ptr, cstr or cstr?",
                          s->params[k], s->name);
             }
             if (!l->failed)
@@ -2282,7 +2477,7 @@ static void collect_structs(L *l, const Program *prog) {
             for (size_t j = 0; j < k; j++)
                 if (strcmp(s->params[k], s->params[j]) == 0)
                     lerr(l, s->param_line[k], s->param_col[k], "duplicate field '%s'", s->params[k]);
-            tys[k] = resolve_type(l, &s->param_types[k]);
+            tys[k] = stored(resolve_type(l, &s->param_types[k]));
         }
         ir_struct_set_fields(l->m, l->structs[si].sid, (int)s->nparams, (const char *const *)s->params, tys);
         free(tys);
@@ -2514,7 +2709,7 @@ static int instantiate(L *l, int gi, const Ty *targs_in, int line, int col) {
     l->tenv = env;
     l->ntenv = (int)n;
     Ty *tys = xmalloc((d->nparams ? d->nparams : 1) * sizeof *tys);
-    for (size_t k = 0; k < d->nparams; k++) tys[k] = resolve_type(l, &d->param_types[k]);
+    for (size_t k = 0; k < d->nparams; k++) tys[k] = stored(resolve_type(l, &d->param_types[k]));
     ir_struct_set_fields(l->m, sid, (int)d->nparams, (const char *const *)d->params, tys);
     free(tys);
     l->tenv = saved;
@@ -2544,7 +2739,7 @@ static int instantiate(L *l, int gi, const Ty *targs_in, int line, int col) {
  *                                     %r = call @m.P.f(%self, %a)  ret %r }
  * Returns the global to register in the struct's method table. */
 static int dynamic_entry(L *l, const FnInfo *fi) {
-    bool typed = false;
+    bool typed = fi->ret == T_F64; /* a raw result is boxed for the caller */
     for (int k = 1; k < fi->arity; k++) typed |= fi->ptypes[k] != T_ANY;
     if (!typed) return fi->global;
     char sym[700];
@@ -2560,13 +2755,24 @@ static int dynamic_entry(L *l, const FnInfo *fi) {
     IrFunc *f = &l->m->funcs[wf];
     for (int k = 0; k < fi->arity; k++) ir_func_new_vreg(f, fi->decl->params[k]);
     int b = ir_func_block(f, "entry");
+    int *argv = xmalloc((size_t)fi->arity * sizeof *argv);
     for (int k = 0; k < fi->arity; k++) {
+        argv[k] = k;
         if (ctx[k] < 0) continue;
         IrInstr *in = ir_emit(f, b, IR_CHECK);
         in->dst = in->a = k;
-        in->ty = fi->ptypes[k];
+        in->ty = fi->ptypes[k] == T_F64 ? T_INT | T_FLOAT : fi->ptypes[k];
         in->global = ctx[k];
         in->line = fi->decl->line;
+        if (fi->ptypes[k] == T_F64) { /* a float parameter takes the raw double */
+            char vn[32];
+            snprintf(vn, sizeof vn, "raw%d", k);
+            argv[k] = ir_func_new_vreg(f, vn);
+            in = ir_emit(f, b, IR_UNBOX);
+            in->dst = argv[k];
+            in->a = k;
+            in->line = fi->decl->line;
+        }
     }
     int r = ir_func_new_vreg(f, "0");
     IrInstr *in = ir_emit(f, b, IR_CALL);
@@ -2574,12 +2780,21 @@ static int dynamic_entry(L *l, const FnInfo *fi) {
     in->global = fi->global;
     in->nargs = fi->arity;
     in->args = xmalloc((size_t)fi->arity * sizeof(int));
-    for (int k = 0; k < fi->arity; k++) in->args[k] = k;
+    for (int k = 0; k < fi->arity; k++) in->args[k] = argv[k];
     in->line = fi->decl->line;
+    if (fi->ret == T_F64) {
+        int bx = ir_func_new_vreg(f, "boxed");
+        in = ir_emit(f, b, IR_BOX);
+        in->dst = bx;
+        in->a = r;
+        in->line = fi->decl->line;
+        r = bx;
+    }
     in = ir_emit(f, b, IR_RET);
     in->a = r;
     in->line = fi->decl->line;
     free(ctx);
+    free(argv);
     return f->global;
 }
 
@@ -2674,7 +2889,7 @@ static void collect_declarations(L *l, const Program *prog) {
                 lerr(l, s->line, s->col, "'%s' is a builtin function and cannot be redeclared as a variable", s->name);
                 continue;
             }
-            Ty ty = resolve_type(l, &s->type);
+            Ty ty = stored(resolve_type(l, &s->type)); /* a global holds a value: float is boxed */
             int g = find_gvar(l, s->name);
             if (g >= 0) {
                 if (l->gvars[g].ty != ty) {
@@ -2886,7 +3101,7 @@ bool lower_program(const Program *user, IrModule *out) {
     l.path = prog->source_path;
     l.m = out;
     l.write_fn = l.space_fn = l.newline_fn = l.free_fn = -1;
-    l.dispose_fn = l.refcount_fn = -1;
+    l.dispose_fn = l.refcount_fn = l.coerce_fn = -1;
     for (int i = 0; i < 64; i++) l.intrinsic_fn[i] = -1;
     for (int i = 0; i < 5; i++) l.cs_fn[i] = -1;
     Fn main_fn;

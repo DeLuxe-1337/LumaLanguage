@@ -135,9 +135,40 @@ static bool lex_number(Lexer *lx, Token *tok) {
         else v = v * 10 + d;
         advance(lx);
     }
-    if (peek(lx) == '.' && is_digit(peek_at(lx, 1))) {
-        lex_error(lx, tok->line, tok->col, "floating-point numbers are not supported yet%s", NULL);
-        return false;
+    /* a float: digits '.' digits, an exponent, or both (1.5, 2e10, 1.5e-3) */
+    bool frac = peek(lx) == '.' && is_digit(peek_at(lx, 1));
+    bool expo = (peek(lx) == 'e' || peek(lx) == 'E') &&
+                (is_digit(peek_at(lx, 1)) || ((peek_at(lx, 1) == '+' || peek_at(lx, 1) == '-') && is_digit(peek_at(lx, 2))));
+    if (frac || expo) {
+        if (frac) {
+            advance(lx);
+            while (is_digit(peek(lx))) advance(lx);
+        }
+        if (peek(lx) == 'e' || peek(lx) == 'E') {
+            if (!(is_digit(peek_at(lx, 1)) || ((peek_at(lx, 1) == '+' || peek_at(lx, 1) == '-') && is_digit(peek_at(lx, 2))))) {
+                lex_error(lx, tok->line, tok->col, "invalid number literal (an exponent needs digits)%s", NULL);
+                return false;
+            }
+            advance(lx);
+            if (peek(lx) == '+' || peek(lx) == '-') advance(lx);
+            while (is_digit(peek(lx))) advance(lx);
+        }
+        if (is_ident_start(peek(lx)) || peek(lx) == '.') {
+            lex_error(lx, tok->line, tok->col, "invalid number literal%s", NULL);
+            return false;
+        }
+        char num[128];
+        size_t n = lx->pos - start;
+        if (n >= sizeof num) {
+            lex_error(lx, tok->line, tok->col, "number literal too long%s", NULL);
+            return false;
+        }
+        memcpy(num, lx->src + start, n);
+        num[n] = '\0';
+        tok->kind = TOK_FLOAT;
+        tok->fval = strtod(num, NULL); /* (too large: inf) */
+        tok->lexeme_len = n;
+        return true;
     }
     if (is_ident_start(peek(lx))) {
         lex_error(lx, tok->line, tok->col, "invalid number literal%s", NULL);
@@ -248,7 +279,7 @@ const char *token_kind_name(TokenKind k) {
     static const char *const names[] = {
         "LEFT_PAREN", "RIGHT_PAREN", "LEFT_BRACE", "RIGHT_BRACE", "COMMA", "DOT", "MINUS", "PLUS",
         "SEMICOLON", "SLASH", "STAR", "COLON", "QUESTION", "COLON_COLON", "BANG", "BANG_EQUAL", "EQUAL", "EQUAL_EQUAL", "GREATER",
-        "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "AND", "ARENA", "CLASS",
+        "GREATER_EQUAL", "LESS", "LESS_EQUAL", "IDENTIFIER", "STRING", "NUMBER", "FLOAT", "AND", "ARENA", "CLASS",
         "ELSE", "EXTERN", "FALSE", "FOR", "FUN", "IF", "IMPL", "NIL", "OR", "RETURN", "STRUCT", "SUPER", "THIS", "TRUE",
         "VAR", "WHILE", "WITH", "EOF",
     };

@@ -26,7 +26,11 @@ bool opt_may_trap(const IrModule *m, const IrInstr *in, const IrTy *vty) {
     case IR_CONST_INT: case IR_CONST_NIL: case IR_CONST_TRUE: case IR_CONST_FALSE: case IR_CONST_DATA:
     case IR_MOV: case IR_EQ: case IR_NE: case IR_NOT: case IR_PHI: case IR_NOP: case IR_STORE:
     case IR_JMP: case IR_BR: case IR_RET:
+    case IR_CONST_F64: case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV: case IR_FNEG: case IR_BOX:
+    case IR_FEQ: case IR_FNE: case IR_FLT: case IR_FLE: case IR_FGT: case IR_FGE:
         return false;
+    case IR_UNBOX:
+        return !sub(ta, TY_INT | TY_FLOAT);
     case IR_LT: case IR_LE: case IR_GT: case IR_GE:
         return !(sub(ta, TY_INT) && sub(tb, TY_INT));
     case IR_ADD:
@@ -63,7 +67,7 @@ bool opt_runtime_frees_nothing(const char *name) {
         "luma_write_space", "luma_write_newline", "luma_refcount", "luma_array_new", "luma_array_len",
         "luma_array_get", "luma_str_len", "luma_str_byte", "luma_str_char", "luma_str_slice", "luma_str_find",
         "luma_str_cmp", "luma_str_from_int", "luma_str_to_int", "luma_str_case", "luma_str_join", "luma_argc",
-        "luma_argv", "luma_mem_string", "luma_mem_write", "luma_type_name"};
+        "luma_argv", "luma_mem_string", "luma_mem_write", "luma_type_name", "luma_coerce_float", "luma_str_to_float"};
     for (size_t i = 0; i < sizeof N / sizeof *N; i++)
         if (strcmp(name, N[i]) == 0) return true;
     return false;

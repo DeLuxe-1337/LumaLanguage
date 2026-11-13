@@ -29,7 +29,7 @@ typedef enum {
     TOK_BANG, TOK_BANG_EQUAL, TOK_EQUAL, TOK_EQUAL_EQUAL,
     TOK_GREATER, TOK_GREATER_EQUAL, TOK_LESS, TOK_LESS_EQUAL,
     /* literals */
-    TOK_IDENTIFIER, TOK_STRING, TOK_NUMBER,
+    TOK_IDENTIFIER, TOK_STRING, TOK_NUMBER, TOK_FLOAT,
     /* keywords */
     TOK_AND, TOK_ARENA, TOK_CLASS, TOK_ELSE, TOK_EXTERN, TOK_FALSE, TOK_FOR, TOK_FUN, TOK_IF, TOK_IMPL, TOK_NIL,
     TOK_OR, TOK_RETURN, TOK_STRUCT, TOK_SUPER, TOK_THIS, TOK_TRUE, TOK_VAR, TOK_WHILE, TOK_WITH,
@@ -45,6 +45,7 @@ typedef struct {
     char *value;        /* TOK_STRING: decoded bytes, NUL-terminated (owned) */
     size_t value_len;
     int64_t ival;       /* TOK_NUMBER */
+    double fval;        /* TOK_FLOAT */
 } Token;
 
 typedef struct {

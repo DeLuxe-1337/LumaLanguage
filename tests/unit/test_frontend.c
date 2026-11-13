@@ -74,7 +74,9 @@ static void test_lex_errors(void) {
     CHECK(!lex_str("print \"a\\q\";", &t));     /* unsupported escape */
     CHECK(!lex_str("print 'a';", &t));          /* single quotes */
     CHECK(!lex_str("print 1 % 2;", &t));        /* no modulo operator in Lox */
-    CHECK(!lex_str("print 1.5;", &t));          /* floats not supported yet */
+    CHECK(!lex_str("print 1.5.2;", &t));        /* malformed float */
+    CHECK(!lex_str("print 1e;", &t));           /* exponent without digits */
+    CHECK(!lex_str("print 1.5x;", &t));
     CHECK(!lex_str("print 4611686018427387904;", &t)); /* 2^62: too large */
     CHECK(!lex_str("print 99999999999999999999999;", &t));
     CHECK(!lex_str("print 12abc;", &t));
@@ -324,7 +326,9 @@ static void test_lower(void) {
                        "%1 = check %1, int, @s0\n  store @var.n, %1");
     expect_ir_contains("fun u(x) { return x; } var n: int = u(1);", "global @var.n: int\n");
     expect_ir_contains("fun f(a: int, b, c: str?): bool { return true; }", "fn @fn.f(%a: int, %b, %c: str?): bool {");
-    expect_ir_contains("fun u(x) { return x; } var n: int = u(1) + 1;", "%3 = add %1, %2\n  store @var.n, %3"); /* '+' with int -> int: no guard */
+    /* '+' of any and int may be a float (any may hold one): guarded */
+    expect_ir_contains("fun u(x) { return x; } var n: int = u(1) + 1;", "%3 = add %1, %2\n  %3 = check %3, int, @s0\n  store @var.n, %3");
+    expect_ir_contains("fun u(x: int): int { return x; } var n: int = u(1) + 1;", "%3 = add %1, %2\n  store @var.n, %3"); /* int + int: no guard */
     expect_ir_contains("fun f(): int { for (;;) { return 1; } }", "fn @fn.f(): int {\nentry:\n  jmp while.cond.0\n");
     char *g = lower_str("var n: int = 1; n = 2;");
     CHECK(g && strstr(g, "luma_check_type") == NULL); /* fully typed: no guards at all */
@@ -347,7 +351,7 @@ static void test_lower(void) {
     CHECK((ir = lower_str("fun f(): int { return nil; }")) == NULL);
     CHECK((ir = lower_str("fun f(x): str { if (x) return \"a\"; }")) == NULL);
     CHECK((ir = lower_str("var x: u8 = 1;")) == NULL);
-    CHECK((ir = lower_str("var x: number = 1;")) == NULL);
+    CHECK((ir = lower_str("var x: numbr = 1;")) == NULL);
     CHECK((ir = lower_str("print(1 + \"a\");")) == NULL);
     CHECK((ir = lower_str("print(\"a\" - \"b\");")) == NULL);
     CHECK((ir = lower_str("print(-true);")) == NULL);
@@ -355,7 +359,11 @@ static void test_lower(void) {
     CHECK((ir = lower_str("var b: bool = true; var i: int = b;")) == NULL);
     CHECK((ir = lower_str("var a: int = 1; var a = 2;")) == NULL);      /* redeclared with another type */
     CHECK((ir = lower_str("extern fun f(x: int): void;")) == NULL);
-    CHECK((ir = lower_str("extern fun f(x: f64): void;")) == NULL);
+    CHECK((ir = lower_str("extern fun f(x: f64): void; f(\"a\");")) == NULL);
+    CHECK((ir = lower_str("var x: float = \"a\";")) == NULL);
+    CHECK((ir = lower_str("var x: int = 1.5;")) == NULL);
+    CHECK((ir = lower_str("var x: float = 1.5; var s: str = x;")) == NULL);
+    CHECK((ir = lower_str("print(1.5 + \"a\");")) == NULL);
     CHECK((ir = lower_str("extern fun f(): i64; f(1);")) == NULL);      /* arity */
     CHECK((ir = lower_str("extern fun f(s: cstr): void; f(1);")) == NULL);
     CHECK((ir = lower_str("extern fun f(): void; extern fun f(): void;")) == NULL);
