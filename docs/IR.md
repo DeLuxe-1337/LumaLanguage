@@ -1118,3 +1118,57 @@ The runtime adds a third object type, `LUMA_TYPE_ARRAY` (3): header (type,
 count at offset 4), length, items. Arrays are counted like strings, hold
 references to their items, and are reached only through these functions.
 
+
+## 23. v0.10 additions (milestone 11)
+
+### Floats
+
+Two new types: `float` (bit 5, part of `any`) is a **boxed float**, a heap
+object of type 4 (`LUMA_TYPE_FLOAT`: header, then the double at offset 8),
+immutable and counted like a string; `f64` (bit 6) is a **raw double**: the
+vreg holds the double's 64 bits and is not a Luma value. A type that
+includes `f64` is exactly `f64`. Function parameters and results may be
+`f64` (typed float code); globals, struct fields and `check` types never are.
+
+```
+%x = const f64 1.5              ; a raw constant (printed in the shortest exact form)
+%y = fadd %x, %z                ; fadd fsub fmul fdiv: f64, f64 -> f64
+%b = flt %x, %y                 ; feq fne flt fle fgt fge: f64, f64 -> bool (false when unordered)
+%n = fneg %x
+%v = box %x                     ; f64 -> a new boxed float
+%r = unbox %v                   ; int or boxed float -> f64 (the operand must be proven int|float)
+data @f.0 = float 2.5           ; a static boxed float (count 0); `const @f.0` gives a float
+```
+
+The generic `add sub mul div neg lt le gt ge eq ne` accept boxed floats and
+ints (the result types follow: int op int is int, anything with a float is
+float; `mod` stays int-only).
+
+Verifier rules: raw operands (`f64`) only in float instructions, `box`,
+calls to functions with `f64` parameters and `f32`/`f64` C parameters,
+`mov`, `ret` (when the function returns `f64`) and `br` (truthy); a vreg
+whose type mixes `f64` with Luma values is an error.
+
+C types `f32` (12) and `f64` (13): parameters and results are raw (`f64`),
+passed in xmm registers counted apart from integer ones (`eax` = the number
+of vector registers, for variadic callees); C struct fields of these types
+read and write boxed floats (`luma_cs_get` / `luma_cs_set`).
+
+Both backends keep raw doubles in general registers and do each operation
+in `xmm0`/`xmm1` (`movq`, `addsd`..., `ucomisd` + `seta`/`setae`, or
+`sete`&`setnp` / `setne`|`setp` for `feq`/`fne`); the optimizing backend
+fuses `flt fle fgt fge` with a following `br`. `box` and a mixed `unbox`
+call `luma_box_f64` / `luma_unbox_f64`.
+
+### Exports
+
+```
+export @fn.update "update"
+```
+
+makes `@fn.update` a C entry point named `update`: parameters `int` (C
+`int64_t`), `f64` (`double`) or `bool` (`bool`); the result is converted
+back the same way (anything else: `void`). Both backends emit a wrapper that
+tags the C arguments and calls the function through the runtime's
+`luma_invoke(fn, a0..a5)`, which guards it (setjmp): a runtime error
+returns to the C caller. See README "Shared libraries".

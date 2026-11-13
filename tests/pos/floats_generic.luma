@@ -1,0 +1,18 @@
+// Floats in generic structs, lists, Rc, float? and globals typed float.
+var l: List<float> = List::new();
+var x: float = 1.5;
+l.push(x);
+l.push(2);
+l.push(x * 2.0);
+var s: float = 0.0;
+for (var i = 0; i < l.len(); i = i + 1) s = s + l.get(i);
+print(l, s);
+struct Box<T> { v: T }
+impl Box<T> { fun get(self): T { return self.v; } }
+var b = Box { v: x };
+var y: float = b.get() + 1;
+print(b, y, Sys::type_of(b.get()));
+var r = Rc::new(Box { v: 2.5 });
+print(r.v * 2, r.get().get());
+fun maybe(f: float?): float { if (f == nil) return -1.0; return f; }
+print(maybe(nil), maybe(3), maybe(x));

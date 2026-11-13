@@ -282,6 +282,21 @@ var qr = div(17, 5);                  // returned by value, in registers
 check(qr.quot == 3 and qr.rem == 2 and div_t::size() == 8, "a struct by value");
 
 // ---------------------------------------------------------------------------
+section("floats");
+// Typed float code is raw doubles in registers; untyped floats are boxed
+// values. Ints convert where a float is wanted; int / int stays floor division.
+fun hyp(a: float, b: float): float { return Math::sqrt(a * a + b * b); }
+check(hyp(3, 4) == 5.0 and Sys::type_of(hyp(3, 4)) == "float", "typed float functions");
+var half = 7 / 2.0;
+check(half == 3.5 and 7 / 2 == 3 and 1 == 1.0 and 0.1 + 0.2 != 0.3, "mixed arithmetic, numbers compare by value");
+var acc: float = 0.0;
+for (var i = 0; i < 4; i = i + 1) acc = acc + 0.25;
+check(acc == 1.0 and Str::of(acc) == "1.0" and Str::of(2500.0) == "2500.0", "a float loop, how floats print");
+check(Math::floor_int(-2.5) == -3 and Math::round(2.5) == 3.0 and Math::abs(-1.5) == 1.5, "Math on floats");
+extern "sqrt" fun c_sqrt(x: f64): f64;
+check(c_sqrt(16) == 4.0, "f64 over the FFI");
+
+// ---------------------------------------------------------------------------
 section("summary");
 print(passed, "passed,", failed, "failed");
 if (failed > 0) Sys::exit(1);

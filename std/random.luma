@@ -19,6 +19,10 @@ impl Random {
 
   fun bool(self): bool { return Math::mod(self.next() / 64, 2) == 0; }
 
+  // a float, 0 <= x < 1, and lo <= x < hi
+  fun unit(self): float { return self.next() / 64 / 33554432.0; }
+  fun between(self, lo: float, hi: float): float { return lo + (hi - lo) * self.unit(); }
+
   // shuffles a List in place (Fisher-Yates)
   fun shuffle(self, list) {
     for (var i = list.len() - 1; i > 0; i = i - 1) {

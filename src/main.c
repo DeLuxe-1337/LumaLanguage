@@ -347,7 +347,7 @@ int main(int argc, char **argv) {
     if (shared) {
         Buf vs = {0};
         buf_printf(&vs, "{\n  global:\n    luma_lib_init;\n    luma_lib_shutdown;\n    luma_lib_error;\n"
-                        "    luma_lib_error_count;\n    luma_lib_set_error_handler;\n");
+                        "    luma_lib_error_count;\n    luma_lib_set_error_handler;\n    luma_lib_set_output_handler;\n    luma_lib_raise;\n");
         for (int i = 0; i < ir.nglobals; i++)
             if (ir.globals[i].kind == IRG_FUNC && ir.globals[i].exported) buf_printf(&vs, "    %s;\n", ir.globals[i].csym);
         buf_printf(&vs, "  local: *;\n};\n");

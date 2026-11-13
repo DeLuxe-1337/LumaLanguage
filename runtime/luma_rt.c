@@ -1069,7 +1069,40 @@ static void write_value(FILE *out, LumaValue v, bool quoted) {
     } else luma_panic("cannot print value of unknown type");
 }
 
+/* print's output: stdout, or (a library whose host set an output handler)
+ * whole lines handed to the host. */
+static void (*output_handler)(const char *line);
+static char *out_line;
+static size_t out_len, out_cap;
+
+static void out_bytes(const char *p, size_t n) {
+    if (out_len + n + 1 > out_cap) {
+        size_t cap = out_cap ? out_cap * 2 : 256;
+        while (cap < out_len + n + 1) cap *= 2;
+        char *b = realloc(out_line, cap);
+        if (!b) luma_panic("Out of memory.");
+        out_line = b;
+        out_cap = cap;
+    }
+    memcpy(out_line + out_len, p, n);
+    out_len += n;
+    out_line[out_len] = '\0';
+}
+
+void luma_lib_set_output_handler(void (*fn)(const char *line)) { output_handler = fn; }
+
 LumaValue luma_write(LumaValue v) {
+    if (output_handler) {
+        char *buf = NULL;
+        size_t len = 0;
+        FILE *f = open_memstream(&buf, &len);
+        if (!f) luma_panic("Out of memory.");
+        write_value(f, v, false);
+        if (fclose(f) != 0 || !buf) luma_panic("Out of memory.");
+        out_bytes(buf, len);
+        free(buf);
+        return LUMA_NIL;
+    }
     write_value(stdout, v, false);
     return LUMA_NIL;
 }
@@ -1090,12 +1123,20 @@ LumaValue luma_show(LumaValue v) {
 }
 
 LumaValue luma_write_space(void) {
-    putchar(' ');
+    if (output_handler) out_bytes(" ", 1);
+    else putchar(' ');
     return LUMA_NIL;
 }
 
 LumaValue luma_write_newline(void) {
-    putchar('\n');
+    if (output_handler) {
+        out_bytes("", 0);
+        output_handler(out_line);
+        out_len = 0;
+        out_line[0] = '\0';
+    } else {
+        putchar('\n');
+    }
     return LUMA_NIL;
 }
 
@@ -1801,6 +1842,11 @@ uint64_t luma_invoke(uintptr_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64
     nguards = depth;
     return r;
 }
+
+/* A host function called from Luma code reports an error as a Luma runtime
+ * error (the exported call returns to the host). The host must call it with
+ * no C++ objects alive in its own frames, as it does not return. */
+_Noreturn void luma_lib_raise(const char *msg) { runtime_error(msg ? msg : "error"); }
 
 const char *luma_lib_error(void) { return last_error; }
 uint64_t luma_lib_error_count(void) { return error_count; }

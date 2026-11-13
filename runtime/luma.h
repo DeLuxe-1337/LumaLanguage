@@ -37,6 +37,13 @@ const char *luma_lib_error(void);
 uint64_t luma_lib_error_count(void);
 /* Called with each runtime error's message instead of printing it. */
 void luma_lib_set_error_handler(void (*handler)(const char *message));
+/* print hands each line (without the newline) to the handler instead of
+ * writing it to stdout. */
+void luma_lib_set_output_handler(void (*handler)(const char *line));
+/* For host functions that Luma code calls (extern fun): ends the current
+ * exported call with a Luma runtime error. Does not return (longjmp): call
+ * it only with no C++ objects alive in the calling frames. */
+void luma_lib_raise(const char *message);
 
 #ifdef __cplusplus
 }

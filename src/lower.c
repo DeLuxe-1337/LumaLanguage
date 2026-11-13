@@ -382,7 +382,7 @@ static Val flow(L *l, Val v, Ty slot, const char *what, int line, int col) {
         int t = temp(l);
         int g = runtime_extern(l, &l->coerce_fn, "luma_coerce_float", 1);
         emit_call(l, t, g, &v.v, 1, line);
-        v = (Val){t, (v.ty & ~(Ty)T_INT) | T_FLOAT};
+        v = (Val){t, T_ANY}; /* (a runtime call: the check below narrows it) */
     }
     if (ir_ty_sub(v.ty, slot)) return v;
     ty_name(l, slot, want, sizeof want);

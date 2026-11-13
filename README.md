@@ -16,8 +16,13 @@ The syntax started from Lox and has grown its own features:
   prove dead; `Rc<T>` and arenas are written in Luma itself, in the prelude
 - C functions are called directly through `extern fun`, and C structs are
   declared with `extern struct` (passed by pointer or by value)
+- floats: typed float code (`x: float`) runs on raw doubles in SSE registers,
+  untyped floats are boxed values
 - a standard library written in Luma: `Math`, `Str`, `List<T>`, `File`,
   `Sys`, `Date`, `Random`, `C`
+- a program can be built as a shared library (`luma --shared`) that a C host
+  loads; `export fun` functions are its C entry points (a game engine uses
+  this for scripts: see [Shared libraries](#shared-libraries))
 
 Nothing is final before Luma bootstraps.
 
@@ -86,6 +91,7 @@ Options:
 
 ```
 --emit-ir       stop after writing OUT.lir
+--shared        build a shared library OUT (export fun entry points; see below)
 -S              stop after writing OUT.s
 -c              stop after writing OUT.o
 --dump-tokens   print the token stream
@@ -120,7 +126,7 @@ Its input language, encodings and relocation rules are specified in
 
 | | |
 |---|---|
-| Values | 63-bit integers, strings, `true`, `false`, `nil`, struct instances |
+| Values | 63-bit integers, floats (doubles), strings, `true`, `false`, `nil`, struct instances |
 | Structs | `struct P { x: int, y }` declares fields (typed or untyped). `P { x: 1, y }` builds one (every field, any order, `y` is shorthand for `y: y`). Instances are references: assignment shares, `==` is identity, and they are always truthy. `print` shows `P { x: 1, y: "s" }`. `shared struct` makes every instance reference counted. |
 | Generics | `struct Box<T> { value: T }` and `impl Box<T> { … }`: one struct per list of type arguments (`Box<int>`, `Pair<str, Point?>`), inferred in expressions, written in annotations (below). |
 | Hooks | Methods with special meaning: `drop(self)` runs when an instance dies, `deref(self)` answers fields and methods the struct lacks, `show(self): str` is how `print` shows it, `enter(self)`/`leave(self)` are called by `with`. |
@@ -128,15 +134,103 @@ Its input language, encodings and relocation rules are specified in
 | `impl` | `impl P { fun m(self, a) { … } fun new(…) { … } }` adds methods (first parameter `self`, untyped) and associated functions (no `self`). Call them as `p.m(1)`, `P::new(…)` or `P::m(p, 1)`. Several `impl` blocks per struct are allowed. When the object's static type is exactly `P`, field access and method calls are compiled statically; otherwise they are looked up by name at runtime, with the same error messages. |
 | Functions | `fun name(a, b) { … return v; }` at top level, called as `name(x, y)`. Recursion and mutual recursion work, and functions can be called before their definition. Up to 6 parameters. Arity is checked at compile time. A missing `return` returns `nil`. `fun f(move p)`: the call takes over the caller's variable (using it afterwards is a compile error). |
 | Builtins | `print(a, b, …)` writes its arguments separated by spaces, then a newline, and returns `nil`. All arguments are evaluated before anything is written. `free(x)`, `dispose(x)` and `refcount(x)`: see Memory. |
-| Types | Optional annotations: `var n: int`, `fun f(a: str, b): bool?`. The types are `int str bool nil any`, struct names, and `T?` (T or nil). Mismatches the compiler can prove are compile errors; values whose type is only known at runtime are checked by a guard at the annotated boundary. Unannotated code stays fully dynamic. |
-| C FFI | `extern fun name(p: ctype, …): ctype;` with `i8`…`i64`, `u8`…`u64`, `bool`, `cstr`, `cstr?`, `ptr` and `void`, plus C structs (below). Values are converted and range-checked at the call. `extern "sym" fun name(…)` calls the C symbol `sym`. Link libraries with `-l NAME -L DIR`, or pass `.o`/`.a`/`.so` files. |
+| Types | Optional annotations: `var n: int`, `fun f(a: str, b): bool?`. The types are `int float number str bool nil any`, struct names, and `T?` (T or nil); `number` is an int or a float. Mismatches the compiler can prove are compile errors; values whose type is only known at runtime are checked by a guard at the annotated boundary. Unannotated code stays fully dynamic. |
+| Floats | `1.5`, `2e10`, `1.5e-3`. `+ - * /` and the compares mix ints and floats (an int with a float gives a float; `/` of two ints stays floor division); `1 == 1.0`. Where a float is wanted an int converts (`var x: float = 1;`). See [Floats](#floats). |
+| C FFI | `extern fun name(p: ctype, …): ctype;` with `i8`…`i64`, `u8`…`u64`, `f32`, `f64`, `bool`, `cstr`, `cstr?`, `ptr` and `void`, plus C structs (below). Values are converted and range-checked at the call. `extern "sym" fun name(…)` calls the C symbol `sym`. Link libraries with `-l NAME -L DIR`, or pass `.o`/`.a`/`.so` files. |
+| Exports | `export fun name(a: int, b: float, c: bool): float { … }` is also a C function `name` (`int64_t`, `double`, `bool`); `luma --shared` builds a shared library a C program loads. See [Shared libraries](#shared-libraries). |
 | Standard library | `Math`, `Str`, `List<T>`, `File`, `Sys`, `Date`, `Random`, `C`, written in Luma in [std/](std); see below. |
 | Statements | `var`, expression statements, `{ }` blocks, `if`/`else`, `while`, `for`, `return`, `with x { … }`, `arena { … }` |
 | Operators | `= or and == != < <= > >= + - * / ! -` (unary), and `+` on two strings concatenates them |
 | Variables | Top-level variables are globals that functions can read and write. Variables in blocks and functions are local, with lexical scoping checked at compile time. |
 | Semantics | Lox truthiness (only `nil` and `false` are falsy). `and`/`or` return an operand. Integer overflow, type errors, reading a global before it is assigned, and stack overflow are runtime errors (exit status 1). `/` is floor division. |
 | Memory | Manual by default (below): `free(x)` for struct instances, `Rc::new(x)` for shared ownership, `arena { … }` for bulk lifetimes; strings are automatic. `--mm=none` never frees, and `free` then does nothing, so a program compiles in both modes. Using a variable after `free`, or after a `move` parameter took it, on every path, is a compile error. |
-| Not yet | first-class functions and closures, generic functions, traits/interfaces, floats (including C `f32`/`f64`), C callbacks, unions, arrays and nested structs in C structs, `break`, collecting reference cycles |
+| Not yet | first-class functions and closures, generic functions, traits/interfaces, C callbacks (other than `export fun`), unions, arrays and nested structs in C structs, C structs with float fields passed by value, `break`, collecting reference cycles, Windows |
+
+## Floats
+
+```js
+fun integrate(n: int): float {          // typed: raw doubles, SSE arithmetic, no allocation
+  var sum: float = 0.0;
+  var x: float = 0.0;
+  var dx: float = 1.0 / n;               // an int converts where a float is wanted
+  for (var i = 0; i < n; i = i + 1) {
+    sum = sum + x * x * dx;
+    x = x + dx;
+  }
+  return sum;
+}
+var area = integrate(1000000);           // an untyped variable: a boxed float
+print(area, Math::sqrt(2.0), 7 / 2, 7 / 2.0, 1 == 1.0, 0.1 + 0.2);
+```
+
+```
+0.33333283333399866 1.4142135623730951 3 3.5 true 0.30000000000000004
+```
+
+- A float in a typed slot (a local, parameter or result declared `float`)
+  is a raw double: it lives in a register, and arithmetic on it is inline
+  SSE code. Everywhere else (untyped variables, `any`, `float?`, `number`,
+  struct fields, globals, lists) a float is a boxed value: an immutable heap
+  object, reference counted like a string and freed automatically. Values
+  convert at the boundary (box / unbox), so the two kinds mix freely.
+- Arithmetic: int op int is an int (`/` floors), anything with a float is a
+  float (`/` is true division; `x / 0.0` is `inf` or `nan`, not an error).
+  Compares and `==` compare numbers by value (`1 == 1.0`, `nan != nan`).
+- `print` shows the shortest text that reads back exactly, always with a
+  `.` or an exponent: `2.0`, `0.1`, `2500.0`, `1e+16`, `nan`, `inf`.
+- `Math` has the float functions (`sqrt sin cos tan asin acos atan atan2
+  exp log log10 fpow fmod floor ceil round trunc lerp is_nan is_finite pi e
+  inf nan`), conversions (`to_int floor_int ceil_int round_int to_float`),
+  and `abs min max clamp sign` take numbers. `Str::from_float`,
+  `Str::to_float`, `Random::unit`, `Random::between`.
+- C: `f32` and `f64` parameters and results go in xmm registers; C struct
+  fields may be `f32` / `f64` (such a struct is passed by pointer).
+
+One cost: in untyped code `n - 1` may now be a boxed float, which the caller
+releases after a call returns, so `return f(n - 1)` with an untyped `n` is
+no longer a tail call. Typed code (`n: int`) is unchanged.
+
+## Shared libraries
+
+`luma --shared game.luma -o libgame.so` builds a shared library for a C
+program (a host) to load. Its `export fun` functions are C functions of the
+same name; [runtime/luma.h](runtime/luma.h) declares the rest of its
+interface:
+
+```js
+var total: float = 0.0;
+print("loaded");                          // top-level code runs in luma_lib_init()
+export fun update(dt: float) { total = total + dt; }
+export fun add(a: int, b: int): int { return a + b; }
+export fun boom() { Sys::fail("no"); }    // the host gets an error, not an exit
+```
+
+```c
+void *h = dlopen("./libgame.so", RTLD_NOW | RTLD_LOCAL);
+int (*init)(void) = dlsym(h, "luma_lib_init");
+void (*update)(double) = dlsym(h, "update");
+init();                     /* prints "loaded" */
+update(0.016);
+```
+
+- Parameter and result types map `int` <-> `int64_t`, `float` <-> `double`,
+  `bool` <-> `bool`; a function without a return type returns `void`.
+- A runtime error in an exported call (or in `luma_lib_init`) does not end
+  the process: the call returns `0`/`0.0`/`false`, `luma_lib_error()` has
+  the message and `luma_lib_error_count()` goes up (the message is printed
+  to stderr unless `luma_lib_set_error_handler` installed a handler).
+  `luma_lib_set_output_handler` gets `print`'s lines instead of stdout.
+- C functions the host provides are declared with `extern fun` as usual and
+  resolved when the library is loaded (the host exports them, e.g.
+  `-Wl,--export-dynamic-symbol=...`). Such a function can report an error in
+  the calling Luma code with `luma_lib_raise(message)`.
+- Each library has its own runtime, heap and globals: two loads of copies of
+  the same file are independent, and `dlclose` + `dlopen` starts over. The
+  library exports only its entry points and `luma_lib_*` (a version script);
+  it links `build/libluma_rt_pic.a` (the runtime built `-fPIC`, without
+  `main` or a `SIGSEGV` handler).
+- Not handled yet: calls from several threads, and unbounded recursion
+  (it overflows the host's stack).
 
 ## Memory management
 
@@ -352,13 +446,13 @@ print(Math::gcd(84, 36), Math::pow(3, 4), Str::split("a,b,c", ","), Sys::date(0)
 
 | Module | What it has |
 |---|---|
-| `Math` | `abs min max clamp sign pow gcd lcm isqrt mod digits is_even is_odd max_int min_int` (integers: there are no floats yet) |
-| `Str` | `len byte char slice find find_from contains starts_with ends_with count repeat upper lower trim trim_start trim_end split lines words join replace from_int to_int compare pad_left pad_right of is_space is_digit is_alpha`. Strings are byte strings; indexes count bytes |
+| `Math` | numbers: `abs min max clamp sign`; ints: `pow gcd lcm isqrt mod digits is_even is_odd max_int min_int`; floats: `sqrt sin cos tan asin acos atan atan2 exp log log10 fpow fmod floor ceil round trunc lerp is_nan is_finite pi e inf nan`; `to_int floor_int ceil_int round_int to_float` |
+| `Str` | `len byte char slice find find_from contains starts_with ends_with count repeat upper lower trim trim_start trim_end split lines words join replace from_int to_int from_float to_float compare pad_left pad_right of is_space is_digit is_alpha`. Strings are byte strings; indexes count bytes |
 | `List<T>` | `List::new()`; `len is_empty get set push pop first last insert remove index_of contains clear reverse sort slice copy`; prints as `[1, 2, 3]` |
 | `File` | `File::open(path, mode)` (nil if it can't), `read_line read_all write write_line flush close`; `File::read write_all append lines exists remove` |
 | `Sys` | `args env exit run fail eprint type_of time clock_ms clock_ns date local_date` |
 | `Date` | `year month day hour minute second weekday zone`, `weekday_name()`, prints as `2023-11-14 22:13:20 GMT` |
-| `Random` | `Random::new(seed)`, `next range bool shuffle` (reproducible; not for cryptography) |
+| `Random` | `Random::new(seed)`, `next range bool unit between shuffle` (reproducible; not for cryptography) |
 | `C` | `alloc free string cstring write`: raw C memory for the FFI |
 
 - The library's types (`List`, `File`, `Date`, `Random`) are shared

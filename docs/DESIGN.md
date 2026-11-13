@@ -949,6 +949,51 @@ Not supported yet: `f32`/`f64` (Luma has no floats), nested structs, arrays
 and unions in C structs, by-value structs over 16 bytes, callbacks, variadic
 declarations, and more than 6 parameters.
 
+## Floats (milestone 11)
+
+- **Two representations.** Luma values stay one tagged word (63-bit
+  fixnums, pointers, specials): no NaN-boxing, so ints keep their range and
+  every existing fast path. A float *value* is a boxed object (type 4); a
+  float in a slot the program typed `float` is a *raw* double (IR type
+  `f64`) that never leaves registers and stack slots. Lowering decides the
+  representation per expression (`Val.ty == T_F64` means raw) and converts
+  at one place, `flow()`: into a raw slot it unboxes (or converts an int:
+  a constant int is rewritten to `const f64` in place; a dynamic value gets
+  a `check int|float` first), into a value slot it boxes (a raw literal
+  becomes a static box instead). `stored()` maps `float` to the boxed type
+  where values are stored (fields, globals, type arguments).
+- **Operators.** When an operand is statically a float and the other may be
+  a number, `+ - * / < <= > >=` lower to `fadd...fge` on raw operands;
+  `== !=` only when both are statically numbers (else the generic `eq`,
+  which compares numbers by value). Otherwise the generic operations run,
+  and the runtime handles floats on their slow paths.
+- **Allocation.** Boxed floats come from a free list (16-byte objects), and
+  static literals are never allocated. Raw code allocates nothing.
+- **Hints.** A raw double is never written to a lowering hint (a variable
+  that holds values): variable reads, calls returning `float` and float
+  operations use fresh temps, so a vreg never mixes the two kinds.
+- **The cost in untyped code.** `x - 1` with an untyped `x` may produce a
+  counted object now, so the memory pass releases such temporaries after a
+  call: an untyped `return f(n - 1)` is no longer a tail call.
+
+## Shared libraries (milestone 11)
+
+- `export fun` lowers to an ordinary function plus an IR `export` line;
+  both backends emit a C-ABI wrapper (x86_isel.c `x86_emit_exports`) that
+  saves the C arguments, tags them (`int64_t` -> fixnum, `bool` -> 2/10,
+  `double` stays raw) and calls `luma_invoke(fn, a0..a5)`.
+- `luma_invoke` pushes a `jmp_buf` on a guard stack; `runtime_error` (every
+  panic) longjmps to the innermost guard when there is one, else exits as
+  before. After an error the guard drops arenas the call entered and the
+  objects waiting to be destroyed (they leak), and resets print state.
+  Nested calls (host -> Luma -> host -> Luma) each have their own guard.
+- `luma --shared` links `libluma_rt_pic.a` (`-fPIC -DLUMA_LIBRARY`: no
+  `main`, no SIGSEGV handler, `luma_lib_init` runs `luma_main` guarded) with
+  `-shared` and a version script exporting only the entry points and
+  `luma_lib_*`. Generated code needs no PIC changes: calls go through the
+  PLT, data is reached RIP-relative within the library, descriptors use
+  `R_X86_64_64` (load-time relocations).
+
 ## Runtime (`runtime/luma_rt.c` → `build/libluma_rt.a`)
 
 The runtime is part of the toolchain, like libc. `make` builds it with the
